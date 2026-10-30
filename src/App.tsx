@@ -31,6 +31,7 @@ import { soundEngine } from './game/sound.ts';
 import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
+  arePlayersTeammates,
   AsteroidState,
   BulletState,
   ChatMessage,
@@ -53,6 +54,7 @@ import {
   ServerToClientMessage,
   SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
+  stepAiDroneAutopilot,
   WARP_DRIVE_SPEED,
 } from './shared/types.ts';
 
@@ -214,7 +216,7 @@ export default function App() {
   }>({
     players: new Map(),
     bullets: [],
-    asteroids: createInitialClientAsteroids(24),
+    asteroids: createInitialClientAsteroids(48),
     planets: INITIAL_PLANETS.map((p) => ({
       ...p,
       x: GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius,
@@ -625,18 +627,24 @@ export default function App() {
       if (pkt.type === 'peer:player_state') {
         if (pkt.player.id !== selfIdRef.current) {
           const existing = world.players.get(pkt.player.id);
-          const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
-          const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
+          // Do not overwrite live-simulated AI drones with static initial spawn coordinates from /api/sector
+          if (pkt.player.isDrone && existing) {
+            existing.name = pkt.player.name || existing.name;
+          } else {
+            const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
+            const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
 
-          world.players.set(
-            pkt.player.id,
-            mergeSmoothRemotePlayerState(existing, pkt.player, recentlyDamagedLocally)
-          );
+            world.players.set(
+              pkt.player.id,
+              mergeSmoothRemotePlayerState(existing, pkt.player, recentlyDamagedLocally)
+            );
+          }
         }
         if (pkt.drones) {
           for (const d of pkt.drones) {
-            const existingDrone = world.players.get(d.id);
-            world.players.set(d.id, mergeSmoothRemotePlayerState(existingDrone, d));
+            if (!world.players.has(d.id)) {
+              world.players.set(d.id, mergeSmoothRemotePlayerState(undefined, d));
+            }
           }
         }
         return;
@@ -1597,8 +1605,8 @@ export default function App() {
             }
           }
 
-          if (world.asteroids.length < 12) {
-            const extra = createInitialClientAsteroids(4);
+          if (world.asteroids.length < 48) {
+            const extra = createInitialClientAsteroids(8);
             for (const ast of extra) {
               ast.id = `ast_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
               world.asteroids.push(ast);
@@ -1634,16 +1642,71 @@ export default function App() {
             }
 
             if (p.isDrone) {
-              const dxStar = p.x - GRAVITY_STAR_X;
-              const dyStar = p.y - GRAVITY_STAR_Y;
-              const distStar = Math.hypot(dxStar, dyStar);
-              const orbitAngle =
-                Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
-              p.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
-              p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
-              p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
+              stepAiDroneAutopilot(
+                p,
+                world.players,
+                world.planets,
+                world.gravityStarEnabled,
+                dt,
+                nowSec
+              );
+              renderer.stepLocalPlayerPhysics(
+                p,
+                dt,
+                world.gravityStarEnabled,
+                world.planets
+              );
+
+              // Respawn AI drone at a safe orbit if pulled into the central Gravity Star
+              if (world.gravityStarEnabled) {
+                const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
+                const distToSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
+                if (distToSun < GRAVITY_STAR_RADIUS + dSpec.radius - 4) {
+                  const safeOrbit = getSafeSunOrbitPoint();
+                  p.x = safeOrbit.x;
+                  p.y = safeOrbit.y;
+                  p.vx = 0;
+                  p.vy = 0;
+                  p.hp = p.maxHp;
+                  p.invulnerableTimer = 1.5;
+                }
+              }
+
               p.netTargetX = p.x;
               p.netTargetY = p.y;
+              p.netTargetVx = p.vx;
+              p.netTargetVy = p.vy;
+              p.netTargetAngle = p.angle;
+
+              // Allow AI ships to actively fire weapons at players & rival ships in Vercel/client mode!
+              if (p.shooting && world.bullets.length < 1550) {
+                const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
+                const aiCooldown = Math.max(dSpec.fireCooldown * 1.6, 0.38);
+                if (nowSec - (p.lastFireTime || 0) >= aiCooldown) {
+                  p.lastFireTime = nowSec;
+                  const aiSalvo = {
+                    idPrefix: `ai_${p.id}_${Date.now().toString(36)}`,
+                    ownerId: p.id,
+                    ownerName: p.name,
+                    color: p.color,
+                    x: p.x,
+                    y: p.y,
+                    vx: p.vx,
+                    vy: p.vy,
+                    angle: p.angle,
+                    noseDist: dSpec.radius + 10,
+                    count: dSpec.spreadCount,
+                    spreadAngle: dSpec.spreadAngle,
+                    novaSpread: false,
+                    baseMuzzle: dSpec.bulletSpeed,
+                    damage: dSpec.bulletDamage,
+                    ttl: 2.4,
+                    isMissile: false,
+                    targetIds: [],
+                  };
+                  world.bullets.push(...expandSalvoToBullets(aiSalvo));
+                }
+              }
             } else {
               if (p.shooting) {
                 // Ensure remote player shooting is always visible even between /api/sector HTTP polls
@@ -1725,8 +1788,15 @@ export default function App() {
             let bulletConsumed = false;
 
             // 1. Check bullet vs all alive players (both ship body AND 2x spectator mouse cursor!)
+            const bulletOwner = world.players.get(b.ownerId);
             for (const target of world.players.values()) {
-              if (!target.alive || target.id === b.ownerId) continue;
+              if (
+                !target.alive ||
+                target.id === b.ownerId ||
+                arePlayersTeammates(bulletOwner, target)
+              ) {
+                continue;
+              }
               const tSpec = HULL_SPECS[target.hull] || HULL_SPECS.needle;
               const hitRadius = tSpec.radius + (b.isMissile ? 14 : 9);
               const dx = shortestToroidalDelta(b.x, target.x, ARENA_WIDTH);
@@ -1758,8 +1828,14 @@ export default function App() {
 
                 const hitId = `hit_${b.id}`;
                 const alreadyProcessed = peerSyncRef.current?.hasSeenHit(hitId) ?? false;
+                const isDroneCombat = Boolean(bulletOwner?.isDrone || target.isDrone);
 
-                if (!alreadyProcessed && (b.ownerId === selfIdRef.current || target.id === selfIdRef.current)) {
+                if (
+                  !alreadyProcessed &&
+                  (b.ownerId === selfIdRef.current ||
+                    target.id === selfIdRef.current ||
+                    isDroneCombat)
+                ) {
                   peerSyncRef.current?.markHitSeen(hitId);
                   if (!target.spectating && !target.warping) {
                     const knockback = b.isMissile ? 95 : 65;

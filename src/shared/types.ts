@@ -146,6 +146,8 @@ export interface PlayerState {
   inputSource: 'gamepad' | 'keyboard';
   cheats?: PlayerCheats;
   isDrone?: boolean;
+  squadId?: string | null;
+  aiTargetId?: string | null;
   spectating?: boolean;
   spectateTargetId?: string | null;
   cursorX?: number;
@@ -565,3 +567,293 @@ export type ServerToClientMessage =
       clientTime: number;
       serverTime: number;
     };
+
+function shortestDelta(from: number, to: number, size: number): number {
+  let d = to - from;
+  if (d > size * 0.5) d -= size;
+  if (d < -size * 0.5) d += size;
+  return d;
+}
+
+function normAngle(diff: number): number {
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  return diff;
+}
+
+function hashIdToNumber(id: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h);
+}
+
+export function arePlayersTeammates(
+  a?: PlayerState | null,
+  b?: PlayerState | null
+): boolean {
+  if (!a || !b) return false;
+  if (a.id === b.id) return true;
+  if (a.squadId && b.squadId && a.squadId === b.squadId) return true;
+  return false;
+}
+
+/**
+ * Shared AI Dogfighting & Squad Teaming Brain for Target Drones (`isDrone: true`).
+ * Eliminates the passive circular galaxy drift: AI ships actively hunt players and rival ships,
+ * form 2–4 ship tactical teams (`squadId`) that fly as wingmen and focus-fire enemies,
+ * avoid clumping/hazards, and lead-aim their weapons.
+ */
+export function stepAiDroneAutopilot(
+  drone: PlayerState,
+  players: Map<string, PlayerState>,
+  planets: PlanetState[],
+  gravityStarEnabled: boolean,
+  dt: number,
+  nowSec: number
+): void {
+  if (!drone.alive || !drone.isDrone) return;
+
+  const seed = hashIdToNumber(drone.id);
+  const canTeamUp = seed % 10 < 6; // ~60% of AI ships are open to forming/joining tactical squads
+  const strafeSign = seed % 2 === 0 ? 1 : -1;
+  const spec = HULL_SPECS[drone.hull] || HULL_SPECS.needle;
+
+  // 1. Scan nearby ships for:
+  //    (a) anti-clumping separation
+  //    (b) squadmates / dynamic teaming
+  //    (c) enemy target acquisition (human players prioritized, plus squad focus-fire)
+  let sepX = 0;
+  let sepY = 0;
+  let nearestMate: PlayerState | null = null;
+  let nearestMateDistSq = Infinity;
+  let squadMateCount = 0;
+  let bestEnemy: PlayerState | null = null;
+  let bestEnemyScore = Infinity; // Lower score = higher priority
+
+  // Check if our current locked target is still valid
+  const currentTarget = drone.aiTargetId ? players.get(drone.aiTargetId) : undefined;
+  const validLockedTarget =
+    currentTarget &&
+    currentTarget.alive &&
+    !currentTarget.spectating &&
+    currentTarget.id !== drone.id &&
+    !arePlayersTeammates(drone, currentTarget)
+      ? currentTarget
+      : null;
+
+  for (const other of players.values()) {
+    if (!other.alive || other.id === drone.id || other.spectating) continue;
+
+    const dx = shortestDelta(drone.x, other.x, ARENA_WIDTH);
+    const dy = shortestDelta(drone.y, other.y, ARENA_HEIGHT);
+    const distSq = dx * dx + dy * dy;
+
+    // Anti-clumping separation within 260 units so ships never stack in lines or spirals
+    if (distSq < 260 * 260 && distSq > 1) {
+      const dist = Math.sqrt(distSq);
+      const push = (260 - dist) / 260;
+      sepX -= (dx / dist) * push * 2.2;
+      sepY -= (dy / dist) * push * 2.2;
+    }
+
+    // Dynamic Teaming: if both AI ships are team-friendly and within 620u, form or join a squad (up to 4 ships)
+    if (other.isDrone && canTeamUp && !drone.squadId && distSq < 620 * 620) {
+      const otherSeed = hashIdToNumber(other.id);
+      if (otherSeed % 10 < 6) {
+        if (other.squadId) {
+          // Count members in other's squad
+          let count = 0;
+          for (const p of players.values()) {
+            if (p.alive && p.squadId === other.squadId) count++;
+          }
+          if (count < 4) {
+            drone.squadId = other.squadId;
+            drone.color = other.color;
+          }
+        } else {
+          const newSquadId = `SQUAD-${((seed ^ otherSeed) % 89) + 10}`;
+          drone.squadId = newSquadId;
+          other.squadId = newSquadId;
+          drone.color = other.color;
+        }
+      }
+    }
+
+    if (arePlayersTeammates(drone, other)) {
+      squadMateCount++;
+      if (distSq < nearestMateDistSq) {
+        nearestMateDistSq = distSq;
+        nearestMate = other;
+      }
+      continue;
+    }
+
+    // Evaluate enemy candidate
+    // Only scan within 5,600 units unless we have no target at all
+    if (distSq > 5600 * 5600 && bestEnemy !== null) continue;
+
+    const dist = Math.sqrt(distSq);
+    let priorityDist = dist;
+
+    // Strongly prioritize attacking human players so the sector feels alive and dangerous!
+    if (!other.isDrone) {
+      priorityDist *= 0.42;
+    }
+
+    // Stickiness bonus for our currently locked target so AI doesn't jitter between targets
+    if (validLockedTarget && other.id === validLockedTarget.id) {
+      priorityDist *= 0.72;
+    }
+
+    // Squad Focus-Fire bonus: if our nearest squadmate is targeting this enemy, gang up on them!
+    if (nearestMate && nearestMate.aiTargetId === other.id) {
+      priorityDist *= 0.55;
+    }
+
+    if (priorityDist < bestEnemyScore) {
+      bestEnemyScore = priorityDist;
+      bestEnemy = other;
+    }
+  }
+
+  // If a squadmate has a target within reasonable distance and we don't have a close human target, assist our squadmate!
+  if (nearestMate && nearestMate.aiTargetId) {
+    const mateTarget = players.get(nearestMate.aiTargetId);
+    if (
+      mateTarget &&
+      mateTarget.alive &&
+      !mateTarget.spectating &&
+      !arePlayersTeammates(drone, mateTarget)
+    ) {
+      const mdx = shortestDelta(drone.x, mateTarget.x, ARENA_WIDTH);
+      const mdy = shortestDelta(drone.y, mateTarget.y, ARENA_HEIGHT);
+      const mDist = Math.hypot(mdx, mdy);
+      if (!bestEnemy || (bestEnemy.isDrone && mDist < 3200)) {
+        bestEnemy = mateTarget;
+      }
+    }
+  }
+
+  // If our squad has no other alive members left, clear stale squadId so we can form a new team later
+  if (drone.squadId && squadMateCount === 0 && (seed + Math.floor(nowSec)) % 12 === 0) {
+    drone.squadId = null;
+  }
+
+  drone.aiTargetId = bestEnemy ? bestEnemy.id : null;
+
+  // 2. Compute desired steering vector
+  let steerX = sepX;
+  let steerY = sepY;
+  let wantsThrust = false;
+  let wantsShoot = false;
+
+  if (bestEnemy) {
+    const dx = shortestDelta(drone.x, bestEnemy.x, ARENA_WIDTH);
+    const dy = shortestDelta(drone.y, bestEnemy.y, ARENA_HEIGHT);
+    const dist = Math.max(1, Math.hypot(dx, dy));
+
+    // Predictive lead intercept calculation using target velocity & relative motion
+    const leadTime = Math.min(1.15, dist / Math.max(600, spec.bulletSpeed));
+    const leadDx = dx + (bestEnemy.vx - drone.vx * 0.35) * leadTime;
+    const leadDy = dy + (bestEnemy.vy - drone.vy * 0.35) * leadTime;
+    const leadAngle = Math.atan2(leadDy, leadDx);
+
+    if (dist < 310) {
+      // Close-quarters dogfight weave/strafe so AI circles and blasts the target instead of parking on top of it
+      const strafeAngle = leadAngle + strafeSign * (Math.PI * 0.38);
+      steerX += Math.cos(strafeAngle) * 1.6;
+      steerY += Math.sin(strafeAngle) * 1.6;
+      wantsThrust = true;
+    } else {
+      // Direct intercept pursuit
+      steerX += Math.cos(leadAngle) * 1.9;
+      steerY += Math.sin(leadAngle) * 1.9;
+      wantsThrust = dist > 380 || Math.hypot(drone.vx, drone.vy) < 380;
+    }
+
+    // Wingman Flanking Cohesion when teamed up
+    if (nearestMate && nearestMateDistSq < 1800 * 1800 && nearestMateDistSq > 220 * 220) {
+      const mdx = shortestDelta(drone.x, nearestMate.x, ARENA_WIDTH);
+      const mdy = shortestDelta(drone.y, nearestMate.y, ARENA_HEIGHT);
+      const mDist = Math.sqrt(nearestMateDistSq);
+      steerX += (mdx / mDist) * 0.48;
+      steerY += (mdy / mDist) * 0.48;
+    }
+
+    // Fire weapons when enemy is within 1,850 units and nose is lined up within ~24 degrees
+    const aimError = Math.abs(normAngle(leadAngle - drone.angle));
+    if (dist < 1850 && aimError < 0.42) {
+      wantsShoot = true;
+    }
+  } else {
+    // Roaming / Squad Patrol when no enemy is in range (never a circular galaxy spiral!)
+    if (nearestMate && nearestMateDistSq > 240 * 240 && nearestMateDistSq < 2200 * 2200) {
+      const mdx = shortestDelta(drone.x, nearestMate.x, ARENA_WIDTH);
+      const mdy = shortestDelta(drone.y, nearestMate.y, ARENA_HEIGHT);
+      const mDist = Math.sqrt(nearestMateDistSq);
+      steerX += (mdx / mDist) * 1.2 + Math.cos(nearestMate.angle) * 0.7;
+      steerY += (mdy / mDist) * 1.2 + Math.sin(nearestMate.angle) * 0.7;
+      wantsThrust = true;
+    } else {
+      const wanderAngle =
+        ((seed % 628) / 100) +
+        Math.sin(nowSec * 0.55 + (seed % 37)) * 1.15 +
+        Math.cos(nowSec * 0.27 + (seed % 19)) * 0.75;
+      steerX += Math.cos(wanderAngle);
+      steerY += Math.sin(wanderAngle);
+      wantsThrust = Math.hypot(drone.vx, drone.vy) < 340;
+    }
+  }
+
+  // 3. Hazard Avoidance (Central Gravity Star & Orbiting Planets)
+  if (gravityStarEnabled) {
+    const dxStar = shortestDelta(GRAVITY_STAR_X, drone.x, ARENA_WIDTH); // vector from Star to drone
+    const dyStar = shortestDelta(GRAVITY_STAR_Y, drone.y, ARENA_HEIGHT);
+    const distStar = Math.hypot(dxStar, dyStar);
+    if (distStar < GRAVITY_STAR_RADIUS + 950 && distStar > 1) {
+      const urgency = Math.min(4.0, (GRAVITY_STAR_RADIUS + 950 - distStar) / 220);
+      steerX += (dxStar / distStar) * urgency * 2.8;
+      steerY += (dyStar / distStar) * urgency * 2.8;
+      wantsThrust = true;
+    }
+  }
+
+  for (let i = 0; i < planets.length; i++) {
+    const planet = planets[i];
+    const dxP = shortestDelta(planet.x, drone.x, ARENA_WIDTH);
+    const dyP = shortestDelta(planet.y, drone.y, ARENA_HEIGHT);
+    const distP = Math.hypot(dxP, dyP);
+    const safeRadius = planet.radius + 320;
+    if (distP < safeRadius && distP > 1) {
+      const urgency = (safeRadius - distP) / 140;
+      steerX += (dxP / distP) * urgency * 2.4;
+      steerY += (dyP / distP) * urgency * 2.4;
+      wantsThrust = true;
+    }
+  }
+
+  // 4. Smoothly rotate ship nose toward desired steering vector
+  const desiredAngle =
+    Math.abs(steerX) > 0.001 || Math.abs(steerY) > 0.001
+      ? Math.atan2(steerY, steerX)
+      : drone.angle;
+  const angleDiff = normAngle(desiredAngle - drone.angle);
+  const maxTurn = 6.2 * dt;
+  drone.angle = normAngle(drone.angle + Math.max(-maxTurn, Math.min(maxTurn, angleDiff)));
+
+  // Also thrust if our current velocity vector is misaligned with where we want to go
+  const currentSpd = Math.hypot(drone.vx, drone.vy);
+  if (currentSpd > 460) {
+    // Gentle velocity vector damping when maneuvering at high speeds so AI ships turn sharply instead of drifting endlessly
+    const damp = Math.max(0.92, 1 - 0.85 * dt);
+    drone.vx *= damp;
+    drone.vy *= damp;
+  }
+
+  drone.thrusting = wantsThrust || currentSpd < 220;
+  drone.shooting = wantsShoot;
+}
+

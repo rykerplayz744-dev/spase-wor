@@ -127,7 +127,7 @@ export function getColocatedSpawnPoint(
   return getSafeSunOrbitPoint();
 }
 
-export function createInitialClientAsteroids(count: number = 24): AsteroidState[] {
+export function createInitialClientAsteroids(count: number = 48): AsteroidState[] {
   const list: AsteroidState[] = [];
   for (let i = 0; i < count; i++) {
     const theta = (i / count) * Math.PI * 2 + (i % 3) * 0.4;
@@ -159,6 +159,32 @@ export function createInitialClientAsteroids(count: number = 24): AsteroidState[
   return list;
 }
 
+const SQUAD_CALLSIGNS = [
+  'ALPHA',
+  'BRAVO',
+  'DELTA',
+  'OMEGA',
+  'VANGUARD',
+  'NOVA',
+  'SHADOW',
+  'CRIMSON',
+  'TITAN',
+  'APEX',
+  'VIPER',
+  'PHANTOM',
+];
+
+function randomSafeSectorCoords(): { x: number; y: number } {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const x = Math.random() * ARENA_WIDTH;
+    const y = Math.random() * ARENA_HEIGHT;
+    if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > 1750) {
+      return { x: Math.round(x), y: Math.round(y) };
+    }
+  }
+  return getSafeSunOrbitPoint();
+}
+
 export function createTargetDronesBatch(
   existingPlayers: Map<string, PlayerState>,
   countToSpawn: number,
@@ -167,34 +193,81 @@ export function createTargetDronesBatch(
   const spawned: PlayerState[] = [];
   let droneNum = Array.from(existingPlayers.values()).filter((p) => p.isDrone).length;
 
+  let currentSquadId: string | null = null;
+  let currentSquadColor: string = PLAYER_COLORS[0];
+  let currentSquadAnchor = randomSafeSectorCoords();
+  let currentSquadHeading = Math.random() * Math.PI * 2;
+  let squadRemaining = 0;
+  let squadIndex = Math.floor(Math.random() * SQUAD_CALLSIGNS.length);
+
   for (let i = 0; i < countToSpawn; i++) {
     droneNum++;
     const droneId = `drone_${Date.now().toString(36)}_${i}_${Math.random().toString(36).slice(2, 6)}`;
     const hull = HULL_LIST[(existingPlayers.size + i) % HULL_LIST.length];
     const spec = HULL_SPECS[hull];
-    const color = PLAYER_COLORS[(existingPlayers.size + i) % PLAYER_COLORS.length];
 
     let spawnX: number;
     let spawnY: number;
     let initAngle: number;
     let initSpeed: number;
+    let squadId: string | null = null;
+    let color = PLAYER_COLORS[(existingPlayers.size + i) % PLAYER_COLORS.length];
 
     if (countToSpawn === 1 && referencePlayer) {
-      // Spawn single target ship near the player so it is immediately visible
+      // Spawn single AI ship near the player at a random approach angle
       const theta = Math.random() * Math.PI * 2;
-      const dist = 260 + Math.random() * 240;
+      const dist = 360 + Math.random() * 320;
       spawnX = (((referencePlayer.x + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
       spawnY = (((referencePlayer.y + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-      initAngle = theta + Math.PI * 0.5;
+      initAngle = Math.atan2(referencePlayer.y - spawnY, referencePlayer.x - spawnX);
       initSpeed = 240 + Math.random() * 140;
     } else {
-      const frac = (i + 0.5) / countToSpawn;
-      const orbitRadius = 1400 + Math.sqrt(frac) * 7200;
-      const theta = i * 2.3999632 + Math.random() * 0.15;
-      spawnX = (((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-      spawnY = (((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-      initAngle = theta + Math.PI * 0.5;
-      initSpeed = 260 + Math.random() * 180;
+      // Mix of teamed tactical squads (~50% in 2-3 ship teams) and independent lone-wolf hunters (~50%)
+      if (squadRemaining > 0 && currentSquadId) {
+        squadId = currentSquadId;
+        color = currentSquadColor;
+        const wingAngle = Math.random() * Math.PI * 2;
+        const wingDist = 150 + Math.random() * 190;
+        spawnX = (((currentSquadAnchor.x + Math.cos(wingAngle) * wingAngleDist(wingDist)) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+        spawnY = (((currentSquadAnchor.y + Math.sin(wingAngle) * wingAngleDist(wingDist)) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+        initAngle = currentSquadHeading + (Math.random() - 0.5) * 0.35;
+        initSpeed = 250 + Math.random() * 130;
+        squadRemaining--;
+      } else if (Math.random() < 0.52 && countToSpawn - i >= 2) {
+        // Start a new 2-3 ship AI squad
+        const callsign = SQUAD_CALLSIGNS[squadIndex % SQUAD_CALLSIGNS.length];
+        squadIndex++;
+        currentSquadId = `${callsign}-${Math.floor(10 + Math.random() * 89)}`;
+        currentSquadColor = PLAYER_COLORS[squadIndex % PLAYER_COLORS.length];
+        currentSquadAnchor =
+          i < 6 && referencePlayer
+            ? {
+                x: (((referencePlayer.x + (Math.random() - 0.5) * 2600) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
+                y: (((referencePlayer.y + (Math.random() - 0.5) * 2200) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+              }
+            : randomSafeSectorCoords();
+        currentSquadHeading = Math.random() * Math.PI * 2;
+        squadRemaining = Math.random() < 0.45 ? 2 : 1; // total 2 or 3 ships in this team
+        squadId = currentSquadId;
+        color = currentSquadColor;
+        spawnX = currentSquadAnchor.x;
+        spawnY = currentSquadAnchor.y;
+        initAngle = currentSquadHeading;
+        initSpeed = 260 + Math.random() * 130;
+      } else {
+        // Independent lone-wolf hunter at random sector coordinates
+        const pt =
+          i < 8 && referencePlayer
+            ? {
+                x: (((referencePlayer.x + (Math.random() - 0.5) * 3200) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
+                y: (((referencePlayer.y + (Math.random() - 0.5) * 2600) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+              }
+            : randomSafeSectorCoords();
+        spawnX = pt.x;
+        spawnY = pt.y;
+        initAngle = Math.random() * Math.PI * 2;
+        initSpeed = 240 + Math.random() * 180;
+      }
     }
 
     const drone: PlayerState = {
@@ -218,15 +291,20 @@ export function createTargetDronesBatch(
       peakSpeed: Math.round(initSpeed),
       alive: true,
       respawnTimer: 0,
-      invulnerableTimer: 0,
+      invulnerableTimer: 0.4,
       lastFireTime: 0,
       inputSource: 'keyboard',
       isDrone: true,
+      squadId,
     };
     spawned.push(drone);
   }
 
   return spawned;
+}
+
+function wingAngleDist(d: number): number {
+  return d;
 }
 
 export function mergeSmoothRemotePlayerState(

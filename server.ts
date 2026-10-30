@@ -8,6 +8,7 @@ import { createServer as createViteServer } from 'vite';
 import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
+  arePlayersTeammates,
   AsteroidState,
   BulletState,
   ChatMessage,
@@ -30,8 +31,10 @@ import {
   ServerToClientMessage,
   SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
+  stepAiDroneAutopilot,
   WARP_DRIVE_SPEED,
 } from './src/shared/types.ts';
+import { createTargetDronesBatch } from './src/game/peerSync.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -132,7 +135,7 @@ function getOrCreateRoom(_roomId?: string): RoomState {
       clients: new Set(),
       colorIndex: 0,
     };
-    for (let i = 0; i < 28; i++) {
+    for (let i = 0; i < 56; i++) {
       const ast = createAsteroid(room);
       room.asteroids.set(ast.id, ast);
     }
@@ -402,8 +405,11 @@ function spawnPlayerBullets(room: RoomState, player: PlayerState, nowSec: number
   const cheats = player.cheats || DEFAULT_PLAYER_CHEATS;
 
   // Zero cooldown (0s) when 360° Nova Salvo or Hyper-Rapid Fire is active!
+  const baseCooldown = player.isDrone
+    ? Math.max(spec.fireCooldown * 1.5, 0.36)
+    : spec.fireCooldown;
   const effectiveCooldown =
-    cheats.novaSpread || cheats.rapidFire ? 0 : spec.fireCooldown;
+    cheats.novaSpread || cheats.rapidFire ? 0 : baseCooldown;
   if (effectiveCooldown > 0 && nowSec - player.lastFireTime < effectiveCooldown) return;
   player.lastFireTime = nowSec;
 
@@ -476,9 +482,11 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     planet.vy = Math.cos(planet.orbitAngle) * planet.orbitSpeed * planet.orbitRadius;
   }
 
-  if (room.asteroids.size < 8) {
-    const ast = createAsteroid(room);
-    room.asteroids.set(ast.id, ast);
+  if (room.asteroids.size < 56) {
+    for (let s = 0; s < 2 && room.asteroids.size < 56; s++) {
+      const ast = createAsteroid(room);
+      room.asteroids.set(ast.id, ast);
+    }
   }
 
   for (const ast of room.asteroids.values()) {
@@ -520,15 +528,14 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
 
     if (player.isDrone) {
-      const dxStar = shortestToroidalDelta(player.x, GRAVITY_STAR_X, ARENA_WIDTH);
-      const dyStar = shortestToroidalDelta(player.y, GRAVITY_STAR_Y, ARENA_HEIGHT);
-      const distStar = Math.hypot(dxStar, dyStar);
-      const orbitAngle = Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
-      player.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
-      const spd = Math.hypot(player.vx, player.vy);
-      player.thrusting = spd < 460 || distStar < 1100;
-      player.shooting =
-        room.players.size <= 12 && Math.sin(nowSec * 3.5 + player.x * 0.01) > 0.78;
+      stepAiDroneAutopilot(
+        player,
+        room.players,
+        room.planets,
+        room.gravityStarEnabled,
+        dt,
+        nowSec
+      );
     }
 
     if (player.cheats?.godMode || player.warping) {
@@ -909,10 +916,18 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
 
     let hitSomething = false;
 
+    const bulletOwner = room.players.get(bullet.ownerId) || null;
+
     for (let i = 0; i < alivePlayers.length; i++) {
       const entry = alivePlayers[i];
       const target = entry.player;
-      if (!target.alive || target.id === bullet.ownerId) continue;
+      if (
+        !target.alive ||
+        target.id === bullet.ownerId ||
+        arePlayersTeammates(bulletOwner, target)
+      ) {
+        continue;
+      }
 
       const r = bullet.isMissile ? entry.missileRadius : entry.hitRadius;
       const rSq = bullet.isMissile ? entry.missileRadiusSq : entry.hitRadiusSq;
@@ -1461,65 +1476,8 @@ async function startServer() {
             player.vy = 0;
           } else if (msg.action === 'spawn_drone' || msg.action === 'spawn_drones_100') {
             const countToSpawn = msg.action === 'spawn_drones_100' ? 100 : 1;
-            const hulls: ShipHullType[] = ['needle', 'wedge', 'interceptor', 'disc'];
-            let droneNum = Array.from(room.players.values()).filter((p) => p.isDrone).length;
-
-            for (let i = 0; i < countToSpawn; i++) {
-              droneNum++;
-              const droneId = nextId('drone');
-              const hull = hulls[(room.players.size + i) % hulls.length];
-              const spec = HULL_SPECS[hull];
-              const color = PLAYER_COLORS[room.colorIndex++ % PLAYER_COLORS.length];
-
-              let spawnX: number;
-              let spawnY: number;
-              let initAngle: number;
-              let initSpeed: number;
-
-              if (countToSpawn === 1) {
-                const theta = Math.random() * Math.PI * 2;
-                const dist = 260 + Math.random() * 220;
-                spawnX = wrapCoord(player.x + Math.cos(theta) * dist, ARENA_WIDTH);
-                spawnY = wrapCoord(player.y + Math.sin(theta) * dist, ARENA_HEIGHT);
-                initAngle = theta + Math.PI * 0.5;
-                initSpeed = 240 + Math.random() * 140;
-              } else {
-                // Golden-angle spiral distribution across the 10x star system for 100 target ships at once
-                const frac = (i + 0.5) / countToSpawn;
-                const orbitRadius = 1400 + Math.sqrt(frac) * 7200;
-                const theta = i * 2.3999632 + Math.random() * 0.15;
-                spawnX = wrapCoord(GRAVITY_STAR_X + Math.cos(theta) * orbitRadius, ARENA_WIDTH);
-                spawnY = wrapCoord(GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius, ARENA_HEIGHT);
-                initAngle = theta + Math.PI * 0.5;
-                initSpeed = 260 + Math.random() * 180;
-              }
-
-              const drone: PlayerState = {
-                id: droneId,
-                name: `TARGET-${droneNum}`,
-                color,
-                hull,
-                x: Math.round(spawnX),
-                y: Math.round(spawnY),
-                vx: Math.round(Math.cos(initAngle) * initSpeed),
-                vy: Math.round(Math.sin(initAngle) * initSpeed),
-                angle: Number(initAngle.toFixed(3)),
-                thrusting: true,
-                shooting: false,
-                hp: spec.maxHp,
-                maxHp: spec.maxHp,
-                score: 0,
-                kills: 0,
-                deaths: 0,
-                streak: 0,
-                peakSpeed: Math.round(initSpeed),
-                alive: true,
-                respawnTimer: 0,
-                invulnerableTimer: 0.4,
-                lastFireTime: 0,
-                inputSource: 'keyboard',
-                isDrone: true,
-              };
+            const spawnedDrones = createTargetDronesBatch(room.players, countToSpawn, player);
+            for (const drone of spawnedDrones) {
               room.players.set(drone.id, drone);
               if (countToSpawn === 1) {
                 broadcastRoom(room, { type: 'player:joined', player: drone });

@@ -1293,6 +1293,33 @@ export class SpacewarRenderer {
         ctx.restore();
       }
 
+      // If this ship is teamed up in a squad, draw a subtle wingman link line to nearby squadmates on screen
+      if (player.squadId) {
+        for (const mate of players.values()) {
+          if (
+            mate.alive &&
+            mate.id > player.id &&
+            mate.squadId === player.squadId
+          ) {
+            const mdx = shortestToroidalDelta(player.x, mate.x, ARENA_WIDTH);
+            const mdy = shortestToroidalDelta(player.y, mate.y, ARENA_HEIGHT);
+            if (Math.abs(mdx) < 620 && Math.abs(mdy) < 620 && mdx * mdx + mdy * mdy < 620 * 620) {
+              const mScreen = worldToScreen(mate.x, mate.y);
+              ctx.save();
+              ctx.globalAlpha = 0.28;
+              ctx.strokeStyle = player.color;
+              ctx.lineWidth = 1.2;
+              ctx.setLineDash([4, 6]);
+              ctx.beginPath();
+              ctx.moveTo(sx, sy);
+              ctx.lineTo(mScreen.sx, mScreen.sy);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+        }
+      }
+
       // Draw Ship Body
       ctx.save();
       ctx.translate(sx, sy);
@@ -1378,14 +1405,14 @@ export class SpacewarRenderer {
 
       ctx.restore();
 
-      // Draw Callsign, Speed & Hull Integrity Bar below ship
+      // Draw Callsign, Squad Tag, Speed & Hull Integrity Bar below ship
       const spd = Math.round(Math.hypot(player.vx, player.vy));
       ctx.save();
       ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
       ctx.fillStyle = player.warping ? '#38BDF8' : isLocal ? '#F8FAFC' : '#CBD5E1';
       ctx.textAlign = 'center';
       ctx.fillText(
-        `${player.name}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
+        `${player.name}${player.squadId ? ` [${player.squadId}]` : ''}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
         sx,
         sy + spec.radius + 18
       );
