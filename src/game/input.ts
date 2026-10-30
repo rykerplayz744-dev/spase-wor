@@ -96,6 +96,9 @@ export class InputManager {
   private lastInputSource: 'gamepad' | 'keyboard' = 'keyboard';
   private mapping: ControllerMapping;
 
+  private cachedGamepads: Gamepad[] = [];
+  private lastGamepadPollAt = 0;
+
   constructor() {
     this.mapping = loadControllerMapping();
     if (typeof window !== 'undefined') {
@@ -103,10 +106,15 @@ export class InputManager {
       window.addEventListener('keyup', this.onKeyUp);
       window.addEventListener('blur', this.onBlur);
       window.addEventListener('focusin', this.onFocusIn);
-      window.addEventListener('mousemove', this.onMouseMove);
-      window.addEventListener('mousedown', this.onMouseDown);
-      window.addEventListener('mouseup', this.onMouseUp);
+      window.addEventListener('mousemove', this.onMouseMove, { passive: true });
+      window.addEventListener('mousedown', this.onMouseDown, { passive: true });
+      window.addEventListener('mouseup', this.onMouseUp, { passive: true });
+      window.addEventListener('pointerup', this.onPointerUpOrCancel, { passive: true });
+      window.addEventListener('pointercancel', this.onPointerUpOrCancel, { passive: true });
+      window.addEventListener('touchend', this.onTouchEndOrCancel, { passive: true });
+      window.addEventListener('touchcancel', this.onTouchEndOrCancel, { passive: true });
       window.addEventListener('contextmenu', this.onContextMenu);
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
     }
   }
 
@@ -119,7 +127,12 @@ export class InputManager {
       window.removeEventListener('mousemove', this.onMouseMove);
       window.removeEventListener('mousedown', this.onMouseDown);
       window.removeEventListener('mouseup', this.onMouseUp);
+      window.removeEventListener('pointerup', this.onPointerUpOrCancel);
+      window.removeEventListener('pointercancel', this.onPointerUpOrCancel);
+      window.removeEventListener('touchend', this.onTouchEndOrCancel);
+      window.removeEventListener('touchcancel', this.onTouchEndOrCancel);
       window.removeEventListener('contextmenu', this.onContextMenu);
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
     }
   }
 
@@ -136,12 +149,55 @@ export class InputManager {
     this.currentAngle = angle;
   }
 
+  public clearHeldInputs() {
+    this.heldKeys.clear();
+    this.justPressedKeys.clear();
+    this.mouseLeftDown = false;
+    this.mouseRightDown = false;
+  }
+
   private onKeyDown = (e: KeyboardEvent) => {
+    // Never intercept ChromeOS system shortcuts, browser tab/window controls, or function keys
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    const code = e.code || (e.key === 'Escape' ? 'Escape' : '');
+
+    // Always allow Escape to release pointer lock and blur inputs on Chromebooks
+    if (code === 'Escape' || e.key === 'Escape' || e.key === 'BrowserBack') {
+      if (typeof document !== 'undefined' && document.pointerLockElement) {
+        document.exitPointerLock?.();
+      }
+      const active = document.activeElement as HTMLElement | null;
+      if (
+        active &&
+        (active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          active.tagName === 'SELECT' ||
+          active.tagName === 'BUTTON')
+      ) {
+        active.blur();
+      }
+      if (!e.repeat) {
+        this.justPressedKeys.add('Escape');
+      }
+      return;
+    }
+
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
-    const code = e.code;
-    if (!this.heldKeys.has(code)) {
+    // One-shot toggle keys should always register on non-repeat keydown even if ChromeOS swallowed a prior keyup
+    const isOneShotKey =
+      code === 'KeyK' ||
+      code === 'KeyP' ||
+      code === 'KeyE' ||
+      code === 'KeyQ' ||
+      code === 'KeyF' ||
+      code === 'Enter' ||
+      code === 'BracketLeft' ||
+      code === 'BracketRight';
+
+    if (!this.heldKeys.has(code) || (isOneShotKey && !e.repeat)) {
       this.justPressedKeys.add(code);
     }
     this.heldKeys.add(code);
@@ -149,7 +205,12 @@ export class InputManager {
   };
 
   private onKeyUp = (e: KeyboardEvent) => {
-    this.heldKeys.delete(e.code);
+    if (e.code) {
+      this.heldKeys.delete(e.code);
+    }
+    if (e.key === 'Escape') {
+      this.heldKeys.delete('Escape');
+    }
   };
 
   private onFocusIn = (e: FocusEvent) => {
@@ -163,21 +224,45 @@ export class InputManager {
   };
 
   private onBlur = () => {
-    this.heldKeys.clear();
-    this.justPressedKeys.clear();
-    this.mouseLeftDown = false;
-    this.mouseRightDown = false;
+    this.clearHeldInputs();
+  };
+
+  private onVisibilityChange = () => {
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.clearHeldInputs();
+    }
   };
 
   private onMouseMove = (e: MouseEvent) => {
     this.mousePos.x = e.clientX;
     this.mousePos.y = e.clientY;
     this.mouseMovedRecently = true;
+    // Chromebook touchpad safeguard: if no mouse buttons are physically held during move, clear any stuck button state
+    if (typeof e.buttons === 'number') {
+      if ((e.buttons & 1) === 0 && this.mouseLeftDown) {
+        this.mouseLeftDown = false;
+      }
+      if ((e.buttons & 2) === 0 && this.mouseRightDown) {
+        this.mouseRightDown = false;
+      }
+    }
   };
 
   private onMouseDown = (e: MouseEvent) => {
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === 'BUTTON' || tag === 'INPUT' || (e.target as HTMLElement)?.closest('button')) return;
+    if (typeof document !== 'undefined' && document.pointerLockElement) {
+      document.exitPointerLock?.();
+    }
+    const target = e.target as HTMLElement | null;
+    // Only treat clicks directly on the game <canvas> as ship fire/thrust; never intercept UI buttons or modals
+    if (
+      !target ||
+      target.tagName !== 'CANVAS' ||
+      target.closest('button, input, textarea, select, a, label, [role="button"], [role="dialog"]')
+    ) {
+      this.mouseLeftDown = false;
+      this.mouseRightDown = false;
+      return;
+    }
     if (e.button === 0) {
       this.mouseLeftDown = true;
       this.lastInputSource = 'keyboard';
@@ -190,6 +275,20 @@ export class InputManager {
   private onMouseUp = (e: MouseEvent) => {
     if (e.button === 0) this.mouseLeftDown = false;
     if (e.button === 2) this.mouseRightDown = false;
+    if (typeof e.buttons === 'number' && e.buttons === 0) {
+      this.mouseLeftDown = false;
+      this.mouseRightDown = false;
+    }
+  };
+
+  private onPointerUpOrCancel = () => {
+    this.mouseLeftDown = false;
+    this.mouseRightDown = false;
+  };
+
+  private onTouchEndOrCancel = () => {
+    this.mouseLeftDown = false;
+    this.mouseRightDown = false;
   };
 
   private onContextMenu = (e: MouseEvent) => {
@@ -197,18 +296,30 @@ export class InputManager {
     if (tag === 'CANVAS') {
       e.preventDefault();
     }
+    this.mouseLeftDown = false;
+    this.mouseRightDown = false;
   };
 
   public getConnectedGamepads(): Gamepad[] {
     if (typeof navigator === 'undefined' || !navigator.getGamepads) return [];
-    const list = navigator.getGamepads();
-    const result: Gamepad[] = [];
-    for (const gp of list) {
-      if (gp && gp.connected) {
-        result.push(gp);
-      }
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (now - this.lastGamepadPollAt < 24) {
+      return this.cachedGamepads;
     }
-    return result;
+    this.lastGamepadPollAt = now;
+    try {
+      const list = navigator.getGamepads();
+      const result: Gamepad[] = [];
+      for (const gp of list) {
+        if (gp && gp.connected) {
+          result.push(gp);
+        }
+      }
+      this.cachedGamepads = result;
+      return result;
+    } catch {
+      return this.cachedGamepads;
+    }
   }
 
   /**

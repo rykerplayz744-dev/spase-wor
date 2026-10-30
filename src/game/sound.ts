@@ -41,26 +41,61 @@ class SoundEngine {
     return this.muted;
   }
 
-  public playLaser(hull: string = 'needle') {
+  private activeVoices: number = 0;
+  private lastLaserTime: number = 0;
+  private lastNonFatalHitTime: number = 0;
+  private lastFatalHitTime: number = 0;
+  private lastWarpTime: number = 0;
+  private lastMissileTime: number = 0;
+
+  private spawnVoice(
+    type: OscillatorType,
+    setup: (osc: OscillatorNode, gain: GainNode, now: number) => number
+  ) {
+    if (this.activeVoices >= 10) return;
     const ctx = this.ensureContext();
     if (!ctx) return;
 
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
+    osc.type = type;
 
-    osc.type = hull === 'wedge' ? 'sawtooth' : hull === 'disc' ? 'triangle' : 'square';
-    const startFreq = hull === 'wedge' ? 520 : hull === 'interceptor' ? 980 : 760;
-    osc.frequency.setValueAtTime(startFreq, now);
-    osc.frequency.exponentialRampToValueAtTime(110, now + 0.11);
+    const duration = setup(osc, gain, now);
+    this.activeVoices++;
 
-    gain.gain.setValueAtTime(0.09, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
+    osc.onended = () => {
+      this.activeVoices = Math.max(0, this.activeVoices - 1);
+      try {
+        osc.disconnect();
+        gain.disconnect();
+      } catch {
+        // ignore
+      }
+    };
 
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start(now);
-    osc.stop(now + 0.12);
+    osc.stop(now + duration);
+  }
+
+  public playLaser(hull: string = 'needle') {
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowPerf - this.lastLaserTime < 48) return;
+    this.lastLaserTime = nowPerf;
+
+    const oscType: OscillatorType =
+      hull === 'wedge' ? 'sawtooth' : hull === 'disc' ? 'triangle' : 'square';
+    const startFreq = hull === 'wedge' ? 520 : hull === 'interceptor' ? 980 : 760;
+
+    this.spawnVoice(oscType, (osc, gain, now) => {
+      osc.frequency.setValueAtTime(startFreq, now);
+      osc.frequency.exponentialRampToValueAtTime(110, now + 0.11);
+      gain.gain.setValueAtTime(0.08, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
+      return 0.12;
+    });
   }
 
   public updateThrust(active: boolean, currentSpeed: number) {
@@ -113,75 +148,52 @@ class SoundEngine {
     this.isThrustPlaying = false;
   }
 
-  private lastFatalHitTime: number = 0;
-
   public playHit(fatal: boolean = false) {
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
     if (fatal) {
-      const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
       if (nowPerf - this.lastFatalHitTime < 450) return;
       this.lastFatalHitTime = nowPerf;
+    } else {
+      if (nowPerf - this.lastNonFatalHitTime < 45) return;
+      this.lastNonFatalHitTime = nowPerf;
     }
-    const ctx = this.ensureContext();
-    if (!ctx) return;
 
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    osc.type = fatal ? 'sawtooth' : 'triangle';
-    osc.frequency.setValueAtTime(fatal ? 220 : 340, now);
-    osc.frequency.exponentialRampToValueAtTime(fatal ? 32 : 75, now + (fatal ? 0.42 : 0.14));
-
-    gain.gain.setValueAtTime(fatal ? 0.18 : 0.11, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + (fatal ? 0.42 : 0.14));
-
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + (fatal ? 0.44 : 0.15));
+    this.spawnVoice(fatal ? 'sawtooth' : 'triangle', (osc, gain, now) => {
+      osc.frequency.setValueAtTime(fatal ? 220 : 340, now);
+      osc.frequency.exponentialRampToValueAtTime(fatal ? 32 : 75, now + (fatal ? 0.42 : 0.14));
+      gain.gain.setValueAtTime(fatal ? 0.16 : 0.1, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + (fatal ? 0.42 : 0.14));
+      return fatal ? 0.44 : 0.15;
+    });
   }
 
   public playWarp() {
-    const ctx = this.ensureContext();
-    if (!ctx) return;
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowPerf - this.lastWarpTime < 120) return;
+    this.lastWarpTime = nowPerf;
 
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(180, now);
-    osc.frequency.exponentialRampToValueAtTime(920, now + 0.18);
-
-    gain.gain.setValueAtTime(0.1, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.19);
-
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.2);
+    this.spawnVoice('sine', (osc, gain, now) => {
+      osc.frequency.setValueAtTime(180, now);
+      osc.frequency.exponentialRampToValueAtTime(920, now + 0.18);
+      gain.gain.setValueAtTime(0.1, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.19);
+      return 0.2;
+    });
   }
 
   public playMissileLaunch() {
-    const ctx = this.ensureContext();
-    if (!ctx) return;
+    const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowPerf - this.lastMissileTime < 70) return;
+    this.lastMissileTime = nowPerf;
 
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(240, now);
-    osc.frequency.exponentialRampToValueAtTime(680, now + 0.08);
-    osc.frequency.exponentialRampToValueAtTime(180, now + 0.22);
-
-    gain.gain.setValueAtTime(0.11, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.23);
-
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.24);
+    this.spawnVoice('sawtooth', (osc, gain, now) => {
+      osc.frequency.setValueAtTime(240, now);
+      osc.frequency.exponentialRampToValueAtTime(680, now + 0.08);
+      osc.frequency.exponentialRampToValueAtTime(180, now + 0.22);
+      gain.gain.setValueAtTime(0.1, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.23);
+      return 0.24;
+    });
   }
 }
 

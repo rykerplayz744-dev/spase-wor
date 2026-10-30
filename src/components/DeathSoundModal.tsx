@@ -31,6 +31,37 @@ function getBundledDeathSounds(): OggSoundEffect[] {
 export const DEFAULT_DEATH_SOUND_FILE = 'classic_explosion.ogg';
 export const DEFAULT_SMASH_SOUND_FILE = 'smash_collision.ogg';
 
+// Persistent in-RAM Blob URL cache for all .ogg death/smash sound effects
+const ramDeathSoundCache = new Map<string, string>();
+const ramDeathSoundInFlight = new Map<string, Promise<string | null>>();
+
+async function preloadDeathSoundIntoRam(snd: OggSoundEffect): Promise<string | null> {
+  const key = snd.filename.toLowerCase();
+  const existing = ramDeathSoundCache.get(key);
+  if (existing) return existing;
+
+  const inflight = ramDeathSoundInFlight.get(key);
+  if (inflight) return inflight;
+
+  const promise = (async (): Promise<string | null> => {
+    try {
+      const res = await fetch(snd.url, { cache: 'force-cache' });
+      if (!res.ok) return null;
+      const ab = await res.arrayBuffer();
+      const blobUrl = URL.createObjectURL(new Blob([ab], { type: 'audio/ogg' }));
+      ramDeathSoundCache.set(key, blobUrl);
+      return blobUrl;
+    } catch {
+      return null;
+    } finally {
+      ramDeathSoundInFlight.delete(key);
+    }
+  })();
+
+  ramDeathSoundInFlight.set(key, promise);
+  return promise;
+}
+
 export interface DeathSoundController {
   sounds: OggSoundEffect[];
   selectedDeathSound: string;
@@ -60,6 +91,13 @@ export function useDeathSoundController(): DeathSoundController {
   selectedDeathRef.current = selectedDeathSound;
   const selectedSmashRef = useRef<string>(selectedSmashSound);
   selectedSmashRef.current = selectedSmashSound;
+
+  // Automatically preload all death & smash .ogg sound effects into RAM on startup
+  useEffect(() => {
+    for (const snd of sounds) {
+      preloadDeathSoundIntoRam(snd);
+    }
+  }, [sounds]);
 
   const refreshFolder = useCallback(async () => {
     setIsLoading(true);
@@ -102,12 +140,17 @@ export function useDeathSoundController(): DeathSoundController {
     if (list.length === 0) return null;
     const targetName = filename || fallbackDefault || DEFAULT_DEATH_SOUND_FILE;
     const exact = list.find((s) => s.filename.toLowerCase() === targetName.toLowerCase());
-    if (exact) return exact.url;
+    if (exact) {
+      return ramDeathSoundCache.get(exact.filename.toLowerCase()) || exact.url;
+    }
     if (fallbackDefault) {
       const fb = list.find((s) => s.filename.toLowerCase() === fallbackDefault.toLowerCase());
-      if (fb) return fb.url;
+      if (fb) {
+        return ramDeathSoundCache.get(fb.filename.toLowerCase()) || fb.url;
+      }
     }
-    return list[0].url;
+    const first = list[0];
+    return ramDeathSoundCache.get(first.filename.toLowerCase()) || first.url;
   }, []);
 
   const previewSound = useCallback(
@@ -223,8 +266,18 @@ export const DeathSoundModal: React.FC<DeathSoundModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#060913]/85 p-4 pointer-events-auto">
-      <div className="w-full max-w-lg rounded-xl border border-amber-500/40 bg-[#0B1120] p-6 text-slate-100 shadow-2xl">
+    <div
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#060913]/85 p-4 pointer-events-auto"
+    >
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        className="w-full max-w-lg rounded-xl border border-amber-500/40 bg-[#0B1120] p-6 text-slate-100 shadow-2xl pointer-events-auto"
+      >
         {/* Header */}
         <div className="flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
           <div>
@@ -239,10 +292,11 @@ export const DeathSoundModal: React.FC<DeathSoundModalProps> = ({
             </p>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0"
+            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Close
+            Close (Esc)
           </button>
         </div>
 

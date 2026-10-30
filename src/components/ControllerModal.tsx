@@ -137,8 +137,18 @@ export const ControllerModal: React.FC<ControllerModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#060913]/88 p-4">
-      <div className="w-full max-w-2xl rounded-xl border border-slate-800 bg-[#0B1120] p-6 text-slate-100 shadow-2xl">
+    <div
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#060913]/88 p-4 pointer-events-auto"
+    >
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        className="w-full max-w-2xl rounded-xl border border-slate-800 bg-[#0B1120] p-6 text-slate-100 shadow-2xl pointer-events-auto"
+      >
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div>
             <h2 className="font-display text-xl font-bold tracking-tight text-white">
@@ -149,10 +159,11 @@ export const ControllerModal: React.FC<ControllerModalProps> = ({
             </p>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0"
+            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Close
+            Close (Esc)
           </button>
         </div>
 

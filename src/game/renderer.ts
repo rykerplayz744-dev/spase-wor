@@ -765,17 +765,26 @@ export class SpacewarRenderer {
     }
 
     // 4. Render Central Gravity Star ("The Heavy Star" - 10x Scale)
+    const maxViewHalfDiag = Math.hypot(width, height) * 0.58;
     if (gravityStarEnabled) {
       const { sx, sy } = worldToScreen(GRAVITY_STAR_X, GRAVITY_STAR_Y);
-      // Gravity well contour rings (10x scale)
+      const distToSunCenter = Math.hypot(sx - viewCenterX, sy - viewCenterY);
+      const baseAngleToCam = Math.atan2(viewCenterY - sy, viewCenterX - sx);
+
+      // Gravity well contour rings (10x scale) - culled to visible viewport arc to protect ChromeOS GPU
       const ringRadii = [1800, 3800, 6500];
       ctx.save();
-      ctx.setLineDash([6, 12]);
+      ctx.lineWidth = 1;
       for (let i = 0; i < ringRadii.length; i++) {
+        const r = ringRadii[i];
+        if (Math.abs(distToSunCenter - r) > maxViewHalfDiag) continue;
+        const span =
+          distToSunCenter < r * 0.35
+            ? Math.PI
+            : Math.min(Math.PI, (maxViewHalfDiag / Math.max(r, 1)) * 1.25);
         ctx.strokeStyle = `rgba(245, 158, 11, ${0.14 - i * 0.035})`;
-        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.arc(sx, sy, ringRadii[i], 0, Math.PI * 2);
+        ctx.arc(sx, sy, r, baseAngleToCam - span, baseAngleToCam + span);
         ctx.stroke();
       }
       ctx.restore();
@@ -832,16 +841,22 @@ export class SpacewarRenderer {
     // 4b. Render Planetary Orbit Tracks & Orbiting Planets around the Sun
     if (planets.length > 0) {
       const sunScreen = worldToScreen(GRAVITY_STAR_X, GRAVITY_STAR_Y);
+      const distToSunCenter = Math.hypot(sunScreen.sx - viewCenterX, sunScreen.sy - viewCenterY);
+      const baseAngleToCam = Math.atan2(viewCenterY - sunScreen.sy, viewCenterX - sunScreen.sx);
 
-      // Draw faint orbital path rings around the Sun
+      // Draw faint orbital path rings around the Sun (culled to visible viewport arc)
       ctx.save();
-      ctx.setLineDash([5, 9]);
       ctx.lineWidth = 1;
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.13)';
       for (let i = 0; i < planets.length; i++) {
-        const planet = planets[i];
-        ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
+        const r = planets[i].orbitRadius;
+        if (Math.abs(distToSunCenter - r) > maxViewHalfDiag) continue;
+        const span =
+          distToSunCenter < r * 0.35
+            ? Math.PI
+            : Math.min(Math.PI, (maxViewHalfDiag / Math.max(r, 1)) * 1.25);
         ctx.beginPath();
-        ctx.arc(sunScreen.sx, sunScreen.sy, planet.orbitRadius, 0, Math.PI * 2);
+        ctx.arc(sunScreen.sx, sunScreen.sy, r, baseAngleToCam - span, baseAngleToCam + span);
         ctx.stroke();
       }
       ctx.restore();
@@ -917,27 +932,24 @@ export class SpacewarRenderer {
         ctx.arc(0, 0, planet.radius, 0, Math.PI * 2);
         ctx.fill();
 
-        // Vector latitude bands clipped to planet sphere
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(0, 0, planet.radius, 0, Math.PI * 2);
-        ctx.clip();
+        // Vector latitude bands fitted inside planet sphere (avoids expensive GPU stencil clip)
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
         ctx.lineWidth = 1.2;
         for (let b = -1; b <= 1; b++) {
+          const latY = b * planet.radius * 0.42;
+          const chordRx = planet.radius * (b === 0 ? 0.98 : 0.89);
           ctx.beginPath();
           ctx.ellipse(
             0,
-            b * planet.radius * 0.42,
-            planet.radius * 1.05,
-            planet.radius * 0.18,
+            latY,
+            chordRx,
+            planet.radius * 0.16,
             0,
             0,
             Math.PI * 2
           );
           ctx.stroke();
         }
-        ctx.restore();
 
         // Crisp vector rim outline
         ctx.strokeStyle = planet.accentColor;
@@ -1156,6 +1168,11 @@ export class SpacewarRenderer {
       dy: number;
       dist: number;
     }[] = [];
+    const onScreenSquadShips: {
+      player: PlayerState;
+      sx: number;
+      sy: number;
+    }[] = [];
 
     for (const player of players.values()) {
       if (!player.alive) continue;
@@ -1293,31 +1310,9 @@ export class SpacewarRenderer {
         ctx.restore();
       }
 
-      // If this ship is teamed up in a squad, draw a subtle wingman link line to nearby squadmates on screen
+      // Record on-screen squad ships so we can draw wingman links in O(K^2) instead of O(N^2)
       if (player.squadId) {
-        for (const mate of players.values()) {
-          if (
-            mate.alive &&
-            mate.id > player.id &&
-            mate.squadId === player.squadId
-          ) {
-            const mdx = shortestToroidalDelta(player.x, mate.x, ARENA_WIDTH);
-            const mdy = shortestToroidalDelta(player.y, mate.y, ARENA_HEIGHT);
-            if (Math.abs(mdx) < 620 && Math.abs(mdy) < 620 && mdx * mdx + mdy * mdy < 620 * 620) {
-              const mScreen = worldToScreen(mate.x, mate.y);
-              ctx.save();
-              ctx.globalAlpha = 0.28;
-              ctx.strokeStyle = player.color;
-              ctx.lineWidth = 1.2;
-              ctx.setLineDash([4, 6]);
-              ctx.beginPath();
-              ctx.moveTo(sx, sy);
-              ctx.lineTo(mScreen.sx, mScreen.sy);
-              ctx.stroke();
-              ctx.restore();
-            }
-          }
-        }
+        onScreenSquadShips.push({ player, sx, sy });
       }
 
       // Draw Ship Body
@@ -1438,6 +1433,30 @@ export class SpacewarRenderer {
             ? player.music.title.slice(0, 24) + '…'
             : player.music.title;
         ctx.fillText(`♪ ${shortTitle}`, sx, barY + 14);
+      }
+      ctx.restore();
+    }
+
+    // 8a. Render Wingman Links between On-Screen Squad Ships
+    if (onScreenSquadShips.length > 1) {
+      ctx.save();
+      ctx.globalAlpha = 0.24;
+      ctx.lineWidth = 1.2;
+      for (let i = 0; i < onScreenSquadShips.length; i++) {
+        const a = onScreenSquadShips[i];
+        for (let j = i + 1; j < onScreenSquadShips.length; j++) {
+          const b = onScreenSquadShips[j];
+          if (a.player.squadId === b.player.squadId) {
+            const dSq = (a.sx - b.sx) * (a.sx - b.sx) + (a.sy - b.sy) * (a.sy - b.sy);
+            if (dSq < 620 * 620) {
+              ctx.strokeStyle = a.player.color;
+              ctx.beginPath();
+              ctx.moveTo(a.sx, a.sy);
+              ctx.lineTo(b.sx, b.sy);
+              ctx.stroke();
+            }
+          }
+        }
       }
       ctx.restore();
     }

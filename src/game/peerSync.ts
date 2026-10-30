@@ -90,6 +90,11 @@ export type PeerSyncPacket =
       type: 'peer:chat';
       senderId: string;
       message: ChatMessage;
+    }
+  | {
+      type: 'peer:focus';
+      senderId: string;
+      focused: boolean;
     };
 
 export function getSafeSunOrbitPoint(): { x: number; y: number } {
@@ -127,16 +132,25 @@ export function getColocatedSpawnPoint(
   return getSafeSunOrbitPoint();
 }
 
-export function createInitialClientAsteroids(count: number = 48): AsteroidState[] {
+export function createInitialClientAsteroids(
+  count: number = 192,
+  randomize: boolean = false
+): AsteroidState[] {
   const list: AsteroidState[] = [];
   for (let i = 0; i < count; i++) {
-    const theta = (i / count) * Math.PI * 2 + (i % 3) * 0.4;
-    const dist = 2000 + ((i * 571) % 6200);
+    const theta = randomize
+      ? Math.random() * Math.PI * 2
+      : (i / count) * Math.PI * 2 + (i % 5) * 0.37;
+    const dist = randomize
+      ? 1800 + Math.random() * 6400
+      : 1800 + ((i * 571) % 6400);
     const x = (((GRAVITY_STAR_X + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
     const y = (((GRAVITY_STAR_Y + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-    const radius = 40 + ((i * 19) % 48);
-    const speed = 40 + ((i * 23) % 65);
-    const moveAngle = theta + Math.PI * 0.5;
+    const radius = randomize
+      ? Math.round(24 + Math.random() * 34)
+      : 24 + ((i * 19) % 34);
+    const speed = randomize ? 35 + Math.random() * 75 : 40 + ((i * 23) % 65);
+    const moveAngle = randomize ? Math.random() * Math.PI * 2 : theta + Math.PI * 0.5;
     const vertices: number[] = [];
     for (let v = 0; v < 10; v++) {
       vertices.push(0.8 + (((i + v) * 13) % 35) * 0.01);
@@ -401,6 +415,8 @@ export class PeerSectorSync {
   private seenHits = new Set<string>();
   private seenChats = new Set<string>();
   private isPolling = false;
+  private focusedPeerId: string | null = null;
+  private focusListenersCleanup: (() => void) | null = null;
 
   constructor(selfId: string, onPacket: (packet: PeerSyncPacket) => void) {
     this.selfId = selfId;
@@ -417,11 +433,70 @@ export class PeerSectorSync {
         // Ignore if BroadcastChannel is blocked
       }
     }
+
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      if (document.hasFocus()) {
+        this.focusedPeerId = this.selfId;
+      }
+      const onFocus = () => {
+        this.focusedPeerId = this.selfId;
+        this.broadcastFocus(true);
+      };
+      const onBlur = () => {
+        this.broadcastFocus(false);
+      };
+      const onVis = () => {
+        if (document.visibilityState === 'visible' && document.hasFocus()) {
+          this.focusedPeerId = this.selfId;
+          this.broadcastFocus(true);
+        } else if (document.visibilityState === 'hidden') {
+          this.broadcastFocus(false);
+        }
+      };
+      window.addEventListener('focus', onFocus);
+      window.addEventListener('blur', onBlur);
+      document.addEventListener('visibilitychange', onVis);
+      this.focusListenersCleanup = () => {
+        window.removeEventListener('focus', onFocus);
+        window.removeEventListener('blur', onBlur);
+        document.removeEventListener('visibilitychange', onVis);
+      };
+    }
+  }
+
+  private broadcastFocus(focused: boolean) {
+    if (!this.channel) return;
+    try {
+      this.channel.postMessage({
+        type: 'peer:focus',
+        senderId: this.selfId,
+        focused,
+      } satisfies PeerSyncPacket);
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
+   * Returns true if another local browser tab/window on the same computer currently has focus,
+   * so this background tab yields its flat cockpit audio and lets the focused tab render spatial proximity audio.
+   */
+  public isAnotherLocalTabFocused(): boolean {
+    return Boolean(this.focusedPeerId && this.focusedPeerId !== this.selfId);
   }
 
   private handleIncomingPacket(pkt: PeerSyncPacket) {
     if (!pkt || pkt.senderId === this.selfId) return;
     this.peerLastSeen.set(pkt.senderId, Date.now());
+
+    if (pkt.type === 'peer:focus') {
+      if (pkt.focused) {
+        this.focusedPeerId = pkt.senderId;
+      } else if (this.focusedPeerId === pkt.senderId) {
+        this.focusedPeerId = typeof document !== 'undefined' && document.hasFocus() ? this.selfId : null;
+      }
+      return;
+    }
 
     if (pkt.type === 'peer:salvo') {
       if (this.seenSalvos.has(pkt.salvo.idPrefix)) return;
@@ -540,7 +615,8 @@ export class PeerSectorSync {
 
   public startCloudRelayPoll(
     isWsConnected: () => boolean,
-    getLocalPlayer: () => PlayerState | undefined
+    getLocalPlayer: () => PlayerState | undefined,
+    onServerTime?: (serverTime: number) => void
   ) {
     if (this.pollTimer) window.clearInterval(this.pollTimer);
     this.pollTimer = window.setInterval(async () => {
@@ -563,9 +639,13 @@ export class PeerSectorSync {
         if (res.ok) {
           const data = (await res.json()) as {
             latestSeq?: number;
+            serverTime?: number;
             players?: PlayerState[];
             events?: PeerSyncPacket[];
           };
+          if (typeof data.serverTime === 'number' && onServerTime) {
+            onServerTime(data.serverTime);
+          }
           if (typeof data.latestSeq === 'number' && data.latestSeq > this.lastCloudSeq) {
             this.lastCloudSeq = data.latestSeq;
           }
@@ -596,6 +676,10 @@ export class PeerSectorSync {
   }
 
   public destroy(localPlayerId: string) {
+    if (this.focusListenersCleanup) {
+      this.focusListenersCleanup();
+      this.focusListenersCleanup = null;
+    }
     if (this.pollTimer) {
       window.clearInterval(this.pollTimer);
       this.pollTimer = null;

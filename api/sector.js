@@ -40,6 +40,34 @@ export default function handler(req, res) {
           activePlayers.delete(existingId);
         }
       }
+
+      const prevEntry = activePlayers.get(body.player.id);
+      const incomingMusic = body.player.music;
+      if (incomingMusic && incomingMusic.isPlaying) {
+        const prevMusic = prevEntry?.player?.music;
+        const reportedTrackTime = Math.max(0, Number(incomingMusic.trackTime) || 0);
+        const computedStartMs = now - Math.round(reportedTrackTime * 1000);
+        const isSameTrack =
+          prevMusic &&
+          prevMusic.isPlaying &&
+          prevMusic.filename === incomingMusic.filename;
+        const prevStartMs = prevMusic?.startedAtServerMs;
+        const didSeekOrRestart =
+          !isSameTrack ||
+          typeof prevStartMs !== 'number' ||
+          Math.abs(computedStartMs - prevStartMs) > 650;
+
+        const authoritativeStartMs = didSeekOrRestart ? computedStartMs : prevStartMs;
+        body.player.music = {
+          ...incomingMusic,
+          startedAtServerMs: authoritativeStartMs,
+          trackTime: Math.max(0, Number(((now - authoritativeStartMs) / 1000).toFixed(3))),
+          updatedAt: now,
+        };
+      } else {
+        body.player.music = null;
+      }
+
       activePlayers.set(body.player.id, {
         player: body.player,
         updatedAt: now,
@@ -55,13 +83,18 @@ export default function handler(req, res) {
           activePlayers.delete(pkt.playerId);
         }
 
-        // Maintain shared target drones on the relay as well
+        // Maintain shared target drones on the relay (capped at 100 so serverless polls stay fast on Chromebooks)
         if (pkt.type === 'peer:cheat_action') {
           if (Array.isArray(pkt.spawnedDrones)) {
             for (const d of pkt.spawnedDrones) {
               if (d && typeof d.id === 'string') {
                 sharedDrones.set(d.id, d);
               }
+            }
+            while (sharedDrones.size > 100) {
+              const oldestKey = sharedDrones.keys().next().value;
+              if (!oldestKey) break;
+              sharedDrones.delete(oldestKey);
             }
           } else if (pkt.action === 'clear_drones') {
             sharedDrones.clear();
@@ -88,12 +121,28 @@ export default function handler(req, res) {
     }
   }
 
+  // If no human players are active in the sector, clear leftover drones so fresh sessions start clean
+  if (activePlayers.size === 0 && sharedDrones.size > 0) {
+    sharedDrones.clear();
+  }
+
   const players = [];
   for (const entry of activePlayers.values()) {
-    players.push(entry.player);
+    const p = entry.player;
+    if (p && p.music && p.music.isPlaying && typeof p.music.startedAtServerMs === 'number') {
+      p.music = {
+        ...p.music,
+        trackTime: Math.max(0, Number(((now - p.music.startedAtServerMs) / 1000).toFixed(3))),
+        updatedAt: now,
+      };
+    }
+    players.push(p);
   }
-  for (const drone of sharedDrones.values()) {
-    players.push(drone);
+  // Only send the full sharedDrones list on initial join (sinceSeq === 0); subsequent polls receive drone spawns/clears via newEvents
+  if (sinceSeq === 0) {
+    for (const drone of sharedDrones.values()) {
+      players.push(drone);
+    }
   }
 
   const newEvents =
@@ -103,6 +152,7 @@ export default function handler(req, res) {
 
   res.status(200).json({
     roomId: 'SECTOR-01',
+    serverTime: now,
     latestSeq: eventSeq - 1,
     players,
     events: newEvents,

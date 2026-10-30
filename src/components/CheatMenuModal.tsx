@@ -72,7 +72,10 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
   );
   const [loadingPngs, setLoadingPngs] = useState<boolean>(false);
 
-  const otherShips = players.filter((p) => p.id !== selfId);
+  const otherShips = players
+    .filter((p) => p.id !== selfId)
+    .sort((a, b) => Number(Boolean(a.isDrone)) - Number(Boolean(b.isDrone)))
+    .slice(0, 32);
 
   const refreshShipPngs = useCallback(async () => {
     setLoadingPngs(true);
@@ -93,19 +96,11 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
     setLoadingPngs(false);
   }, []);
 
+  // Only refresh PNGs when the Cheat Menu is opened — never on 80ms player telemetry updates!
   useEffect(() => {
     if (!isOpen) return;
     refreshShipPngs();
-    setDraftNames((prev) => {
-      const next = { ...prev };
-      for (const p of players) {
-        if (p.id !== selfId && next[p.id] === undefined) {
-          next[p.id] = p.name;
-        }
-      }
-      return next;
-    });
-  }, [isOpen, players, refreshShipPngs, selfId]);
+  }, [isOpen, refreshShipPngs]);
 
   if (!isOpen) return null;
 
@@ -135,8 +130,18 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#060913]/80 p-4">
-      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-rose-500/40 bg-[#0B1120] p-6 text-slate-100 shadow-2xl">
+    <div
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#060913]/80 p-4 pointer-events-auto"
+    >
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-rose-500/40 bg-[#0B1120] p-6 text-slate-100 shadow-2xl pointer-events-auto"
+      >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div>
@@ -144,14 +149,15 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
               Cheat & Experimental Weapons Menu
             </h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              Press <span className="font-mono-tabular text-amber-400">K</span> anytime to toggle this menu. Changes apply immediately in live play.
+              Press <span className="font-mono-tabular text-amber-400">K</span> or <span className="font-mono-tabular text-amber-400">Esc</span> anytime to toggle this menu. Changes apply immediately in live play.
             </p>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0"
+            className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Resume (K)
+            Resume (K / Esc)
           </button>
         </div>
 

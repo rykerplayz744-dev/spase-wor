@@ -216,7 +216,7 @@ export default function App() {
   }>({
     players: new Map(),
     bullets: [],
-    asteroids: createInitialClientAsteroids(48),
+    asteroids: createInitialClientAsteroids(192),
     planets: INITIAL_PLANETS.map((p) => ({
       ...p,
       x: GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius,
@@ -280,6 +280,64 @@ export default function App() {
   }, [chatMessages]);
 
   useEffect(() => {
+    const onGlobalKeyCapture = (e: KeyboardEvent) => {
+      const isEsc =
+        e.key === 'Escape' ||
+        e.code === 'Escape' ||
+        e.key === 'BrowserBack';
+
+      if (isEsc && !e.repeat) {
+        if (typeof document !== 'undefined' && document.pointerLockElement) {
+          document.exitPointerLock?.();
+        }
+        inputRef.current?.clearHeldInputs();
+
+        const active = document.activeElement as HTMLElement | null;
+        if (
+          active &&
+          (active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.tagName === 'SELECT' ||
+            active.tagName === 'BUTTON')
+        ) {
+          active.blur();
+        }
+
+        if (cheatMenuOpenRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          cheatMenuOpenRef.current = false;
+          setCheatMenuOpen(false);
+          return;
+        }
+        if (controllerModalOpenRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          controllerModalOpenRef.current = false;
+          setControllerModalOpen(false);
+          return;
+        }
+        if (deathSoundModalOpenRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          deathSoundModalOpenRef.current = false;
+          setDeathSoundModalOpen(false);
+          return;
+        }
+        if (shellStateRef.current !== 'TITLE_MENU') {
+          e.preventDefault();
+          e.stopPropagation();
+          setIsEditingOwnName(false);
+          setShellState((prev) => {
+            const next = prev === 'PAUSED' ? 'PLAYING' : 'PAUSED';
+            shellStateRef.current = next;
+            return next;
+          });
+          return;
+        }
+      }
+    };
+
     const onGlobalChatShortcut = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -300,8 +358,13 @@ export default function App() {
         chatInputRef.current?.focus();
       }
     };
+
+    window.addEventListener('keydown', onGlobalKeyCapture, true);
     window.addEventListener('keydown', onGlobalChatShortcut);
-    return () => window.removeEventListener('keydown', onGlobalChatShortcut);
+    return () => {
+      window.removeEventListener('keydown', onGlobalKeyCapture, true);
+      window.removeEventListener('keydown', onGlobalChatShortcut);
+    };
   }, []);
 
   // Connect to authoritative WebSocket server with auto-reconnect
@@ -349,6 +412,9 @@ export default function App() {
 
           if (msg.type === 'pong') {
             world.pingMs = Math.max(1, Date.now() - msg.clientTime);
+            if (typeof msg.serverTime === 'number') {
+              musicBoxRef.current.updateServerClock(msg.serverTime);
+            }
             return;
           }
 
@@ -375,6 +441,9 @@ export default function App() {
           }
 
           if (msg.type === 'state:snapshot') {
+            if (typeof msg.serverTime === 'number') {
+              musicBoxRef.current.updateServerClock(msg.serverTime);
+            }
             world.gravityStarEnabled = msg.gravityStarEnabled;
             if (Array.isArray(msg.bullets)) {
               world.bullets = msg.bullets;
@@ -803,14 +872,85 @@ export default function App() {
           lp.shipPng = selectedShipPngRef.current;
         }
         return lp;
+      },
+      (serverTime) => {
+        musicBoxRef.current.updateServerClock(serverTime);
       }
     );
 
+    // Background heartbeat so when a tab is unfocused/hidden or paused, its server music stream and multi-tab audio yield stay active
+    const bgSyncTimer = window.setInterval(() => {
+      const world = worldRef.current;
+      const lp = world.players.get(selfIdRef.current);
+      if (!lp) return;
+
+      const isHiddenOrPaused =
+        (typeof document !== 'undefined' && document.hidden) ||
+        shellStateRef.current === 'PAUSED';
+
+      if (isHiddenOrPaused && shellStateRef.current !== 'TITLE_MENU') {
+        lp.music = musicBoxRef.current.getBroadcastMusicState();
+        lp.deathSound = deathSoundCtrlRef.current.selectedDeathSound;
+        lp.shipPng = selectedShipPngRef.current;
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          sendWs({
+            type: 'player:input',
+            playerId: selfIdRef.current,
+            angle: lp.angle,
+            thrusting: false,
+            shooting: false,
+            inputSource: lp.inputSource,
+            x: lp.x,
+            y: lp.y,
+            vx: lp.vx,
+            vy: lp.vy,
+            spectating: lp.spectating,
+            spectateTargetId: lp.spectateTargetId,
+            cursorX: lp.cursorX,
+            cursorY: lp.cursorY,
+            music: lp.music,
+            deathSound: lp.deathSound,
+            shipPng: lp.shipPng,
+            warping: lp.warping,
+          });
+        } else {
+          peerSync.send({
+            type: 'peer:player_state',
+            senderId: selfIdRef.current,
+            player: lp,
+          });
+        }
+      }
+
+      if (typeof document !== 'undefined' && document.hidden) {
+        const camPos = rendererRef.current?.getCameraPosition();
+        const listenerX =
+          lp && !cheatsRef.current.freeCam ? lp.x : camPos ? camPos.x : lp.x;
+        const listenerY =
+          lp && !cheatsRef.current.freeCam ? lp.y : camPos ? camPos.y : lp.y;
+        musicBoxRef.current.syncRemotePlayersAudio(
+          world.players,
+          selfIdRef.current,
+          listenerX,
+          listenerY,
+          isMutedRef.current,
+          {
+            localShipX: lp.x,
+            localShipY: lp.y,
+            isFreeCam: Boolean(cheatsRef.current.freeCam),
+            yieldLocalCockpitToOtherTab: peerSync.isAnotherLocalTabFocused(),
+          }
+        );
+      }
+    }, 350);
+
     return () => {
+      window.clearInterval(bgSyncTimer);
       peerSync.destroy(selfIdRef.current);
       peerSyncRef.current = null;
     };
-  }, []);
+  }, [sendWs]);
 
   const handleStartGame = useCallback(() => {
     const cleanName = pilotName.trim().slice(0, 16) || 'PILOT';
@@ -1019,6 +1159,22 @@ export default function App() {
         (action === 'spawn_drone' || action === 'spawn_drones_100')
       ) {
         const countToSpawn = action === 'spawn_drones_100' ? 100 : 1;
+        // Keep total drones capped at 100 so multiple +100 clicks refresh the fleet instead of piling up 1,000+ drones on Chromebooks
+        let currentDroneCount = 0;
+        for (const p of world.players.values()) {
+          if (p.isDrone) currentDroneCount++;
+        }
+        const excess = currentDroneCount + countToSpawn - 105;
+        if (excess > 0) {
+          let removed = 0;
+          for (const [pid, p] of world.players.entries()) {
+            if (p.isDrone) {
+              world.players.delete(pid);
+              removed++;
+              if (removed >= excess) break;
+            }
+          }
+        }
         const spawnedDrones = createTargetDronesBatch(
           world.players,
           countToSpawn,
@@ -1338,7 +1494,15 @@ export default function App() {
 
       // Press K while in-game to toggle the Cheat Menu
       if (!isTitle && sampled.cheatMenuJustPressed) {
-        setCheatMenuOpen((prev) => !prev);
+        if (typeof document !== 'undefined' && document.pointerLockElement) {
+          document.exitPointerLock?.();
+        }
+        input.clearHeldInputs();
+        setCheatMenuOpen((prev) => {
+          const next = !prev;
+          cheatMenuOpenRef.current = next;
+          return next;
+        });
       }
 
       // Press F (or R3 on controller) to toggle Auto-Fire
@@ -1368,14 +1532,27 @@ export default function App() {
         !cheatMenuOpenRef.current
       ) {
         handleStartGame();
-      } else if (
-        !isTitle &&
-        sampled.pauseJustPressed &&
-        !controllerModalOpenRef.current &&
-        !deathSoundModalOpenRef.current &&
-        !cheatMenuOpenRef.current
-      ) {
-        setShellState((prev) => (prev === 'PAUSED' ? 'PLAYING' : 'PAUSED'));
+      } else if (!isTitle && sampled.pauseJustPressed) {
+        if (typeof document !== 'undefined' && document.pointerLockElement) {
+          document.exitPointerLock?.();
+        }
+        input.clearHeldInputs();
+        if (cheatMenuOpenRef.current) {
+          cheatMenuOpenRef.current = false;
+          setCheatMenuOpen(false);
+        } else if (controllerModalOpenRef.current) {
+          controllerModalOpenRef.current = false;
+          setControllerModalOpen(false);
+        } else if (deathSoundModalOpenRef.current) {
+          deathSoundModalOpenRef.current = false;
+          setDeathSoundModalOpen(false);
+        } else {
+          setShellState((prev) => {
+            const next = prev === 'PAUSED' ? 'PLAYING' : 'PAUSED';
+            shellStateRef.current = next;
+            return next;
+          });
+        }
       }
 
       // Step client-side planetary orbits smoothly at 60fps
@@ -1605,8 +1782,11 @@ export default function App() {
             }
           }
 
-          if (world.asteroids.length < 48) {
-            const extra = createInitialClientAsteroids(8);
+          if (world.asteroids.length < 192) {
+            const extra = createInitialClientAsteroids(
+              Math.min(32, 192 - world.asteroids.length),
+              true
+            );
             for (const ast of extra) {
               ast.id = `ast_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
               world.asteroids.push(ast);
@@ -1678,33 +1858,39 @@ export default function App() {
               p.netTargetVy = p.vy;
               p.netTargetAngle = p.angle;
 
-              // Allow AI ships to actively fire weapons at players & rival ships in Vercel/client mode!
-              if (p.shooting && world.bullets.length < 1550) {
-                const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
-                const aiCooldown = Math.max(dSpec.fireCooldown * 1.6, 0.38);
-                if (nowSec - (p.lastFireTime || 0) >= aiCooldown) {
-                  p.lastFireTime = nowSec;
-                  const aiSalvo = {
-                    idPrefix: `ai_${p.id}_${Date.now().toString(36)}`,
-                    ownerId: p.id,
-                    ownerName: p.name,
-                    color: p.color,
-                    x: p.x,
-                    y: p.y,
-                    vx: p.vx,
-                    vy: p.vy,
-                    angle: p.angle,
-                    noseDist: dSpec.radius + 10,
-                    count: dSpec.spreadCount,
-                    spreadAngle: dSpec.spreadAngle,
-                    novaSpread: false,
-                    baseMuzzle: dSpec.bulletSpeed,
-                    damage: dSpec.bulletDamage,
-                    ttl: 2.4,
-                    isMissile: false,
-                    targetIds: [],
-                  };
-                  world.bullets.push(...expandSalvoToBullets(aiSalvo));
+              // Allow nearby AI ships to actively fire weapons at players & rival ships in Vercel/client mode without flooding bullets off-screen
+              if (p.shooting && world.bullets.length < 480) {
+                const refX = localPlayer ? localPlayer.x : GRAVITY_STAR_X;
+                const refY = localPlayer ? localPlayer.y : GRAVITY_STAR_Y;
+                const distToViewX = Math.abs(shortestToroidalDelta(refX, p.x, ARENA_WIDTH));
+                const distToViewY = Math.abs(shortestToroidalDelta(refY, p.y, ARENA_HEIGHT));
+                if (distToViewX < 2400 && distToViewY < 2400) {
+                  const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
+                  const aiCooldown = Math.max(dSpec.fireCooldown * 1.6, 0.42);
+                  if (nowSec - (p.lastFireTime || 0) >= aiCooldown) {
+                    p.lastFireTime = nowSec;
+                    const aiSalvo = {
+                      idPrefix: `ai_${p.id}_${Date.now().toString(36)}`,
+                      ownerId: p.id,
+                      ownerName: p.name,
+                      color: p.color,
+                      x: p.x,
+                      y: p.y,
+                      vx: p.vx,
+                      vy: p.vy,
+                      angle: p.angle,
+                      noseDist: dSpec.radius + 10,
+                      count: dSpec.spreadCount,
+                      spreadAngle: dSpec.spreadAngle,
+                      novaSpread: false,
+                      baseMuzzle: dSpec.bulletSpeed,
+                      damage: dSpec.bulletDamage,
+                      ttl: 2.2,
+                      isMissile: false,
+                      targetIds: [],
+                    };
+                    world.bullets.push(...expandSalvoToBullets(aiSalvo));
+                  }
                 }
               }
             } else {
@@ -2295,7 +2481,14 @@ export default function App() {
         selfIdRef.current,
         listenerX,
         listenerY,
-        isMutedRef.current
+        isMutedRef.current,
+        {
+          localShipX: localPlayer?.x,
+          localShipY: localPlayer?.y,
+          isFreeCam: Boolean(cheatsRef.current.freeCam),
+          yieldLocalCockpitToOtherTab:
+            peerSyncRef.current?.isAnotherLocalTabFocused() ?? false,
+        }
       );
 
       // Keep local cursor world position synced with rendered camera even while paused or right after camera lerp
@@ -2308,12 +2501,36 @@ export default function App() {
         );
       }
 
-      if (now - lastHudSync > 80) {
+      // Keep drone count bounded if a remote peer or relay sent excess drones
+      if (world.players.size > 115) {
+        let excess = world.players.size - 108;
+        for (const [pid, p] of world.players.entries()) {
+          if (p.isDrone && pid !== selfIdRef.current) {
+            world.players.delete(pid);
+            excess--;
+            if (excess <= 0) break;
+          }
+        }
+      }
+
+      const anyModalOpen =
+        cheatMenuOpenRef.current ||
+        controllerModalOpenRef.current ||
+        deathSoundModalOpenRef.current ||
+        shellStateRef.current === 'PAUSED';
+      const hudSyncInterval = anyModalOpen ? 450 : 100;
+
+      if (now - lastHudSync > hudSyncInterval) {
         lastHudSync = now;
         const speed = localPlayer ? Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)) : 0;
-        const sortedPlayers = Array.from(world.players.values()).sort(
-          (a, b) => b.kills - a.kills || b.score - a.score
-        );
+        const sortedPlayers = Array.from(world.players.values())
+          .sort(
+            (a, b) =>
+              Number(Boolean(a.isDrone)) - Number(Boolean(b.isDrone)) ||
+              b.kills - a.kills ||
+              b.score - a.score
+          )
+          .slice(0, 36);
         const pads = input.getConnectedGamepads();
 
         setHud({
@@ -2926,46 +3143,69 @@ export default function App() {
 
             {/* Top-Right Perimeter Cluster: Live Multiplayer Roster & Controls */}
             <div className="flex flex-col items-end gap-2">
-              <div className="flex items-center gap-2 pointer-events-auto">
+              <div className="flex flex-wrap items-center justify-end gap-2 pointer-events-auto">
                 <button
+                  type="button"
                   onClick={handleCopyInvite}
-                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0"
+                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {copiedInvite ? 'Sector Link Copied!' : `Invite Players (${hud.playerCount} Online)`}
                 </button>
                 {(hud.secondPadAvailable || hud.localCoopActive) && (
                   <button
+                    type="button"
                     onClick={handleToggleCoopGamepad}
-                    className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:border-emerald-500/60 whitespace-nowrap shrink-0"
+                    className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:border-emerald-500/60 whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     {hud.localCoopActive ? 'Remove 2nd Controller' : '+ Join 2nd Controller'}
                   </button>
                 )}
                 <button
-                  onClick={() => setDeathSoundModalOpen(true)}
-                  className="rounded-lg border border-amber-500/40 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0"
+                  type="button"
+                  onClick={() => {
+                    inputRef.current?.clearHeldInputs();
+                    setDeathSoundModalOpen(true);
+                  }}
+                  className="rounded-lg border border-amber-500/40 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   Death Sound (.OGG)
                 </button>
                 <button
-                  onClick={() => setControllerModalOpen(true)}
-                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0"
+                  type="button"
+                  onClick={() => {
+                    inputRef.current?.clearHeldInputs();
+                    setControllerModalOpen(true);
+                  }}
+                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   Controller Setup
                 </button>
                 <button
+                  type="button"
+                  onClick={() => {
+                    inputRef.current?.clearHeldInputs();
+                    setCheatMenuOpen((prev) => !prev);
+                  }}
+                  className="rounded-lg border border-rose-500/40 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-rose-300 hover:border-rose-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Cheats (K)
+                </button>
+                <button
+                  type="button"
                   onClick={handleToggleMute}
-                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0"
+                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {isMuted ? 'Unmute' : 'Mute'}
                 </button>
                 <button
-                  onClick={() =>
-                    setShellState((prev) => (prev === 'PAUSED' ? 'PLAYING' : 'PAUSED'))
-                  }
-                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0"
+                  type="button"
+                  onClick={() => {
+                    inputRef.current?.clearHeldInputs();
+                    setShellState((prev) => (prev === 'PAUSED' ? 'PLAYING' : 'PAUSED'));
+                  }}
+                  className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Pause
+                  Pause (Esc)
                 </button>
               </div>
 
@@ -3162,8 +3402,18 @@ export default function App() {
 
       {/* ==================== 3. PAUSE / SECTOR OPTIONS MODAL ==================== */}
       {shellState === 'PAUSED' && (
-        <div className="fixed inset-0 z-30 flex items-center justify-center bg-[#060913]/85 p-4">
-          <div className="w-full max-w-md rounded-xl border border-slate-800 bg-[#0B1120] p-6 text-slate-100 shadow-2xl">
+        <div
+          role="dialog"
+          aria-modal="true"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setShellState('PLAYING');
+          }}
+          className="fixed inset-0 z-40 flex items-center justify-center bg-[#060913]/85 p-4 pointer-events-auto"
+        >
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-xl border border-slate-800 bg-[#0B1120] p-6 text-slate-100 shadow-2xl pointer-events-auto"
+          >
             <h2 className="font-display text-xl font-bold text-white">
               Tactical Systems Paused
             </h2>
@@ -3204,13 +3454,14 @@ export default function App() {
               <div className="flex items-center justify-between pt-1">
                 <span className="text-slate-400">Central Gravity Star</span>
                 <button
+                  type="button"
                   onClick={() =>
                     sendWs({
                       type: 'room:toggle_star',
                       enabled: !hud.gravityStarEnabled,
                     })
                   }
-                  className="rounded border border-slate-700 px-2.5 py-1 text-xs text-slate-200 hover:border-slate-500 whitespace-nowrap shrink-0"
+                  className="rounded border border-slate-700 px-2.5 py-1 text-xs text-slate-200 hover:border-slate-500 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {hud.gravityStarEnabled ? 'Active (1962 Classic)' : 'Disabled'}
                 </button>
@@ -3219,24 +3470,38 @@ export default function App() {
 
             <div className="mt-5 flex flex-col gap-2.5">
               <button
+                type="button"
                 onClick={() => setShellState('PLAYING')}
-                className="w-full rounded-lg bg-amber-500 py-2.5 font-display text-xs font-bold text-slate-950 hover:bg-amber-400 whitespace-nowrap shrink-0"
+                className="w-full rounded-lg bg-amber-500 py-2.5 font-display text-xs font-bold text-slate-950 hover:bg-amber-400 whitespace-nowrap shrink-0 cursor-pointer"
               >
-                Resume Combat
+                Resume Combat (Esc)
               </button>
               <button
+                type="button"
+                onClick={() => {
+                  setShellState('PLAYING');
+                  setCheatMenuOpen(true);
+                }}
+                className="w-full rounded-lg border border-rose-500/50 py-2.5 text-xs font-medium text-rose-300 hover:border-rose-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Cheat & Experimental Weapons Menu (K)
+              </button>
+              <button
+                type="button"
                 onClick={() => setDeathSoundModalOpen(true)}
-                className="w-full rounded-lg border border-amber-500/50 py-2.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0"
+                className="w-full rounded-lg border border-amber-500/50 py-2.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Custom Death & Smash Sounds (.OGG)
               </button>
               <button
+                type="button"
                 onClick={() => setControllerModalOpen(true)}
-                className="w-full rounded-lg border border-slate-700 py-2.5 text-xs font-medium text-slate-200 hover:border-slate-500 whitespace-nowrap shrink-0"
+                className="w-full rounded-lg border border-slate-700 py-2.5 text-xs font-medium text-slate-200 hover:border-slate-500 whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Controller & Joystick Vector Mapping
               </button>
               <button
+                type="button"
                 onClick={() => {
                   if (cheatsRef.current.freeCam) {
                     handleUpdateCheats({ ...cheatsRef.current, freeCam: false });
@@ -3251,7 +3516,7 @@ export default function App() {
                   sendWs({ type: 'player:leave', playerId: selfIdRef.current });
                   setShellState('TITLE_MENU');
                 }}
-                className="w-full rounded-lg border border-slate-800 py-2.5 text-xs font-medium text-slate-400 hover:border-slate-700 hover:text-slate-200 whitespace-nowrap shrink-0"
+                className="w-full rounded-lg border border-slate-800 py-2.5 text-xs font-medium text-slate-400 hover:border-slate-700 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
               >
                 Return to Hangar Title Screen
               </button>

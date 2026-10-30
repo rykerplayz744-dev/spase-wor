@@ -88,7 +88,7 @@ function createAsteroid(_room: RoomState): AsteroidState {
     x = GRAVITY_STAR_X + Math.cos(pushAngle) * (1800 + Math.random() * 6000);
     y = GRAVITY_STAR_Y + Math.sin(pushAngle) * (1800 + Math.random() * 4500);
   }
-  const radius = 38 + Math.random() * 52;
+  const radius = 24 + Math.random() * 34;
   const speed = 35 + Math.random() * 75;
   const moveAngle = Math.random() * Math.PI * 2;
   const vertCount = 10;
@@ -135,7 +135,7 @@ function getOrCreateRoom(_roomId?: string): RoomState {
       clients: new Set(),
       colorIndex: 0,
     };
-    for (let i = 0; i < 56; i++) {
+    for (let i = 0; i < 224; i++) {
       const ast = createAsteroid(room);
       room.asteroids.set(ast.id, ast);
     }
@@ -482,8 +482,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     planet.vy = Math.cos(planet.orbitAngle) * planet.orbitSpeed * planet.orbitRadius;
   }
 
-  if (room.asteroids.size < 56) {
-    for (let s = 0; s < 2 && room.asteroids.size < 56; s++) {
+  if (room.asteroids.size < 224) {
+    for (let s = 0; s < 8 && room.asteroids.size < 224; s++) {
       const ast = createAsteroid(room);
       room.asteroids.set(ast.id, ast);
     }
@@ -536,6 +536,14 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         dt,
         nowSec
       );
+    }
+
+    if (player.music && player.music.isPlaying && typeof player.music.startedAtServerMs === 'number') {
+      player.music.trackTime = Math.max(
+        0,
+        Number(((nowMs - player.music.startedAtServerMs) / 1000).toFixed(3))
+      );
+      player.music.updatedAt = nowMs;
     }
 
     if (player.cheats?.godMode || player.warping) {
@@ -1378,7 +1386,36 @@ async function startServer() {
           }
 
           if (msg.music !== undefined) {
-            player.music = msg.music;
+            if (msg.music && msg.music.isPlaying) {
+              const nowEpoch = Date.now();
+              const prevMusic = player.music;
+              const reportedTrackTime = Math.max(0, Number(msg.music.trackTime) || 0);
+              const clientComputedStart = nowEpoch - Math.round(reportedTrackTime * 1000);
+              const isSameTrack =
+                prevMusic &&
+                prevMusic.isPlaying &&
+                prevMusic.filename === msg.music.filename;
+              const prevStart = prevMusic?.startedAtServerMs;
+              const didSeekOrRestart =
+                !isSameTrack ||
+                typeof prevStart !== 'number' ||
+                Math.abs(clientComputedStart - prevStart) > 650;
+
+              const authoritativeStartMs = didSeekOrRestart ? clientComputedStart : prevStart!;
+              const authoritativeTrackTime = Math.max(
+                0,
+                Number(((nowEpoch - authoritativeStartMs) / 1000).toFixed(3))
+              );
+
+              player.music = {
+                ...msg.music,
+                trackTime: authoritativeTrackTime,
+                updatedAt: nowEpoch,
+                startedAtServerMs: authoritativeStartMs,
+              };
+            } else {
+              player.music = null;
+            }
           }
           if (msg.deathSound) {
             player.deathSound = msg.deathSound;
@@ -1476,6 +1513,21 @@ async function startServer() {
             player.vy = 0;
           } else if (msg.action === 'spawn_drone' || msg.action === 'spawn_drones_100') {
             const countToSpawn = msg.action === 'spawn_drones_100' ? 100 : 1;
+            let currentDrones = 0;
+            for (const p of room.players.values()) {
+              if (p.isDrone) currentDrones++;
+            }
+            const excess = currentDrones + countToSpawn - 105;
+            if (excess > 0) {
+              let removed = 0;
+              for (const [pid, p] of room.players.entries()) {
+                if (p.isDrone) {
+                  room.players.delete(pid);
+                  removed++;
+                  if (removed >= excess) break;
+                }
+              }
+            }
             const spawnedDrones = createTargetDronesBatch(room.players, countToSpawn, player);
             for (const drone of spawnedDrones) {
               room.players.set(drone.id, drone);

@@ -116,6 +116,7 @@ export interface PlayerMusicState {
   isPlaying: boolean;
   trackTime: number;
   updatedAt: number;
+  startedAtServerMs?: number;
   volume: number;
   loopTrack: boolean;
 }
@@ -644,8 +645,27 @@ export function stepAiDroneAutopilot(
       ? currentTarget
       : null;
 
+  // Bound per-frame scan cost so even 100+ ships run at 60fps on Chromebooks without blocking UI clicks
+  const totalPlayers = players.size;
+  const stride = totalPlayers > 90 ? Math.ceil(totalPlayers / 45) : 1;
+  const strideOffset = (seed + Math.floor(nowSec * 60)) % stride;
+  let idx = 0;
+
   for (const other of players.values()) {
+    idx++;
     if (!other.alive || other.id === drone.id || other.spectating) continue;
+
+    const isSameSquad = Boolean(drone.squadId && other.squadId === drone.squadId);
+    const isLocked = Boolean(validLockedTarget && other.id === validLockedTarget.id);
+    if (
+      stride > 1 &&
+      other.isDrone &&
+      !isSameSquad &&
+      !isLocked &&
+      idx % stride !== strideOffset
+    ) {
+      continue;
+    }
 
     const dx = shortestDelta(drone.x, other.x, ARENA_WIDTH);
     const dy = shortestDelta(drone.y, other.y, ARENA_HEIGHT);
@@ -659,20 +679,13 @@ export function stepAiDroneAutopilot(
       sepY -= (dy / dist) * push * 2.2;
     }
 
-    // Dynamic Teaming: if both AI ships are team-friendly and within 620u, form or join a squad (up to 4 ships)
+    // Dynamic Teaming: if both AI ships are team-friendly and within 620u, form or join a squad
     if (other.isDrone && canTeamUp && !drone.squadId && distSq < 620 * 620) {
       const otherSeed = hashIdToNumber(other.id);
       if (otherSeed % 10 < 6) {
         if (other.squadId) {
-          // Count members in other's squad
-          let count = 0;
-          for (const p of players.values()) {
-            if (p.alive && p.squadId === other.squadId) count++;
-          }
-          if (count < 4) {
-            drone.squadId = other.squadId;
-            drone.color = other.color;
-          }
+          drone.squadId = other.squadId;
+          drone.color = other.color;
         } else {
           const newSquadId = `SQUAD-${((seed ^ otherSeed) % 89) + 10}`;
           drone.squadId = newSquadId;
@@ -704,7 +717,7 @@ export function stepAiDroneAutopilot(
     }
 
     // Stickiness bonus for our currently locked target so AI doesn't jitter between targets
-    if (validLockedTarget && other.id === validLockedTarget.id) {
+    if (isLocked) {
       priorityDist *= 0.72;
     }
 
@@ -717,6 +730,11 @@ export function stepAiDroneAutopilot(
       bestEnemyScore = priorityDist;
       bestEnemy = other;
     }
+  }
+
+  // Ensure our locked target is always considered even when striding
+  if (!bestEnemy && validLockedTarget) {
+    bestEnemy = validLockedTarget;
   }
 
   // If a squadmate has a target within reasonable distance and we don't have a close human target, assist our squadmate!
@@ -738,7 +756,7 @@ export function stepAiDroneAutopilot(
   }
 
   // If our squad has no other alive members left, clear stale squadId so we can form a new team later
-  if (drone.squadId && squadMateCount === 0 && (seed + Math.floor(nowSec)) % 12 === 0) {
+  if (drone.squadId && squadMateCount === 0 && stride === 1 && (seed + Math.floor(nowSec)) % 12 === 0) {
     drone.squadId = null;
   }
 
