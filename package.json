@@ -1,8 +1,13 @@
 {
-  "name": "react-example",
+  "name": "vector-spacewar",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",

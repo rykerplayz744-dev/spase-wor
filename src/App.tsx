@@ -441,9 +441,43 @@ export default function App() {
 
   const handleTriggerCheatAction = useCallback(
     (action: CheatActionType) => {
-      const localPlayer = worldRef.current.players.get(selfIdRef.current);
+      const world = worldRef.current;
+      const localPlayer = world.players.get(selfIdRef.current);
+      const isWsConnected = wsRef.current?.readyState === WebSocket.OPEN;
+
       if (action === 'missile_swarm') {
         soundEngine.playMissileLaunch();
+        if (!isWsConnected && localPlayer && localPlayer.alive) {
+          const spec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
+          const targetIds: string[] = [];
+          for (const p of world.players.values()) {
+            if (p.alive && p.id !== localPlayer.id) targetIds.push(p.id);
+          }
+          const salvo = {
+            idPrefix: `swm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+            ownerId: localPlayer.id,
+            ownerName: localPlayer.name,
+            color: '#F43F5E',
+            x: localPlayer.x,
+            y: localPlayer.y,
+            vx: localPlayer.vx,
+            vy: localPlayer.vy,
+            angle: localPlayer.angle + ((performance.now() * 0.011) % (Math.PI * 2)),
+            noseDist: spec.radius + 12,
+            count: 16,
+            spreadAngle: (Math.PI * 2) / 16,
+            novaSpread: true,
+            baseMuzzle: 760,
+            damage: 42,
+            ttl: 3.5,
+            isMissile: true,
+            targetIds,
+          };
+          world.bullets.push(...expandSalvoToBullets(salvo));
+          if (world.bullets.length > 1800) {
+            world.bullets.splice(0, world.bullets.length - 1800);
+          }
+        }
       } else if (action === 'momentum_boost' && localPlayer && localPlayer.alive) {
         localPlayer.vx += Math.cos(localPlayer.angle) * 2500;
         localPlayer.vy += Math.sin(localPlayer.angle) * 2500;
@@ -455,6 +489,70 @@ export default function App() {
       } else if (action === 'momentum_zero' && localPlayer && localPlayer.alive) {
         localPlayer.vx = 0;
         localPlayer.vy = 0;
+      } else if (
+        !isWsConnected &&
+        (action === 'spawn_drone' || action === 'spawn_drones_100')
+      ) {
+        const countToSpawn = action === 'spawn_drones_100' ? 100 : 1;
+        let droneNum = Array.from(world.players.values()).filter((p) => p.isDrone).length;
+        for (let i = 0; i < countToSpawn; i++) {
+          droneNum++;
+          const droneId = `drone_${Date.now().toString(36)}_${i}_${Math.random().toString(36).slice(2, 6)}`;
+          const hull = HULL_LIST[(world.players.size + i) % HULL_LIST.length];
+          const spec = HULL_SPECS[hull];
+          const color = PLAYER_COLORS[(world.players.size + i) % PLAYER_COLORS.length];
+          const frac = (i + 0.5) / countToSpawn;
+          const orbitRadius =
+            countToSpawn === 1
+              ? 1400 + Math.random() * 6800
+              : 1400 + Math.sqrt(frac) * 7200;
+          const theta =
+            countToSpawn === 1
+              ? Math.random() * Math.PI * 2
+              : i * 2.3999632 + Math.random() * 0.15;
+          const spawnX =
+            (((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) +
+              ARENA_WIDTH) %
+            ARENA_WIDTH;
+          const spawnY =
+            (((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) +
+              ARENA_HEIGHT) %
+            ARENA_HEIGHT;
+          const initAngle = theta + Math.PI * 0.5;
+          const initSpeed = 260 + Math.random() * 180;
+          world.players.set(droneId, {
+            id: droneId,
+            name: `TARGET-${droneNum}`,
+            color,
+            hull,
+            x: Math.round(spawnX),
+            y: Math.round(spawnY),
+            vx: Math.round(Math.cos(initAngle) * initSpeed),
+            vy: Math.round(Math.sin(initAngle) * initSpeed),
+            angle: initAngle,
+            thrusting: true,
+            shooting: false,
+            hp: spec.maxHp,
+            maxHp: spec.maxHp,
+            score: 0,
+            kills: 0,
+            deaths: 0,
+            streak: 0,
+            peakSpeed: Math.round(initSpeed),
+            alive: true,
+            respawnTimer: 0,
+            invulnerableTimer: 0.4,
+            lastFireTime: 0,
+            inputSource: 'keyboard',
+            isDrone: true,
+          });
+        }
+      } else if (!isWsConnected && action === 'clear_drones') {
+        for (const [pid, p] of world.players.entries()) {
+          if (p.isDrone) {
+            world.players.delete(pid);
+          }
+        }
       }
 
       sendWs({
@@ -569,6 +667,7 @@ export default function App() {
     let lastNetSend = 0;
     let lastHudSync = 0;
     let lastLocalFire = 0;
+    let lastOfflineShot = 0;
 
     const loop = (now: number) => {
       const rawDt = (now - lastTime) / 1000;
@@ -580,6 +679,7 @@ export default function App() {
       const localPlayer = world.players.get(selfIdRef.current) || null;
       const isTitle = shellStateRef.current === 'TITLE_MENU';
       const isPaused = shellStateRef.current === 'PAUSED';
+      const isWsConnected = wsRef.current?.readyState === WebSocket.OPEN;
 
       const sampled = input.sample(
         dt,
@@ -602,7 +702,7 @@ export default function App() {
         });
       }
 
-      // Press M during gameplay to fire an 8x Homing Missile Swarm
+      // Press M during gameplay to fire an Homing Missile Swarm
       if (!isTitle && sampled.missileSwarmJustPressed) {
         handleTriggerCheatAction('missile_swarm');
       }
@@ -630,6 +730,30 @@ export default function App() {
           world.gravityStarEnabled,
           world.planets
         );
+
+        // If running on static Vercel without WebSocket backend, step drones & local weapon salvos
+        if (!isWsConnected) {
+          for (const p of world.players.values()) {
+            if (!p.isDrone) continue;
+            if (!p.alive) {
+              p.respawnTimer -= dt;
+              if (p.respawnTimer <= 0) {
+                p.alive = true;
+                p.hp = p.maxHp;
+              }
+              continue;
+            }
+            const dxStar = p.x - GRAVITY_STAR_X;
+            const dyStar = p.y - GRAVITY_STAR_Y;
+            const distStar = Math.hypot(dxStar, dyStar);
+            const orbitAngle =
+              Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
+            p.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
+            p.x = (((p.x + p.vx * dt) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+            p.y = (((p.y + p.vy * dt) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+          }
+        }
+
         renderer.stepClientBulletsAndMissiles(
           world.bullets,
           world.players,
@@ -637,11 +761,81 @@ export default function App() {
           dt
         );
 
+        // Local collision check when running on static Vercel without WebSocket backend
+        if (!isWsConnected && world.bullets.length > 0) {
+          for (let i = world.bullets.length - 1; i >= 0; i--) {
+            const b = world.bullets[i];
+            for (const target of world.players.values()) {
+              if (!target.alive || target.id === b.ownerId) continue;
+              const dx = b.x - target.x;
+              const dy = b.y - target.y;
+              if (Math.abs(dx) < 32 && Math.abs(dy) < 32 && dx * dx + dy * dy <= 900) {
+                target.hp -= b.damage;
+                world.bullets.splice(i, 1);
+                if (target.hp <= 0) {
+                  target.alive = false;
+                  target.respawnTimer = 2.8;
+                  localPlayer.kills += 1;
+                  localPlayer.score += 150;
+                  renderer.addBurst(target.x, target.y, target.vx * 0.2, target.vy * 0.2, target.color, 28, 280, true);
+                  soundEngine.playHit(true);
+                } else {
+                  renderer.addBurst(b.x, b.y, 0, 0, b.color, 8, 140, false);
+                }
+                break;
+              }
+            }
+          }
+        }
+
         const currentSpeed = Math.hypot(localPlayer.vx, localPlayer.vy);
         soundEngine.updateThrust(localPlayer.thrusting, currentSpeed);
 
         const hullSpec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
         const activeCheats = cheatsRef.current;
+
+        if (!isWsConnected && localPlayer.shooting) {
+          const effCooldown =
+            activeCheats.novaSpread || activeCheats.rapidFire ? 0 : hullSpec.fireCooldown;
+          if (effCooldown === 0 || nowSec - lastOfflineShot >= effCooldown) {
+            lastOfflineShot = nowSec;
+            const count = activeCheats.novaSpread ? 360 : hullSpec.spreadCount;
+            const targetIds: string[] = [];
+            if (activeCheats.homingMissiles) {
+              for (const p of world.players.values()) {
+                if (p.alive && p.id !== localPlayer.id) targetIds.push(p.id);
+              }
+            }
+            const salvoAngle = activeCheats.novaSpread
+              ? localPlayer.angle + ((nowSec * 9.5) % ((Math.PI * 2) / count))
+              : localPlayer.angle;
+            const salvo = {
+              idPrefix: `loc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+              ownerId: localPlayer.id,
+              ownerName: localPlayer.name,
+              color: activeCheats.homingMissiles ? '#F43F5E' : localPlayer.color,
+              x: localPlayer.x,
+              y: localPlayer.y,
+              vx: localPlayer.vx,
+              vy: localPlayer.vy,
+              angle: salvoAngle,
+              noseDist: hullSpec.radius + 10,
+              count,
+              spreadAngle: hullSpec.spreadAngle,
+              novaSpread: Boolean(activeCheats.novaSpread),
+              baseMuzzle: activeCheats.homingMissiles ? 860 : hullSpec.bulletSpeed,
+              damage: activeCheats.homingMissiles ? (activeCheats.novaSpread ? 26 : 38) : hullSpec.bulletDamage,
+              ttl: activeCheats.homingMissiles ? (activeCheats.novaSpread ? 4.0 : 5.5) : 2.6,
+              isMissile: Boolean(activeCheats.homingMissiles),
+              targetIds,
+            };
+            world.bullets.push(...expandSalvoToBullets(salvo));
+            if (world.bullets.length > 1800) {
+              world.bullets.splice(0, world.bullets.length - 1800);
+            }
+          }
+        }
+
         const sfxInterval =
           activeCheats.novaSpread || activeCheats.rapidFire
             ? 0.065
