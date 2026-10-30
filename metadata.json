@@ -1,0 +1,6 @@
+{
+  "name": "Vector Spacewar",
+  "description": "Real-time multiplayer Newtonian space combat with direct joystick vector aiming and uncapped infinite momentum.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
