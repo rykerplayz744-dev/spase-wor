@@ -113,7 +113,14 @@ class SoundEngine {
     this.isThrustPlaying = false;
   }
 
+  private lastFatalHitTime: number = 0;
+
   public playHit(fatal: boolean = false) {
+    if (fatal) {
+      const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (nowPerf - this.lastFatalHitTime < 450) return;
+      this.lastFatalHitTime = nowPerf;
+    }
     const ctx = this.ensureContext();
     if (!ctx) return;
 

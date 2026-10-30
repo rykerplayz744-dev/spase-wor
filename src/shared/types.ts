@@ -108,6 +108,18 @@ export const DEFAULT_PLAYER_CHEATS: PlayerCheats = {
   freeCam: false,
 };
 
+export const MUSIC_HEARING_RADIUS = 1800;
+
+export interface PlayerMusicState {
+  filename: string;
+  title: string;
+  isPlaying: boolean;
+  trackTime: number;
+  updatedAt: number;
+  volume: number;
+  loopTrack: boolean;
+}
+
 export interface PlayerState {
   id: string;
   name: string;
@@ -138,7 +150,23 @@ export interface PlayerState {
   spectateTargetId?: string | null;
   cursorX?: number;
   cursorY?: number;
+  music?: PlayerMusicState | null;
+  deathSound?: string;
+  shipPng?: string | null;
+  warping?: boolean;
+  // Client-side interpolation targets to hide choppy relay updates
+  netTargetX?: number;
+  netTargetY?: number;
+  netTargetVx?: number;
+  netTargetVy?: number;
+  netTargetAngle?: number;
+  netTargetCursorX?: number;
+  netTargetCursorY?: number;
+  netUpdatedAt?: number;
 }
+
+export const SHIP_SMASH_SPEED_THRESHOLD = 1000;
+export const WARP_DRIVE_SPEED = 4800;
 
 export interface BulletState {
   id: string;
@@ -251,6 +279,17 @@ export interface KillFeedEntry {
   cause: 'laser' | 'missile' | 'star' | 'planet' | 'asteroid' | 'collision';
   speedAtKill: number;
   timestamp: number;
+  deathSound?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderColor: string;
+  text: string;
+  isServerWide: boolean;
+  timestamp: number;
 }
 
 export interface RoomSummary {
@@ -263,6 +302,7 @@ export type CheatActionType =
   | 'missile_swarm'
   | 'momentum_boost'
   | 'momentum_zero'
+  | 'toggle_warp_speed'
   | 'spawn_drone'
   | 'spawn_drones_100'
   | 'clear_drones';
@@ -276,6 +316,8 @@ export type ClientToServerMessage =
       hull: ShipHullType;
       color?: string;
       inputSource: 'gamepad' | 'keyboard';
+      deathSound?: string;
+      shipPng?: string | null;
     }
   | {
       type: 'player:input';
@@ -295,6 +337,10 @@ export type ClientToServerMessage =
       spectateTargetId?: string | null;
       cursorX?: number;
       cursorY?: number;
+      music?: PlayerMusicState | null;
+      deathSound?: string;
+      shipPng?: string | null;
+      warping?: boolean;
     }
   | {
       type: 'player:cheats';
@@ -330,6 +376,14 @@ export type ClientToServerMessage =
   | {
       type: 'room:toggle_star';
       enabled: boolean;
+    }
+  | {
+      type: 'chat:send';
+      id?: string;
+      playerId: string;
+      senderName: string;
+      senderColor: string;
+      text: string;
     }
   | {
       type: 'ping';
@@ -420,6 +474,26 @@ export function expandSalvoToBullets(salvo: SalvoSpawnPayload): BulletState[] {
   return result;
 }
 
+export function parseChatInput(raw: string): { text: string; isServerWide: boolean } | null {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return null;
+
+  // Match "/server-wide " followed by the message text
+  if (/^\/server-wide(?:\s+|$)/i.test(trimmed)) {
+    const body = trimmed.replace(/^\/server-wide\s*/i, '').trim();
+    if (!body) return null;
+    return {
+      text: body.slice(0, 220),
+      isServerWide: true,
+    };
+  }
+
+  return {
+    text: trimmed.slice(0, 220),
+    isServerWide: false,
+  };
+}
+
 export type ServerToClientMessage =
   | {
       type: 'room:init';
@@ -431,6 +505,7 @@ export type ServerToClientMessage =
       asteroids: AsteroidState[];
       planets: PlanetState[];
       killFeed: KillFeedEntry[];
+      chatMessages?: ChatMessage[];
       rooms: RoomSummary[];
     }
   | {
@@ -474,10 +549,16 @@ export type ServerToClientMessage =
       damage: number;
       fatal: boolean;
       color: string;
+      cause?: KillFeedEntry['cause'];
+      deathSound?: string;
     }
   | {
       type: 'combat:kill';
       entry: KillFeedEntry;
+    }
+  | {
+      type: 'chat:message';
+      message: ChatMessage;
     }
   | {
       type: 'pong';

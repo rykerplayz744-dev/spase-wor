@@ -2,6 +2,7 @@ import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
   AsteroidState,
+  ChatMessage,
   CheatActionType,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
@@ -81,7 +82,14 @@ export type PeerSyncPacket =
       damage: number;
       fatal: boolean;
       color: string;
+      cause?: KillFeedEntry['cause'];
+      deathSound?: string;
       killEntry?: KillFeedEntry;
+    }
+  | {
+      type: 'peer:chat';
+      senderId: string;
+      message: ChatMessage;
     };
 
 export function getSafeSunOrbitPoint(): { x: number; y: number } {
@@ -221,6 +229,84 @@ export function createTargetDronesBatch(
   return spawned;
 }
 
+export function mergeSmoothRemotePlayerState(
+  existing: PlayerState | undefined,
+  incoming: PlayerState,
+  preserveLocalDamage: boolean = false
+): PlayerState {
+  const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+  if (!existing) {
+    return {
+      ...incoming,
+      netTargetX: incoming.x,
+      netTargetY: incoming.y,
+      netTargetVx: incoming.vx,
+      netTargetVy: incoming.vy,
+      netTargetAngle: incoming.angle,
+      netTargetCursorX: incoming.cursorX,
+      netTargetCursorY: incoming.cursorY,
+      netUpdatedAt: nowPerf,
+    };
+  }
+
+  let dx = incoming.x - existing.x;
+  if (dx > ARENA_WIDTH * 0.5) dx -= ARENA_WIDTH;
+  if (dx < -ARENA_WIDTH * 0.5) dx += ARENA_WIDTH;
+  let dy = incoming.y - existing.y;
+  if (dy > ARENA_HEIGHT * 0.5) dy -= ARENA_HEIGHT;
+  if (dy < -ARENA_HEIGHT * 0.5) dy += ARENA_HEIGHT;
+  const dist = Math.hypot(dx, dy);
+
+  // Hard-snap if the ship just respawned, died, exited Warp Speed to a zero-momentum stop, or warped > 2200u
+  const justStoppedWarp = Boolean(existing.warping && !incoming.warping);
+  const shouldSnap = !existing.alive || !incoming.alive || justStoppedWarp || dist > 2200;
+
+  let cursorShouldSnap =
+    typeof existing.cursorX !== 'number' || typeof existing.cursorY !== 'number';
+  if (
+    !cursorShouldSnap &&
+    typeof incoming.cursorX === 'number' &&
+    typeof incoming.cursorY === 'number'
+  ) {
+    let cdx = incoming.cursorX - existing.cursorX!;
+    if (cdx > ARENA_WIDTH * 0.5) cdx -= ARENA_WIDTH;
+    if (cdx < -ARENA_WIDTH * 0.5) cdx += ARENA_WIDTH;
+    let cdy = incoming.cursorY - existing.cursorY!;
+    if (cdy > ARENA_HEIGHT * 0.5) cdy -= ARENA_HEIGHT;
+    if (cdy < -ARENA_HEIGHT * 0.5) cdy += ARENA_HEIGHT;
+    if (Math.hypot(cdx, cdy) > 2600) {
+      cursorShouldSnap = true;
+    }
+  }
+
+  return {
+    ...incoming,
+    // Keep visual position, velocity, heading & cursor smooth; store incoming values in netTarget*
+    x: shouldSnap ? incoming.x : existing.x,
+    y: shouldSnap ? incoming.y : existing.y,
+    vx: shouldSnap ? incoming.vx : existing.vx,
+    vy: shouldSnap ? incoming.vy : existing.vy,
+    angle: shouldSnap ? incoming.angle : existing.angle,
+    cursorX: cursorShouldSnap ? incoming.cursorX : existing.cursorX,
+    cursorY: cursorShouldSnap ? incoming.cursorY : existing.cursorY,
+    netTargetX: incoming.x,
+    netTargetY: incoming.y,
+    netTargetVx: incoming.vx,
+    netTargetVy: incoming.vy,
+    netTargetAngle: incoming.angle,
+    netTargetCursorX: incoming.cursorX,
+    netTargetCursorY: incoming.cursorY,
+    netUpdatedAt: nowPerf,
+    hp: preserveLocalDamage ? Math.min(existing.hp, incoming.hp) : incoming.hp,
+    alive: preserveLocalDamage ? (existing.alive ? incoming.alive : false) : incoming.alive,
+    deaths: preserveLocalDamage ? Math.max(existing.deaths, incoming.deaths) : incoming.deaths,
+    respawnTimer:
+      preserveLocalDamage && !existing.alive ? existing.respawnTimer : incoming.respawnTimer,
+    lastFireTime: Math.max(existing.lastFireTime || 0, incoming.lastFireTime || 0),
+  };
+}
+
 /**
  * Provides automatic multi-window & serverless multiplayer synchronization when deployed
  * to static/serverless hosts like Vercel where the persistent `/ws` server is not running.
@@ -235,6 +321,7 @@ export class PeerSectorSync {
   private lastCloudSeq = 0;
   private seenSalvos = new Set<string>();
   private seenHits = new Set<string>();
+  private seenChats = new Set<string>();
   private isPolling = false;
 
   constructor(selfId: string, onPacket: (packet: PeerSyncPacket) => void) {
@@ -272,6 +359,13 @@ export class PeerSectorSync {
         const first = this.seenHits.values().next().value;
         if (first) this.seenHits.delete(first);
       }
+    } else if (pkt.type === 'peer:chat' && pkt.message?.id) {
+      if (this.seenChats.has(pkt.message.id)) return;
+      this.seenChats.add(pkt.message.id);
+      if (this.seenChats.size > 300) {
+        const first = this.seenChats.values().next().value;
+        if (first) this.seenChats.delete(first);
+      }
     }
 
     this.onPacket(pkt);
@@ -302,6 +396,8 @@ export class PeerSectorSync {
       this.seenSalvos.add(packet.salvo.idPrefix);
     } else if (packet.type === 'peer:combat_hit' && packet.hitId) {
       this.seenHits.add(packet.hitId);
+    } else if (packet.type === 'peer:chat' && packet.message?.id) {
+      this.seenChats.add(packet.message.id);
     }
 
     if (this.channel) {
@@ -312,14 +408,15 @@ export class PeerSectorSync {
       }
     }
 
-    // Queue discrete gameplay events (salvos, hits, drones, renames, leaves) for the /api/sector cloud relay
+    // Queue discrete gameplay events (salvos, hits, drones, renames, leaves, chats) for the /api/sector cloud relay
     if (
       packet.type === 'peer:salvo' ||
       packet.type === 'peer:combat_hit' ||
       packet.type === 'peer:cheat_action' ||
       packet.type === 'peer:rename' ||
       packet.type === 'peer:cheat_rename' ||
-      packet.type === 'peer:player_leave'
+      packet.type === 'peer:player_leave' ||
+      packet.type === 'peer:chat'
     ) {
       this.pendingCloudEvents.push(packet);
       if (this.pendingCloudEvents.length > 80) {
@@ -417,7 +514,7 @@ export class PeerSectorSync {
       } finally {
         this.isPolling = false;
       }
-    }, 120);
+    }, 85);
   }
 
   public destroy(localPlayerId: string) {

@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { CheatMenuModal } from './components/CheatMenuModal.tsx';
 import { ControllerModal } from './components/ControllerModal.tsx';
 import {
+  DeathSoundModal,
+  useDeathSoundController,
+} from './components/DeathSoundModal.tsx';
+import {
   FloatingMusicBoxWindow,
   useMusicBoxController,
 } from './components/MusicBox.tsx';
@@ -15,6 +19,7 @@ import {
   createTargetDronesBatch,
   getColocatedSpawnPoint,
   getSafeSunOrbitPoint,
+  mergeSmoothRemotePlayerState,
   PeerSectorSync,
 } from './game/peerSync.ts';
 import {
@@ -28,6 +33,7 @@ import {
   ARENA_WIDTH,
   AsteroidState,
   BulletState,
+  ChatMessage,
   CheatActionType,
   ClientToServerMessage,
   DEFAULT_PLAYER_CHEATS,
@@ -38,13 +44,16 @@ import {
   HULL_SPECS,
   INITIAL_PLANETS,
   KillFeedEntry,
+  parseChatInput,
   PLAYER_COLORS,
   PlanetState,
   PlayerCheats,
   PlayerState,
   RoomSummary,
   ServerToClientMessage,
+  SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
+  WARP_DRIVE_SPEED,
 } from './shared/types.ts';
 
 type GameShellState = 'TITLE_MENU' | 'PLAYING' | 'PAUSED' | 'RESPAWNING';
@@ -87,15 +96,24 @@ export default function App() {
   const roomId = 'SECTOR-01';
   const [isMuted, setIsMuted] = useState<boolean>(() => soundEngine.isMuted());
   const [controllerModalOpen, setControllerModalOpen] = useState<boolean>(false);
+  const [deathSoundModalOpen, setDeathSoundModalOpen] = useState<boolean>(false);
   const [cheatMenuOpen, setCheatMenuOpen] = useState<boolean>(false);
   const [isEditingOwnName, setIsEditingOwnName] = useState<boolean>(false);
   const [ownNameDraft, setOwnNameDraft] = useState<string>('');
   const [autoFire, setAutoFire] = useState<boolean>(false);
+  const [warpSpeedActive, setWarpSpeedActive] = useState<boolean>(false);
   const [cheats, setCheats] = useState<PlayerCheats>({ ...DEFAULT_PLAYER_CHEATS });
   const [spectateTargetId, setSpectateTargetId] = useState<string | null>(null);
   const musicBox = useMusicBoxController();
+  const deathSoundCtrl = useDeathSoundController();
   const [mapping, setMapping] = useState<ControllerMapping>(() => loadControllerMapping());
   const [copiedInvite, setCopiedInvite] = useState<boolean>(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState<string>('');
+  const [serverWideBanner, setServerWideBanner] = useState<ChatMessage | null>(null);
+  const [selectedShipPng, setSelectedShipPng] = useState<string | null>(() => {
+    return localStorage.getItem('spacewar_ship_png') || null;
+  });
 
   const [hud, setHud] = useState<HudTelemetry>({
     hp: 100,
@@ -141,6 +159,8 @@ export default function App() {
   cheatMenuOpenRef.current = cheatMenuOpen;
   const controllerModalOpenRef = useRef<boolean>(controllerModalOpen);
   controllerModalOpenRef.current = controllerModalOpen;
+  const deathSoundModalOpenRef = useRef<boolean>(deathSoundModalOpen);
+  deathSoundModalOpenRef.current = deathSoundModalOpen;
   const spectateTargetIdRef = useRef<string | null>(spectateTargetId);
   spectateTargetIdRef.current = spectateTargetId;
   const freeCamPosRef = useRef<{ x: number; y: number; initialized: boolean }>({
@@ -150,7 +170,22 @@ export default function App() {
   });
   const autoFireRef = useRef<boolean>(autoFire);
   autoFireRef.current = autoFire;
+  const warpSpeedActiveRef = useRef<boolean>(warpSpeedActive);
+  warpSpeedActiveRef.current = warpSpeedActive;
+  const musicBoxRef = useRef(musicBox);
+  musicBoxRef.current = musicBox;
+  const deathSoundCtrlRef = useRef(deathSoundCtrl);
+  deathSoundCtrlRef.current = deathSoundCtrl;
+  const isMutedRef = useRef<boolean>(isMuted);
+  isMutedRef.current = isMuted;
   const lastDamagedRemoteAtRef = useRef<Map<string, number>>(new Map());
+  const lastLocalSunHitAtRef = useRef<number>(0);
+  const seenChatIdsRef = useRef<Set<string>>(new Set());
+  const serverWideTimerRef = useRef<number | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
+  const selectedShipPngRef = useRef<string | null>(selectedShipPng);
+  selectedShipPngRef.current = selectedShipPng;
 
   const selfIdRef = useRef<string>(
     (() => {
@@ -199,6 +234,74 @@ export default function App() {
     }
   }, []);
 
+  const receiveChatMessage = useCallback(
+    (msg: ChatMessage, allowBannerTrigger: boolean = true) => {
+      if (!msg || !msg.id) return;
+      if (seenChatIdsRef.current.has(msg.id)) return;
+      seenChatIdsRef.current.add(msg.id);
+      if (seenChatIdsRef.current.size > 300) {
+        const first = seenChatIdsRef.current.values().next().value;
+        if (first) seenChatIdsRef.current.delete(first);
+      }
+
+      setChatMessages((prev) => {
+        const next = [...prev, msg];
+        return next.length > 60 ? next.slice(next.length - 60) : next;
+      });
+
+      if (
+        allowBannerTrigger &&
+        msg.isServerWide &&
+        Date.now() - (msg.timestamp || Date.now()) < 12000
+      ) {
+        setServerWideBanner(msg);
+        if (serverWideTimerRef.current) {
+          window.clearTimeout(serverWideTimerRef.current);
+        }
+        serverWideTimerRef.current = window.setTimeout(() => {
+          setServerWideBanner((curr) => (curr?.id === msg.id ? null : curr));
+        }, 7000);
+        soundEngine.playWarp();
+      }
+    },
+    []
+  );
+
+  const receiveChatMessageRef = useRef(receiveChatMessage);
+  receiveChatMessageRef.current = receiveChatMessage;
+
+  useEffect(() => {
+    const el = chatListRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [chatMessages]);
+
+  useEffect(() => {
+    const onGlobalChatShortcut = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (
+        shellStateRef.current === 'TITLE_MENU' ||
+        controllerModalOpenRef.current ||
+        deathSoundModalOpenRef.current ||
+        cheatMenuOpenRef.current
+      ) {
+        return;
+      }
+      if (e.key === 't' || e.key === 'T' || e.key === 'Enter') {
+        e.preventDefault();
+        chatInputRef.current?.focus();
+      } else if (e.key === '/') {
+        e.preventDefault();
+        setChatDraft((prev) => (prev ? prev : '/'));
+        chatInputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onGlobalChatShortcut);
+    return () => window.removeEventListener('keydown', onGlobalChatShortcut);
+  }, []);
+
   // Connect to authoritative WebSocket server with auto-reconnect
   useEffect(() => {
     let reconnectTimer: number | null = null;
@@ -223,6 +326,8 @@ export default function App() {
               hull: selectedHullRef.current,
               color: selectedColorRef.current,
               inputSource: 'keyboard',
+              deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+              shipPng: selectedShipPngRef.current,
             } satisfies ClientToServerMessage)
           );
           ws.send(
@@ -259,6 +364,11 @@ export default function App() {
               nextPlayers.set(p.id, p);
             }
             world.players = nextPlayers;
+            if (Array.isArray(msg.chatMessages)) {
+              for (const chatMsg of msg.chatMessages) {
+                receiveChatMessageRef.current(chatMsg, Date.now() - chatMsg.timestamp < 7000);
+              }
+            }
             return;
           }
 
@@ -295,15 +405,27 @@ export default function App() {
                 existing.respawnTimer = serverPlayer.respawnTimer;
                 existing.invulnerableTimer = serverPlayer.invulnerableTimer;
 
+                if (!serverPlayer.alive && serverPlayer.id === selfIdRef.current) {
+                  existing.warping = false;
+                  if (warpSpeedActiveRef.current) {
+                    warpSpeedActiveRef.current = false;
+                    setWarpSpeedActive(false);
+                  }
+                }
+
                 const distToSun = Math.hypot(
                   existing.x - GRAVITY_STAR_X,
                   existing.y - GRAVITY_STAR_Y
                 );
+                const recentlyTeleportedFromSun =
+                  serverPlayer.id === selfIdRef.current &&
+                  Date.now() - lastLocalSunHitAtRef.current < 1200;
                 if (
-                  !serverPlayer.alive ||
-                  (!wasAlive && serverPlayer.alive) ||
-                  serverPlayer.invulnerableTimer > 1.6 ||
-                  distToSun < GRAVITY_STAR_RADIUS + 20
+                  !recentlyTeleportedFromSun &&
+                  (!serverPlayer.alive ||
+                    (!wasAlive && serverPlayer.alive) ||
+                    serverPlayer.invulnerableTimer > 1.6 ||
+                    distToSun < GRAVITY_STAR_RADIUS + 20)
                 ) {
                   existing.x = serverPlayer.x;
                   existing.y = serverPlayer.y;
@@ -311,7 +433,10 @@ export default function App() {
                   existing.vy = serverPlayer.vy;
                 }
               } else {
-                currentPlayers.set(serverPlayer.id, serverPlayer);
+                currentPlayers.set(
+                  serverPlayer.id,
+                  mergeSmoothRemotePlayerState(existing, serverPlayer)
+                );
               }
             }
 
@@ -364,6 +489,14 @@ export default function App() {
           }
 
           if (msg.type === 'combat:hit') {
+            const isLocalSunEcho =
+              msg.targetId === selfIdRef.current &&
+              (msg.attackerId === 'star' ||
+                msg.cause === 'star' ||
+                Date.now() - lastLocalSunHitAtRef.current < 1500);
+            if (isLocalSunEcho) {
+              return;
+            }
             const renderer = rendererRef.current;
             if (renderer) {
               renderer.hitFlashes.set(msg.targetId, 0.12);
@@ -377,6 +510,17 @@ export default function App() {
                 msg.fatal ? 320 : 180,
                 msg.fatal
               );
+              if (msg.fatal) {
+                if (msg.cause === 'collision') {
+                  deathSoundCtrlRef.current.playSmashSound(undefined, isMutedRef.current);
+                } else {
+                  const victim = world.players.get(msg.targetId);
+                  deathSoundCtrlRef.current.playDeathSound(
+                    msg.deathSound || victim?.deathSound,
+                    isMutedRef.current
+                  );
+                }
+              }
               if (msg.targetId === selfIdRef.current || msg.attackerId === selfIdRef.current) {
                 renderer.cameraShake = msg.fatal ? 14 : 5;
                 if (msg.fatal) {
@@ -393,6 +537,11 @@ export default function App() {
               msg.entry,
               ...world.killFeed.filter((k) => k.id !== msg.entry.id),
             ].slice(0, 6);
+            return;
+          }
+
+          if (msg.type === 'chat:message') {
+            receiveChatMessageRef.current(msg.message, true);
             return;
           }
         } catch {
@@ -437,7 +586,11 @@ export default function App() {
 
       if (pkt.type === 'peer:hello') {
         if (pkt.player && pkt.player.id !== selfIdRef.current) {
-          world.players.set(pkt.player.id, pkt.player);
+          const existing = world.players.get(pkt.player.id);
+          world.players.set(
+            pkt.player.id,
+            mergeSmoothRemotePlayerState(existing, pkt.player)
+          );
         }
         peerSync.send({
           type: 'peer:welcome',
@@ -454,7 +607,8 @@ export default function App() {
       if (pkt.type === 'peer:welcome') {
         for (const p of pkt.players) {
           if (p.id !== selfIdRef.current) {
-            world.players.set(p.id, p);
+            const existing = world.players.get(p.id);
+            world.players.set(p.id, mergeSmoothRemotePlayerState(existing, p));
           }
         }
         if (pkt.planets && pkt.planets.length === world.planets.length) {
@@ -474,28 +628,15 @@ export default function App() {
           const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
           const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
 
-          if (existing && recentlyDamagedLocally) {
-            // Preserve local combat damage / kill state against stale in-flight poll packets
-            const merged: PlayerState = {
-              ...pkt.player,
-              hp: Math.min(existing.hp, pkt.player.hp),
-              alive: existing.alive ? pkt.player.alive : false,
-              deaths: Math.max(existing.deaths, pkt.player.deaths),
-              respawnTimer: !existing.alive ? existing.respawnTimer : pkt.player.respawnTimer,
-              lastFireTime: existing.lastFireTime,
-            };
-            world.players.set(pkt.player.id, merged);
-          } else {
-            const prevFireTime = existing?.lastFireTime ?? 0;
-            world.players.set(pkt.player.id, {
-              ...pkt.player,
-              lastFireTime: Math.max(prevFireTime, pkt.player.lastFireTime || 0),
-            });
-          }
+          world.players.set(
+            pkt.player.id,
+            mergeSmoothRemotePlayerState(existing, pkt.player, recentlyDamagedLocally)
+          );
         }
         if (pkt.drones) {
           for (const d of pkt.drones) {
-            world.players.set(d.id, d);
+            const existingDrone = world.players.get(d.id);
+            world.players.set(d.id, mergeSmoothRemotePlayerState(existingDrone, d));
           }
         }
         return;
@@ -567,18 +708,30 @@ export default function App() {
       if (pkt.type === 'peer:combat_hit') {
         const target = world.players.get(pkt.targetId);
         if (target && target.alive) {
-          if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+          if (
+            (target.invulnerableTimer <= 0 || target.spectating) &&
+            !target.cheats?.godMode &&
+            !target.warping
+          ) {
             target.hp = Math.max(0, target.hp - pkt.damage);
           }
-          target.vx = pkt.vx;
-          target.vy = pkt.vy;
-          const isFatal = (pkt.fatal || target.hp <= 0) && !target.cheats?.godMode;
+          if (!target.spectating && !target.warping) {
+            target.vx = pkt.vx;
+            target.vy = pkt.vy;
+          }
+          const isFatal =
+            (pkt.fatal || target.hp <= 0) && !target.cheats?.godMode && !target.warping;
           if (isFatal) {
             target.alive = false;
             target.hp = 0;
             target.deaths += 1;
             target.streak = 0;
             target.respawnTimer = 2.8;
+            target.warping = false;
+            if (target.id === selfIdRef.current) {
+              warpSpeedActiveRef.current = false;
+              setWarpSpeedActive(false);
+            }
             const attacker = world.players.get(pkt.attackerId);
             if (attacker && attacker.id !== target.id) {
               attacker.kills += 1;
@@ -600,6 +753,16 @@ export default function App() {
             pkt.fatal ? 320 : 180,
             pkt.fatal
           );
+          if (pkt.fatal) {
+            if (pkt.cause === 'collision' || pkt.killEntry?.cause === 'collision') {
+              deathSoundCtrlRef.current.playSmashSound(undefined, isMutedRef.current);
+            } else {
+              deathSoundCtrlRef.current.playDeathSound(
+                pkt.deathSound || pkt.killEntry?.deathSound || target?.deathSound,
+                isMutedRef.current
+              );
+            }
+          }
           if (pkt.targetId === selfIdRef.current || pkt.attackerId === selfIdRef.current) {
             renderer.cameraShake = pkt.fatal ? 14 : 5;
             soundEngine.playHit(pkt.fatal);
@@ -611,6 +774,12 @@ export default function App() {
             ...world.killFeed.filter((k) => k.id !== pkt.killEntry!.id),
           ].slice(0, 6);
         }
+        return;
+      }
+
+      if (pkt.type === 'peer:chat' && pkt.message) {
+        receiveChatMessageRef.current(pkt.message, true);
+        return;
       }
     });
 
@@ -618,7 +787,15 @@ export default function App() {
     peerSync.announceJoin();
     peerSync.startCloudRelayPoll(
       () => wsRef.current?.readyState === WebSocket.OPEN,
-      () => worldRef.current.players.get(selfIdRef.current)
+      () => {
+        const lp = worldRef.current.players.get(selfIdRef.current);
+        if (lp) {
+          lp.music = musicBoxRef.current.getBroadcastMusicState();
+          lp.deathSound = deathSoundCtrlRef.current.selectedDeathSound;
+          lp.shipPng = selectedShipPngRef.current;
+        }
+        return lp;
+      }
     );
 
     return () => {
@@ -662,8 +839,13 @@ export default function App() {
       lastFireTime: 0,
       inputSource: 'keyboard',
       cheats: cheatsRef.current,
+      deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+      shipPng: selectedShipPngRef.current,
+      warping: false,
     };
 
+    warpSpeedActiveRef.current = false;
+    setWarpSpeedActive(false);
     shellStateRef.current = 'PLAYING';
     setShellState('PLAYING');
 
@@ -680,6 +862,8 @@ export default function App() {
       hull: selectedHull,
       color: selectedColor,
       inputSource: 'keyboard',
+      deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+      shipPng: selectedShipPngRef.current,
     });
 
     sendWs({
@@ -697,7 +881,11 @@ export default function App() {
       if (localPlayer) {
         localPlayer.cheats = nextCheats;
         localPlayer.spectating = Boolean(nextCheats.freeCam);
-        if (!nextCheats.freeCam) {
+        if (nextCheats.freeCam) {
+          localPlayer.warping = false;
+          warpSpeedActiveRef.current = false;
+          setWarpSpeedActive(false);
+        } else {
           localPlayer.spectateTargetId = null;
         }
       }
@@ -813,6 +1001,9 @@ export default function App() {
         }
         soundEngine.playWarp();
       } else if (action === 'momentum_zero' && localPlayer && localPlayer.alive) {
+        warpSpeedActiveRef.current = false;
+        setWarpSpeedActive(false);
+        localPlayer.warping = false;
         localPlayer.vx = 0;
         localPlayer.vy = 0;
       } else if (
@@ -854,6 +1045,128 @@ export default function App() {
         playerId: selfIdRef.current,
         action,
       });
+    },
+    [sendWs]
+  );
+
+  const handleToggleWarpSpeed = useCallback(() => {
+    const localPlayer = worldRef.current.players.get(selfIdRef.current);
+    if (!localPlayer || !localPlayer.alive || cheatsRef.current.freeCam) return;
+
+    const nextWarp = !warpSpeedActiveRef.current;
+    warpSpeedActiveRef.current = nextWarp;
+    setWarpSpeedActive(nextWarp);
+    localPlayer.warping = nextWarp;
+
+    soundEngine.playWarp();
+    const renderer = rendererRef.current;
+
+    if (nextWarp) {
+      // Engage Warp Speed Drive: full invincibility + warp velocity along ship heading
+      localPlayer.invulnerableTimer = Math.max(localPlayer.invulnerableTimer, 0.5);
+      const currentSpd = Math.hypot(localPlayer.vx, localPlayer.vy);
+      const warpSpd = Math.max(WARP_DRIVE_SPEED, currentSpd);
+      localPlayer.vx = Math.cos(localPlayer.angle) * warpSpd;
+      localPlayer.vy = Math.sin(localPlayer.angle) * warpSpd;
+      if (warpSpd > localPlayer.peakSpeed) {
+        localPlayer.peakSpeed = Math.round(warpSpd);
+      }
+      renderer?.addBurst(
+        localPlayer.x,
+        localPlayer.y,
+        localPlayer.vx * 0.15,
+        localPlayer.vy * 0.15,
+        '#38BDF8',
+        28,
+        320,
+        false
+      );
+    } else {
+      // Second click: immediately stop ship and set momentum to 0 wherever you clicked!
+      localPlayer.vx = 0;
+      localPlayer.vy = 0;
+      renderer?.addBurst(
+        localPlayer.x,
+        localPlayer.y,
+        0,
+        0,
+        '#A855F7',
+        26,
+        240,
+        false
+      );
+    }
+
+    if (wsRef.current?.readyState !== WebSocket.OPEN) {
+      peerSyncRef.current?.send({
+        type: 'peer:player_state',
+        senderId: selfIdRef.current,
+        player: localPlayer,
+      });
+    }
+    sendWs({
+      type: 'player:input',
+      playerId: selfIdRef.current,
+      angle: localPlayer.angle,
+      thrusting: localPlayer.thrusting,
+      shooting: localPlayer.shooting,
+      inputSource: localPlayer.inputSource,
+      x: localPlayer.x,
+      y: localPlayer.y,
+      vx: localPlayer.vx,
+      vy: localPlayer.vy,
+      spectating: localPlayer.spectating,
+      spectateTargetId: localPlayer.spectateTargetId,
+      cursorX: localPlayer.cursorX,
+      cursorY: localPlayer.cursorY,
+      music: localPlayer.music,
+      deathSound: localPlayer.deathSound,
+      shipPng: localPlayer.shipPng,
+      warping: localPlayer.warping,
+    });
+  }, [sendWs]);
+
+  const handleSelectShipPng = useCallback(
+    (filename: string | null) => {
+      setSelectedShipPng(filename);
+      selectedShipPngRef.current = filename;
+      if (filename) {
+        localStorage.setItem('spacewar_ship_png', filename);
+      } else {
+        localStorage.removeItem('spacewar_ship_png');
+      }
+
+      const localPlayer = worldRef.current.players.get(selfIdRef.current);
+      if (localPlayer) {
+        localPlayer.shipPng = filename;
+        if (wsRef.current?.readyState !== WebSocket.OPEN) {
+          peerSyncRef.current?.send({
+            type: 'peer:player_state',
+            senderId: selfIdRef.current,
+            player: localPlayer,
+          });
+        }
+        sendWs({
+          type: 'player:input',
+          playerId: selfIdRef.current,
+          angle: localPlayer.angle,
+          thrusting: localPlayer.thrusting,
+          shooting: localPlayer.shooting,
+          inputSource: localPlayer.inputSource,
+          x: localPlayer.x,
+          y: localPlayer.y,
+          vx: localPlayer.vx,
+          vy: localPlayer.vy,
+          spectating: localPlayer.spectating,
+          spectateTargetId: localPlayer.spectateTargetId,
+          cursorX: localPlayer.cursorX,
+          cursorY: localPlayer.cursorY,
+          music: localPlayer.music,
+          deathSound: localPlayer.deathSound,
+          shipPng: filename,
+          warping: localPlayer.warping,
+        });
+      }
     },
     [sendWs]
   );
@@ -1043,6 +1356,7 @@ export default function App() {
         isTitle &&
         sampled.startJustPressed &&
         !controllerModalOpenRef.current &&
+        !deathSoundModalOpenRef.current &&
         !cheatMenuOpenRef.current
       ) {
         handleStartGame();
@@ -1050,6 +1364,7 @@ export default function App() {
         !isTitle &&
         sampled.pauseJustPressed &&
         !controllerModalOpenRef.current &&
+        !deathSoundModalOpenRef.current &&
         !cheatMenuOpenRef.current
       ) {
         setShellState((prev) => (prev === 'PAUSED' ? 'PLAYING' : 'PAUSED'));
@@ -1064,13 +1379,35 @@ export default function App() {
         renderer.hitstopTimer = Math.max(0, renderer.hitstopTimer - dt);
       } else if (!isTitle && !isPaused && localPlayer) {
         if (isFreeCam) {
+          // If the player died to enemy bullets while in spectator mode, send them back to the Main Menu!
+          if (!localPlayer.alive || localPlayer.hp <= 0) {
+            const nextCheats = { ...cheatsRef.current, freeCam: false };
+            cheatsRef.current = nextCheats;
+            setCheats(nextCheats);
+            spectateTargetIdRef.current = null;
+            setSpectateTargetId(null);
+            freeCamPosRef.current.initialized = false;
+            world.players.delete(selfIdRef.current);
+            peerSyncRef.current?.send({
+              type: 'peer:player_leave',
+              senderId: selfIdRef.current,
+              playerId: selfIdRef.current,
+            });
+            sendWs({ type: 'player:leave', playerId: selfIdRef.current });
+            shellStateRef.current = 'TITLE_MENU';
+            setShellState('TITLE_MENU');
+            rafId = requestAnimationFrame(loop);
+            return;
+          }
+
           // Detached Camera / Spectator Mode:
-          // Ship controls and physics are parked while you fly the camera or spectate!
+          // Ship controls and physics are parked (immune to the Sun), but you retain HP and can be killed by bullets!
           localPlayer.thrusting = false;
           localPlayer.shooting = false;
           localPlayer.vx = 0;
           localPlayer.vy = 0;
           localPlayer.spectating = true;
+          localPlayer.invulnerableTimer = 0;
           localPlayer.inputSource = sampled.inputSource;
 
           if (!freeCamPosRef.current.initialized) {
@@ -1119,6 +1456,7 @@ export default function App() {
           }
           localPlayer.spectating = false;
           localPlayer.spectateTargetId = null;
+          localPlayer.warping = warpSpeedActiveRef.current && localPlayer.alive;
           localPlayer.angle = sampled.angle;
           localPlayer.thrusting = sampled.thrusting && localPlayer.alive;
           localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
@@ -1140,6 +1478,12 @@ export default function App() {
               localPlayer.y - GRAVITY_STAR_Y
             );
             if (distToSun < GRAVITY_STAR_RADIUS + hullRadius - 4) {
+              const nowMs = Date.now();
+              const isDuplicateSunHit = nowMs - lastLocalSunHitAtRef.current < 1200;
+              const wasInvulnerable = localPlayer.invulnerableTimer > 0;
+              lastLocalSunHitAtRef.current = nowMs;
+
+              const impactSpeed = Math.round(Math.hypot(localPlayer.vx, localPlayer.vy));
               renderer.addBurst(
                 localPlayer.x,
                 localPlayer.y,
@@ -1150,31 +1494,76 @@ export default function App() {
                 300,
                 true
               );
-              soundEngine.playHit(true);
               const safeOrbit = getSafeSunOrbitPoint();
               localPlayer.x = safeOrbit.x;
               localPlayer.y = safeOrbit.y;
-              localPlayer.vx = 0;
-              localPlayer.vy = 0;
-              localPlayer.invulnerableTimer = 2.0;
-              if (!isWsConnected && !localPlayer.cheats?.godMode) {
-                localPlayer.deaths += 1;
-                localPlayer.streak = 0;
-                localPlayer.hp = localPlayer.maxHp;
-                const killEntry: KillFeedEntry = {
-                  id: `kill_sun_${Date.now().toString(36)}`,
-                  killerId: 'STAR',
-                  killerName: 'GRAVITY STAR',
-                  killerColor: '#F59E0B',
-                  victimId: localPlayer.id,
-                  victimName: localPlayer.name,
-                  victimColor: localPlayer.color,
-                  cause: 'star',
-                  speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
-                  timestamp: Date.now(),
-                };
-                world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+              if (!localPlayer.warping) {
+                localPlayer.vx = 0;
+                localPlayer.vy = 0;
               }
+              localPlayer.invulnerableTimer = 2.0;
+
+              if (
+                !wasInvulnerable &&
+                !isDuplicateSunHit &&
+                !localPlayer.cheats?.godMode &&
+                !localPlayer.warping
+              ) {
+                soundEngine.playHit(true);
+                deathSoundCtrlRef.current.playDeathSound(
+                  localPlayer.deathSound,
+                  isMutedRef.current
+                );
+                if (!isWsConnected) {
+                  localPlayer.deaths += 1;
+                  localPlayer.streak = 0;
+                  localPlayer.hp = localPlayer.maxHp;
+                  const killEntry: KillFeedEntry = {
+                    id: `kill_sun_${Date.now().toString(36)}`,
+                    killerId: 'STAR',
+                    killerName: 'GRAVITY STAR',
+                    killerColor: '#F59E0B',
+                    victimId: localPlayer.id,
+                    victimName: localPlayer.name,
+                    victimColor: localPlayer.color,
+                    cause: 'star',
+                    speedAtKill: impactSpeed,
+                    timestamp: nowMs,
+                  };
+                  world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+                }
+              }
+
+              // Immediately sync post-teleport safe orbit coordinates & zero velocity to server
+              lastNetSend = now;
+              if (!isWsConnected) {
+                peerSyncRef.current?.send({
+                  type: 'peer:player_state',
+                  senderId: selfIdRef.current,
+                  player: localPlayer,
+                });
+              }
+              sendWs({
+                type: 'player:input',
+                playerId: selfIdRef.current,
+                angle: localPlayer.angle,
+                thrusting: localPlayer.thrusting,
+                shooting: localPlayer.shooting,
+                inputSource: sampled.inputSource,
+                x: localPlayer.x,
+                y: localPlayer.y,
+                vx: localPlayer.vx,
+                vy: localPlayer.vy,
+                spectating: localPlayer.spectating,
+                spectateTargetId: localPlayer.spectateTargetId,
+                cursorX: localPlayer.cursorX,
+                cursorY: localPlayer.cursorY,
+                music: localPlayer.music,
+                deathSound: localPlayer.deathSound,
+                shipPng: localPlayer.shipPng,
+                warping: localPlayer.warping,
+              });
+
               renderer.addBurst(
                 localPlayer.x,
                 localPlayer.y,
@@ -1251,56 +1640,71 @@ export default function App() {
               const orbitAngle =
                 Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
               p.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
-            } else if (p.shooting) {
-              // Ensure remote player shooting is always visible even between /api/sector HTTP polls
-              const rSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
-              const rCheats = p.cheats || DEFAULT_PLAYER_CHEATS;
-              const rCooldown = rCheats.novaSpread || rCheats.rapidFire ? 0.08 : rSpec.fireCooldown;
-              if (nowSec - (p.lastFireTime || 0) >= rCooldown * 1.25) {
-                p.lastFireTime = nowSec;
-                const count = rCheats.novaSpread ? 360 : rSpec.spreadCount;
-                const targetIds: string[] = [];
-                if (rCheats.homingMissiles) {
-                  for (const tp of world.players.values()) {
-                    if (tp.alive && tp.id !== p.id) targetIds.push(tp.id);
-                  }
-                }
-                const remoteSalvo = {
-                  idPrefix: `rem_${p.id}_${Date.now().toString(36)}`,
-                  ownerId: p.id,
-                  ownerName: p.name,
-                  color: rCheats.homingMissiles ? '#F43F5E' : p.color,
-                  x: p.x,
-                  y: p.y,
-                  vx: p.vx,
-                  vy: p.vy,
-                  angle: p.angle,
-                  noseDist: rSpec.radius + 10,
-                  count,
-                  spreadAngle: rSpec.spreadAngle,
-                  novaSpread: Boolean(rCheats.novaSpread),
-                  baseMuzzle: rCheats.homingMissiles ? 860 : rSpec.bulletSpeed,
-                  damage: rCheats.homingMissiles ? (rCheats.novaSpread ? 26 : 38) : rSpec.bulletDamage,
-                  ttl: rCheats.homingMissiles ? 4.0 : 2.6,
-                  isMissile: Boolean(rCheats.homingMissiles),
-                  targetIds,
-                };
-                world.bullets.push(...expandSalvoToBullets(remoteSalvo));
-                if (world.bullets.length > 1800) {
-                  world.bullets.splice(0, world.bullets.length - 1800);
-                }
-              }
-            }
-
-            p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
-            p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
-          }
-        } else {
-          // Even in WebSocket mode, smoothly interpolate remote player positions between 30Hz snapshots
-          for (const p of world.players.values()) {
-            if (p.id !== selfIdRef.current && p.alive) {
               p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
               p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
+              p.netTargetX = p.x;
+              p.netTargetY = p.y;
+            } else {
+              if (p.shooting) {
+                // Ensure remote player shooting is always visible even between /api/sector HTTP polls
+                const rSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
+                const rCheats = p.cheats || DEFAULT_PLAYER_CHEATS;
+                const rCooldown = rCheats.novaSpread || rCheats.rapidFire ? 0.08 : rSpec.fireCooldown;
+                if (nowSec - (p.lastFireTime || 0) >= rCooldown * 1.25) {
+                  p.lastFireTime = nowSec;
+                  const count = rCheats.novaSpread ? 360 : rSpec.spreadCount;
+                  const targetIds: string[] = [];
+                  if (rCheats.homingMissiles) {
+                    for (const tp of world.players.values()) {
+                      if (tp.alive && tp.id !== p.id) targetIds.push(tp.id);
+                    }
+                  }
+                  const remoteSalvo = {
+                    idPrefix: `rem_${p.id}_${Date.now().toString(36)}`,
+                    ownerId: p.id,
+                    ownerName: p.name,
+                    color: rCheats.homingMissiles ? '#F43F5E' : p.color,
+                    x: p.x,
+                    y: p.y,
+                    vx: p.vx,
+                    vy: p.vy,
+                    angle: p.angle,
+                    noseDist: rSpec.radius + 10,
+                    count,
+                    spreadAngle: rSpec.spreadAngle,
+                    novaSpread: Boolean(rCheats.novaSpread),
+                    baseMuzzle: rCheats.homingMissiles ? 860 : rSpec.bulletSpeed,
+                    damage: rCheats.homingMissiles ? (rCheats.novaSpread ? 26 : 38) : rSpec.bulletDamage,
+                    ttl: rCheats.homingMissiles ? 4.0 : 2.6,
+                    isMissile: Boolean(rCheats.homingMissiles),
+                    targetIds,
+                  };
+                  world.bullets.push(...expandSalvoToBullets(remoteSalvo));
+                  if (world.bullets.length > 1800) {
+                    world.bullets.splice(0, world.bullets.length - 1800);
+                  }
+                }
+              }
+
+              // Smooth 60fps dead-reckoning & exponential convergence hides choppy Vercel HTTP polls
+              renderer.stepRemotePlayerSmooth(
+                p,
+                dt,
+                world.gravityStarEnabled,
+                world.planets
+              );
+            }
+          }
+        } else {
+          // Smoothly dead-reckon & interpolate remote player positions between WebSocket snapshots
+          for (const p of world.players.values()) {
+            if (p.id !== selfIdRef.current) {
+              renderer.stepRemotePlayerSmooth(
+                p,
+                dt,
+                world.gravityStarEnabled,
+                world.planets
+              );
             }
           }
         }
@@ -1320,17 +1724,35 @@ export default function App() {
             const b = world.bullets[i];
             let bulletConsumed = false;
 
-            // 1. Check bullet vs all alive players (both local and remote bullets!)
+            // 1. Check bullet vs all alive players (both ship body AND 2x spectator mouse cursor!)
             for (const target of world.players.values()) {
               if (!target.alive || target.id === b.ownerId) continue;
               const tSpec = HULL_SPECS[target.hull] || HULL_SPECS.needle;
               const hitRadius = tSpec.radius + (b.isMissile ? 14 : 9);
               const dx = shortestToroidalDelta(b.x, target.x, ARENA_WIDTH);
-              if (Math.abs(dx) > hitRadius) continue;
               const dy = shortestToroidalDelta(b.y, target.y, ARENA_HEIGHT);
-              if (Math.abs(dy) > hitRadius) continue;
+              const hitShip =
+                Math.abs(dx) <= hitRadius &&
+                Math.abs(dy) <= hitRadius &&
+                dx * dx + dy * dy <= hitRadius * hitRadius;
 
-              if (dx * dx + dy * dy <= hitRadius * hitRadius) {
+              let hitCursor = false;
+              if (
+                !hitShip &&
+                target.spectating &&
+                typeof target.cursorX === 'number' &&
+                typeof target.cursorY === 'number'
+              ) {
+                const cursorRadius = b.isMissile ? 40 : 34;
+                const cdx = shortestToroidalDelta(b.x, target.cursorX, ARENA_WIDTH);
+                const cdy = shortestToroidalDelta(b.y, target.cursorY, ARENA_HEIGHT);
+                hitCursor =
+                  Math.abs(cdx) <= cursorRadius &&
+                  Math.abs(cdy) <= cursorRadius &&
+                  cdx * cdx + cdy * cdy <= cursorRadius * cursorRadius;
+              }
+
+              if (hitShip || hitCursor) {
                 world.bullets.splice(i, 1);
                 bulletConsumed = true;
 
@@ -1339,10 +1761,16 @@ export default function App() {
 
                 if (!alreadyProcessed && (b.ownerId === selfIdRef.current || target.id === selfIdRef.current)) {
                   peerSyncRef.current?.markHitSeen(hitId);
-                  const knockback = b.isMissile ? 95 : 65;
-                  target.vx += Math.cos(b.angle) * knockback;
-                  target.vy += Math.sin(b.angle) * knockback;
-                  if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+                  if (!target.spectating && !target.warping) {
+                    const knockback = b.isMissile ? 95 : 65;
+                    target.vx += Math.cos(b.angle) * knockback;
+                    target.vy += Math.sin(b.angle) * knockback;
+                  }
+                  if (
+                    (target.invulnerableTimer <= 0 || target.spectating) &&
+                    !target.cheats?.godMode &&
+                    !target.warping
+                  ) {
                     target.hp = Math.max(0, target.hp - b.damage);
                   }
                   if (target.id !== selfIdRef.current) {
@@ -1350,7 +1778,7 @@ export default function App() {
                   }
 
                   const attacker = world.players.get(b.ownerId);
-                  const fatal = target.hp <= 0 && !target.cheats?.godMode;
+                  const fatal = target.hp <= 0 && !target.cheats?.godMode && !target.warping;
                   let killEntry: KillFeedEntry | undefined;
 
                   if (fatal) {
@@ -1359,6 +1787,11 @@ export default function App() {
                     target.deaths += 1;
                     target.streak = 0;
                     target.respawnTimer = 2.8;
+                    target.warping = false;
+                    if (target.id === selfIdRef.current) {
+                      warpSpeedActiveRef.current = false;
+                      setWarpSpeedActive(false);
+                    }
                     if (attacker && attacker.id !== target.id) {
                       attacker.kills += 1;
                       attacker.streak += 1;
@@ -1377,8 +1810,21 @@ export default function App() {
                       timestamp: Date.now(),
                     };
                     world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
-                    renderer.addBurst(target.x, target.y, target.vx * 0.2, target.vy * 0.2, target.color, 32, 300, true);
+                    renderer.addBurst(
+                      hitCursor ? b.x : target.x,
+                      hitCursor ? b.y : target.y,
+                      target.vx * 0.2,
+                      target.vy * 0.2,
+                      target.color,
+                      32,
+                      300,
+                      true
+                    );
                     soundEngine.playHit(true);
+                    deathSoundCtrlRef.current.playDeathSound(
+                      target.deathSound,
+                      isMutedRef.current
+                    );
                   } else {
                     renderer.hitFlashes.set(target.id, 0.12);
                     renderer.addBurst(b.x, b.y, 0, 0, b.color, 10, 160, false);
@@ -1398,6 +1844,8 @@ export default function App() {
                     damage: b.damage,
                     fatal,
                     color: b.color,
+                    cause: b.isMissile ? 'missile' : 'laser',
+                    deathSound: target.deathSound,
                     killEntry,
                   });
                 } else {
@@ -1432,6 +1880,118 @@ export default function App() {
                   }
                 }
                 break;
+              }
+            }
+          }
+        }
+
+        // High-Force Ship-to-Ship Smash Collisions (>= 1,000 u/s) in Peer/Vercel Mode
+        if (!isWsConnected && localPlayer.alive && !localPlayer.spectating) {
+          const myRadius = (HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle).radius;
+          for (const other of world.players.values()) {
+            if (other.id === localPlayer.id || !other.alive || other.spectating) continue;
+            const otherRadius = (HULL_SPECS[other.hull] || HULL_SPECS.needle).radius;
+            const minDist = myRadius + otherRadius;
+            const dx = shortestToroidalDelta(other.x, localPlayer.x, ARENA_WIDTH);
+            if (Math.abs(dx) > minDist) continue;
+            const dy = shortestToroidalDelta(other.y, localPlayer.y, ARENA_HEIGHT);
+            if (Math.abs(dy) > minDist) continue;
+            const distSq = dx * dx + dy * dy;
+            if (distSq <= minDist * minDist) {
+              const relSpeed = Math.hypot(localPlayer.vx - other.vx, localPlayer.vy - other.vy);
+              const mySpeed = Math.hypot(localPlayer.vx, localPlayer.vy);
+              const otherSpeed = Math.hypot(other.vx, other.vy);
+              const smashForce = Math.max(relSpeed, mySpeed, otherSpeed);
+
+              if (smashForce >= SHIP_SMASH_SPEED_THRESHOLD) {
+                const hitId = `smash_${Math.floor(Date.now() / 400)}_${[localPlayer.id, other.id].sort().join('_')}`;
+                if (!(peerSyncRef.current?.hasSeenHit(hitId) ?? false)) {
+                  peerSyncRef.current?.markHitSeen(hitId);
+                  const impactSpeed = Math.round(smashForce);
+
+                  if (!localPlayer.cheats?.godMode && !localPlayer.warping) {
+                    localPlayer.alive = false;
+                    localPlayer.hp = 0;
+                    localPlayer.deaths += 1;
+                    localPlayer.streak = 0;
+                    localPlayer.respawnTimer = 2.8;
+                  }
+                  if (!other.cheats?.godMode && !other.warping) {
+                    other.alive = false;
+                    other.hp = 0;
+                    other.deaths += 1;
+                    other.streak = 0;
+                    other.respawnTimer = 2.8;
+                    lastDamagedRemoteAtRef.current.set(other.id, Date.now());
+                  }
+
+                  const killEntry: KillFeedEntry = {
+                    id: `kill_smash_${Date.now().toString(36)}`,
+                    killerId: localPlayer.id,
+                    killerName: localPlayer.name,
+                    killerColor: localPlayer.color,
+                    victimId: other.id,
+                    victimName: other.name,
+                    victimColor: other.color,
+                    cause: 'collision',
+                    speedAtKill: impactSpeed,
+                    timestamp: Date.now(),
+                  };
+                  world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+
+                  renderer.cameraShake = 18;
+                  renderer.hitstopTimer = 0.055;
+                  renderer.addBurst(
+                    localPlayer.x,
+                    localPlayer.y,
+                    localPlayer.vx * 0.2,
+                    localPlayer.vy * 0.2,
+                    localPlayer.color,
+                    38,
+                    360,
+                    true
+                  );
+                  renderer.addBurst(
+                    other.x,
+                    other.y,
+                    other.vx * 0.2,
+                    other.vy * 0.2,
+                    other.color,
+                    38,
+                    360,
+                    true
+                  );
+                  soundEngine.playHit(true);
+                  deathSoundCtrlRef.current.playSmashSound(undefined, isMutedRef.current);
+
+                  peerSyncRef.current?.send({
+                    type: 'peer:combat_hit',
+                    senderId: selfIdRef.current,
+                    hitId,
+                    targetId: other.id,
+                    attackerId: localPlayer.id,
+                    x: Math.round(other.x),
+                    y: Math.round(other.y),
+                    vx: Math.round(other.vx),
+                    vy: Math.round(other.vy),
+                    damage: 999,
+                    fatal: true,
+                    color: other.color,
+                    cause: 'collision',
+                    killEntry,
+                  });
+                  break;
+                }
+              } else {
+                // Sub-1000 u/s elastic bump separation
+                const dist = Math.max(1, Math.sqrt(distSq));
+                const nx = dx / dist;
+                const ny = dy / dist;
+                const overlap = minDist - dist + 2;
+                localPlayer.x = wrapCoord(localPlayer.x + nx * overlap * 0.6, ARENA_WIDTH);
+                localPlayer.y = wrapCoord(localPlayer.y + ny * overlap * 0.6, ARENA_HEIGHT);
+                localPlayer.vx += nx * 130;
+                localPlayer.vy += ny * 130;
               }
             }
           }
@@ -1508,38 +2068,7 @@ export default function App() {
         }
 
         if (sampled.warpJustPressed && localPlayer.alive && !isFreeCam) {
-          soundEngine.playWarp();
-          // Burst at departure coordinates
-          renderer.addBurst(
-            localPlayer.x,
-            localPlayer.y,
-            0,
-            0,
-            localPlayer.color,
-            24,
-            260,
-            false
-          );
-          // Teleport to a safe orbital point across the 10x star system away from the central Gravity Star
-          const orbitRadius = 2200 + Math.random() * 5800;
-          const theta = Math.random() * Math.PI * 2;
-          localPlayer.x = ((ARENA_WIDTH * 0.5 + Math.cos(theta) * orbitRadius) % ARENA_WIDTH + ARENA_WIDTH) % ARENA_WIDTH;
-          localPlayer.y = ((ARENA_HEIGHT * 0.5 + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT + ARENA_HEIGHT) % ARENA_HEIGHT;
-          // Preserve 100% of your accumulated infinite momentum, redirected along your current ship heading!
-          const currentMomentum = Math.hypot(localPlayer.vx, localPlayer.vy);
-          localPlayer.vx = Math.cos(localPlayer.angle) * currentMomentum;
-          localPlayer.vy = Math.sin(localPlayer.angle) * currentMomentum;
-          // Burst at arrival coordinates
-          renderer.addBurst(
-            localPlayer.x,
-            localPlayer.y,
-            localPlayer.vx * 0.2,
-            localPlayer.vy * 0.2,
-            '#38BDF8',
-            24,
-            260,
-            false
-          );
+          handleToggleWarpSpeed();
         }
 
         // Compute world-space coordinates for the local mouse cursor when in Free-Cam / Spectator Mode
@@ -1562,7 +2091,13 @@ export default function App() {
           );
         }
 
-        if (now - lastNetSend >= 32 || (sampled.warpJustPressed && !isFreeCam)) {
+        // Attach live Music Box broadcast state, custom Death Sound (.OGG), and Admin Ship PNG to localPlayer
+        localPlayer.music = musicBoxRef.current.getBroadcastMusicState();
+        localPlayer.deathSound = deathSoundCtrlRef.current.selectedDeathSound;
+        localPlayer.shipPng = selectedShipPngRef.current;
+        localPlayer.warping = warpSpeedActiveRef.current && localPlayer.alive && !isFreeCam;
+
+        if (now - lastNetSend >= 32) {
           lastNetSend = now;
           if (!isWsConnected) {
             peerSyncRef.current?.send({
@@ -1577,7 +2112,6 @@ export default function App() {
             angle: localPlayer.angle,
             thrusting: localPlayer.thrusting,
             shooting: localPlayer.shooting,
-            warpRequested: sampled.warpJustPressed && !isFreeCam,
             inputSource: sampled.inputSource,
             x: localPlayer.x,
             y: localPlayer.y,
@@ -1587,6 +2121,10 @@ export default function App() {
             spectateTargetId: localPlayer.spectateTargetId,
             cursorX: localPlayer.cursorX,
             cursorY: localPlayer.cursorY,
+            music: localPlayer.music,
+            deathSound: localPlayer.deathSound,
+            shipPng: localPlayer.shipPng,
+            warping: localPlayer.warping,
           });
         }
 
@@ -1621,6 +2159,27 @@ export default function App() {
         }
       } else {
         soundEngine.stopThrust();
+        if (localPlayer) {
+          localPlayer.music = musicBoxRef.current.getBroadcastMusicState();
+        }
+        for (const p of world.players.values()) {
+          if (p.id !== selfIdRef.current) {
+            renderer.stepRemotePlayerSmooth(
+              p,
+              dt,
+              world.gravityStarEnabled,
+              world.planets
+            );
+          }
+        }
+        renderer.stepClientBulletsAndMissiles(
+          world.bullets,
+          world.players,
+          world.asteroids,
+          dt,
+          world.planets,
+          world.gravityStarEnabled
+        );
       }
 
       const cameraOverride = cheatsRef.current.freeCam
@@ -1649,14 +2208,27 @@ export default function App() {
         cameraOverride
       );
 
+      // Update spatial proximity audio from other ships playing music within MUSIC_HEARING_RADIUS (1800u)
+      const camPos = renderer.getCameraPosition();
+      const listenerX =
+        localPlayer && !cheatsRef.current.freeCam ? localPlayer.x : camPos.x;
+      const listenerY =
+        localPlayer && !cheatsRef.current.freeCam ? localPlayer.y : camPos.y;
+      musicBoxRef.current.syncRemotePlayersAudio(
+        world.players,
+        selfIdRef.current,
+        listenerX,
+        listenerY,
+        isMutedRef.current
+      );
+
       // Keep local cursor world position synced with rendered camera even while paused or right after camera lerp
       if (localPlayer && cheatsRef.current.freeCam) {
-        const camAfter = renderer.getCameraPosition();
         localPlayer.cursorX = Math.round(
-          wrapCoord(camAfter.x + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
+          wrapCoord(camPos.x + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
         );
         localPlayer.cursorY = Math.round(
-          wrapCoord(camAfter.y + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
+          wrapCoord(camPos.y + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
         );
       }
 
@@ -1706,6 +2278,7 @@ export default function App() {
   }, [
     handleCycleSpectateTarget,
     handleStartGame,
+    handleToggleWarpSpeed,
     handleTriggerCheatAction,
     sendWs,
   ]);
@@ -1725,6 +2298,50 @@ export default function App() {
     const muted = soundEngine.toggleMute();
     setIsMuted(muted);
   };
+
+  const handleSendChat = useCallback(() => {
+    const parsed = parseChatInput(chatDraft);
+    if (!parsed) {
+      setChatDraft('');
+      return;
+    }
+
+    const localPlayer = worldRef.current.players.get(selfIdRef.current);
+    const senderName =
+      (localPlayer?.name || pilotNameRef.current || 'PILOT').trim().slice(0, 16) || 'PILOT';
+    const senderColor = localPlayer?.color || selectedColorRef.current || '#38BDF8';
+    const msgId = `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+
+    const chatEntry: ChatMessage = {
+      id: msgId,
+      senderId: selfIdRef.current,
+      senderName,
+      senderColor,
+      text: parsed.text,
+      isServerWide: parsed.isServerWide,
+      timestamp: Date.now(),
+    };
+
+    receiveChatMessage(chatEntry, true);
+
+    peerSyncRef.current?.send({
+      type: 'peer:chat',
+      senderId: selfIdRef.current,
+      message: chatEntry,
+    });
+
+    sendWs({
+      type: 'chat:send',
+      id: msgId,
+      playerId: selfIdRef.current,
+      senderName,
+      senderColor,
+      text: chatDraft.trim(),
+    });
+
+    setChatDraft('');
+    chatInputRef.current?.blur();
+  }, [chatDraft, receiveChatMessage, sendWs]);
 
   const getMomentumLabel = (spd: number) => {
     if (spd >= 2400) return 'RELATIVISTIC VECTOR';
@@ -1753,6 +2370,32 @@ export default function App() {
         className="block h-full w-full cursor-crosshair"
       />
 
+      {/* ==================== GLOBAL SERVER-WIDE BIG TEXT BROADCAST BANNER ==================== */}
+      {serverWideBanner && (
+        <div className="fixed inset-x-0 top-16 md:top-20 z-40 flex justify-center px-4 pointer-events-none">
+          <div className="pointer-events-auto relative max-w-4xl w-full rounded-2xl border-2 border-amber-400/90 bg-[#0B1120]/95 px-6 py-5 text-center shadow-[0_0_50px_rgba(245,158,11,0.45)] backdrop-blur-md">
+            <div className="flex items-center justify-center gap-2 font-mono-tabular text-xs font-bold uppercase tracking-widest text-amber-400">
+              <span className="h-2.5 w-2.5 rounded-full bg-amber-400 animate-ping" />
+              <span>SERVER-WIDE BROADCAST</span>
+              <span className="text-slate-500">·</span>
+              <span style={{ color: serverWideBanner.senderColor }}>
+                {serverWideBanner.senderName}
+              </span>
+            </div>
+            <div className="mt-2 font-display text-3xl sm:text-4xl md:text-5xl font-black tracking-wide text-white break-words drop-shadow-[0_4px_20px_rgba(245,158,11,0.5)]">
+              {serverWideBanner.text}
+            </div>
+            <button
+              onClick={() => setServerWideBanner(null)}
+              className="absolute right-3 top-3 rounded-md border border-slate-700/80 bg-[#060913]/80 px-2 py-0.5 font-mono-tabular text-[10px] text-slate-400 hover:border-slate-500 hover:text-white"
+              title="Dismiss announcement"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ==================== 1. TITLE SCREEN SHELL ==================== */}
       {shellState === 'TITLE_MENU' && (
         <div className="fixed inset-0 z-20 flex flex-col justify-between p-6 md:p-10 pointer-events-none">
@@ -1769,6 +2412,12 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-2.5">
+              <button
+                onClick={() => setDeathSoundModalOpen(true)}
+                className="rounded-lg border border-amber-500/50 bg-[#0B1120] px-3.5 py-2 text-xs font-medium text-amber-300 transition-colors hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0"
+              >
+                Death Sound (.OGG)
+              </button>
               <button
                 onClick={() => setControllerModalOpen(true)}
                 className="rounded-lg border border-slate-700 bg-[#0B1120] px-3.5 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0"
@@ -1959,7 +2608,7 @@ export default function App() {
 
               {/* Primary Launch Row */}
               <div className="mt-5 flex flex-col items-center justify-between gap-4 border-t border-slate-800/80 pt-4 sm:flex-row">
-                <div className="flex items-center gap-3 text-xs text-slate-400">
+                <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
                   <span>{hud.playerCount} Pilots in Sector</span>
                   <span className="text-slate-600">·</span>
                   <button
@@ -1967,6 +2616,13 @@ export default function App() {
                     className="font-medium text-amber-400 hover:text-amber-300 whitespace-nowrap shrink-0"
                   >
                     {copiedInvite ? 'Invite Link Copied!' : 'Copy Invite Link'}
+                  </button>
+                  <span className="text-slate-600">·</span>
+                  <button
+                    onClick={() => setDeathSoundModalOpen(true)}
+                    className="font-medium text-cyan-400 hover:text-cyan-300 whitespace-nowrap shrink-0"
+                  >
+                    Custom Death Sound (.OGG)
                   </button>
                 </div>
 
@@ -1982,7 +2638,7 @@ export default function App() {
 
           {/* Single Flat Control-Hint Line at Bottom */}
           <div className="text-center font-mono-tabular text-xs text-slate-400 pointer-events-auto">
-            Joystick Points Exact Ship Direction · RT / A Build Infinite Momentum · RB / X Fire · F / R3 Auto-Fire · Y / E Warp · Esc Pause
+            Joystick Points Exact Ship Direction · RT / A Build Infinite Momentum · RB / X Fire · F / R3 Auto-Fire · Y / E Warp · T / Enter Chat · Esc Pause
           </div>
         </div>
       )}
@@ -2097,6 +2753,23 @@ export default function App() {
                 </button>
               </div>
 
+              {/* Dedicated Warp Speed Toggle Button (Invincible while warping; click again to stop at 0 u/s) */}
+              <div className="mt-2 pointer-events-auto">
+                <button
+                  onClick={handleToggleWarpSpeed}
+                  disabled={!hud.alive || cheats.freeCam}
+                  className={`w-full rounded-md border px-3 py-1.5 font-mono-tabular text-xs font-bold transition-colors whitespace-nowrap ${
+                    warpSpeedActive
+                      ? 'border-cyan-300 bg-cyan-500 text-slate-950 hover:bg-cyan-400 shadow-lg shadow-cyan-500/25'
+                      : 'border-cyan-500/50 bg-[#060913] text-cyan-300 hover:border-cyan-400 hover:text-white disabled:opacity-40'
+                  }`}
+                >
+                  {warpSpeedActive
+                    ? '⏹ STOP WARP (ZERO MOMENTUM) · [INVINCIBLE]'
+                    : '⚡ ENGAGE WARP SPEED (E) · INVINCIBLE'}
+                </button>
+              </div>
+
               {/* Active Cheats Readout */}
               {anyCheatActive && (
                 <div className="mt-1.5 font-mono-tabular text-[11px] text-rose-400">
@@ -2109,6 +2782,17 @@ export default function App() {
                   ]
                     .filter(Boolean)
                     .join(' · ')}
+                </div>
+              )}
+
+              {/* Nearby Ship Proximity Music Readout */}
+              {musicBox.nearbyStreams.length > 0 && (
+                <div className="mt-1.5 font-mono-tabular text-[11px] text-amber-400">
+                  {musicBox.nearbyStreams.slice(0, 2).map((s) => (
+                    <div key={s.playerId} className="truncate max-w-[230px]">
+                      ♪ {s.trackTitle} · <span style={{ color: s.playerColor }}>{s.playerName}</span> ({s.distance}m)
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -2181,6 +2865,12 @@ export default function App() {
                     {hud.localCoopActive ? 'Remove 2nd Controller' : '+ Join 2nd Controller'}
                   </button>
                 )}
+                <button
+                  onClick={() => setDeathSoundModalOpen(true)}
+                  className="rounded-lg border border-amber-500/40 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0"
+                >
+                  Death Sound (.OGG)
+                </button>
                 <button
                   onClick={() => setControllerModalOpen(true)}
                   className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0"
@@ -2261,24 +2951,114 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bottom Perimeter Row: Combat Kill Feed & Respawn Notice */}
+          {/* Bottom Perimeter Row: Sector Text Chat, Combat Kill Feed & Respawn Notice */}
           <div className="flex items-end justify-between gap-4">
-            {/* Kill Feed */}
-            <div className="space-y-1">
-              {hud.killFeed.slice(0, 4).map((entry) => (
-                <div
-                  key={entry.id}
-                  className="font-mono-tabular text-xs text-slate-300"
-                >
-                  <span style={{ color: entry.killerColor }}>{entry.killerName}</span>
-                  <span className="mx-1.5 text-slate-500">
-                    {entry.cause === 'missile' ? 'locked & destroyed' : 'destroyed'}
-                  </span>
-                  <span style={{ color: entry.victimColor }}>{entry.victimName}</span>
-                  <span className="mx-1.5 text-slate-600">·</span>
-                  <span className="text-slate-400">{entry.speedAtKill} u/s</span>
+            {/* Bottom-Left: Sector Text Chat + Kill Feed */}
+            <div className="flex flex-col gap-2.5">
+              {/* Kill Feed */}
+              {hud.killFeed.length > 0 && (
+                <div className="space-y-1">
+                  {hud.killFeed.slice(0, 4).map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="font-mono-tabular text-xs text-slate-300"
+                    >
+                      <span style={{ color: entry.killerColor }}>{entry.killerName}</span>
+                      <span className="mx-1.5 text-slate-500">
+                        {entry.cause === 'collision'
+                          ? 'smashed into (1000+ u/s)'
+                          : entry.cause === 'missile'
+                          ? 'locked & destroyed'
+                          : 'destroyed'}
+                      </span>
+                      <span style={{ color: entry.victimColor }}>{entry.victimName}</span>
+                      <span className="mx-1.5 text-slate-600">·</span>
+                      <span className="text-slate-400">{entry.speedAtKill} u/s</span>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
+
+              {/* Live Sector Text Chat */}
+              <div className="pointer-events-auto w-80 sm:w-96 rounded-xl border border-slate-800/90 bg-[#0B1120]/90 p-2.5 shadow-xl backdrop-blur-sm">
+                <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800/80 text-[11px] font-mono-tabular">
+                  <span className="font-semibold text-slate-300">
+                    SECTOR CHAT ({roomId})
+                  </span>
+                </div>
+
+                {/* Chat Message History */}
+                <div
+                  ref={chatListRef}
+                  className="mt-1.5 max-h-28 overflow-y-auto space-y-1 pr-1 font-mono-tabular text-xs"
+                >
+                  {chatMessages.length === 0 ? (
+                    <div className="py-1 text-[11px] text-slate-500">
+                      Press <span className="text-slate-300">T</span> or <span className="text-slate-300">Enter</span> to chat.
+                    </div>
+                  ) : (
+                    chatMessages.map((m) => (
+                      <div
+                        key={m.id}
+                        className={`leading-snug break-words ${
+                          m.isServerWide
+                            ? 'rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-amber-200 font-semibold'
+                            : 'text-slate-200'
+                        }`}
+                      >
+                        {m.isServerWide && (
+                          <span className="mr-1.5 rounded bg-amber-500 px-1 py-0.2 text-[9px] font-bold uppercase text-slate-950">
+                            SERVER-WIDE
+                          </span>
+                        )}
+                        <span
+                          className="font-bold"
+                          style={{ color: m.senderColor || '#38BDF8' }}
+                        >
+                          {m.senderName}:
+                        </span>{' '}
+                        <span>{m.text}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Chat Input Row */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleSendChat();
+                  }}
+                  className="mt-2 flex items-center gap-1.5"
+                >
+                  <input
+                    ref={chatInputRef}
+                    type="text"
+                    maxLength={240}
+                    value={chatDraft}
+                    onChange={(e) => setChatDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === 'Escape') {
+                        e.preventDefault();
+                        chatInputRef.current?.blur();
+                      }
+                    }}
+                    placeholder="Type a message..."
+                    className={`w-full rounded-lg border px-2.5 py-1.5 font-mono-tabular text-xs text-white focus:outline-none ${
+                      /^\/server-wide\s+/i.test(chatDraft)
+                        ? 'border-amber-400 bg-amber-950/30 text-amber-200'
+                        : 'border-slate-700 bg-[#060913] focus:border-cyan-400'
+                    }`}
+                  />
+                  <button
+                    type="submit"
+                    className="rounded-lg bg-amber-500 px-3 py-1.5 font-display text-xs font-bold text-slate-950 hover:bg-amber-400 whitespace-nowrap shrink-0"
+                  >
+                    Send
+                  </button>
+                </form>
+              </div>
             </div>
 
             {/* Respawn Banner when Destroyed */}
@@ -2369,6 +3149,12 @@ export default function App() {
                 Resume Combat
               </button>
               <button
+                onClick={() => setDeathSoundModalOpen(true)}
+                className="w-full rounded-lg border border-amber-500/50 py-2.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0"
+              >
+                Custom Death & Smash Sounds (.OGG)
+              </button>
+              <button
                 onClick={() => setControllerModalOpen(true)}
                 className="w-full rounded-lg border border-slate-700 py-2.5 text-xs font-medium text-slate-200 hover:border-slate-500 whitespace-nowrap shrink-0"
               >
@@ -2406,6 +3192,13 @@ export default function App() {
         onUpdateMapping={handleUpdateMapping}
       />
 
+      {/* ==================== 4B. PUBLIC DEATH SOUND (.OGG) SELECTOR MODAL ==================== */}
+      <DeathSoundModal
+        isOpen={deathSoundModalOpen}
+        onClose={() => setDeathSoundModalOpen(false)}
+        controller={deathSoundCtrl}
+      />
+
       {/* ==================== 5. FLOATING MUSIC BOX WINDOW WHILE FLYING ==================== */}
       {shellState !== 'TITLE_MENU' && (
         <FloatingMusicBoxWindow controller={musicBox} />
@@ -2425,6 +3218,10 @@ export default function App() {
         musicBox={musicBox}
         spectateTargetId={spectateTargetId}
         onSelectSpectateTarget={handleSelectSpectateTarget}
+        warpSpeedActive={warpSpeedActive}
+        onToggleWarpSpeed={handleToggleWarpSpeed}
+        selectedShipPng={selectedShipPng}
+        onSelectShipPng={handleSelectShipPng}
       />
     </div>
   );

@@ -1,10 +1,43 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  MUSIC_HEARING_RADIUS,
+  PlayerMusicState,
+  PlayerState,
+} from '../shared/types.ts';
 
 export interface OggTrack {
   filename: string;
   title: string;
   url: string;
   sizeBytes?: number;
+}
+
+export interface NearbyShipAudioInfo {
+  playerId: string;
+  playerName: string;
+  playerColor: string;
+  trackTitle: string;
+  distance: number;
+  audibility: number; // 0..1
+}
+
+interface RemoteAudioStream {
+  audio: HTMLAudioElement;
+  filename: string;
+  lastPacketUpdatedAt: number;
+  lastPacketTrackTime: number;
+  anchorTrackTime: number;
+  anchorPerfNow: number;
+  loopTrack: boolean;
+}
+
+function shortestToroidalDeltaLocal(from: number, to: number, size: number): number {
+  let delta = to - from;
+  if (delta > size * 0.5) delta -= size;
+  if (delta < -size * 0.5) delta += size;
+  return delta;
 }
 
 // Vite static glob fallback for any .ogg files bundled in src/components/music/
@@ -37,6 +70,7 @@ export interface MusicBoxController {
   duration: number;
   isLoading: boolean;
   pinnedWindowOpen: boolean;
+  nearbyStreams: NearbyShipAudioInfo[];
   setPinnedWindowOpen: React.Dispatch<React.SetStateAction<boolean>>;
   playTrack: (track: OggTrack) => void;
   togglePlayPause: () => void;
@@ -47,6 +81,14 @@ export interface MusicBoxController {
   setVolume: (vol: number) => void;
   seek: (seconds: number) => void;
   refreshFolder: () => Promise<void>;
+  getBroadcastMusicState: () => PlayerMusicState | null;
+  syncRemotePlayersAudio: (
+    players: Map<string, PlayerState>,
+    selfId: string,
+    listenerX: number,
+    listenerY: number,
+    isGlobalMuted: boolean
+  ) => NearbyShipAudioInfo[];
 }
 
 export function useMusicBoxController(): MusicBoxController {
@@ -59,6 +101,7 @@ export function useMusicBoxController(): MusicBoxController {
   const [duration, setDuration] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [pinnedWindowOpen, setPinnedWindowOpen] = useState<boolean>(false);
+  const [nearbyStreams, setNearbyStreams] = useState<NearbyShipAudioInfo[]>([]);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const tracksRef = useRef<OggTrack[]>(tracks);
@@ -67,6 +110,13 @@ export function useMusicBoxController(): MusicBoxController {
   loopRef.current = loopTrack;
   const currentTrackRef = useRef<OggTrack | null>(currentTrack);
   currentTrackRef.current = currentTrack;
+  const isPlayingRef = useRef<boolean>(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const volumeRef = useRef<number>(volume);
+  volumeRef.current = volume;
+
+  const remoteStreamsRef = useRef<Map<string, RemoteAudioStream>>(new Map());
+  const lastNearbyUiSyncRef = useRef<number>(0);
 
   const refreshFolder = useCallback(async () => {
     setIsLoading(true);
@@ -98,7 +148,7 @@ export function useMusicBoxController(): MusicBoxController {
     refreshFolder();
   }, [refreshFolder]);
 
-  // Initialize persistent HTMLAudioElement
+  // Initialize persistent HTMLAudioElement for local player's Music Box
   useEffect(() => {
     const audio = new Audio();
     audio.preload = 'metadata';
@@ -107,8 +157,14 @@ export function useMusicBoxController(): MusicBoxController {
 
     const onTimeUpdate = () => setCurrentTime(audio.currentTime || 0);
     const onLoadedMetadata = () => setDuration(audio.duration || 0);
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
+    const onPlay = () => {
+      isPlayingRef.current = true;
+      setIsPlaying(true);
+    };
+    const onPause = () => {
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+    };
     const onEnded = () => {
       if (loopRef.current) {
         audio.currentTime = 0;
@@ -120,9 +176,11 @@ export function useMusicBoxController(): MusicBoxController {
           const idx = list.findIndex((t) => t.filename === curr.filename);
           const next = list[(idx + 1) % list.length];
           setCurrentTrack(next);
+          currentTrackRef.current = next;
           audio.src = next.url;
           audio.play().catch(() => {});
         } else {
+          isPlayingRef.current = false;
           setIsPlaying(false);
         }
       }
@@ -141,6 +199,11 @@ export function useMusicBoxController(): MusicBoxController {
       audio.removeEventListener('play', onPlay);
       audio.removeEventListener('pause', onPause);
       audio.removeEventListener('ended', onEnded);
+      for (const stream of remoteStreamsRef.current.values()) {
+        stream.audio.pause();
+        stream.audio.src = '';
+      }
+      remoteStreamsRef.current.clear();
     };
   }, []);
 
@@ -192,6 +255,7 @@ export function useMusicBoxController(): MusicBoxController {
     audio.pause();
     audio.currentTime = 0;
     setCurrentTime(0);
+    isPlayingRef.current = false;
     setIsPlaying(false);
   }, []);
 
@@ -229,6 +293,7 @@ export function useMusicBoxController(): MusicBoxController {
 
   const setVolume = useCallback((vol: number) => {
     const clamped = Math.max(0, Math.min(1, vol));
+    volumeRef.current = clamped;
     setVolumeState(clamped);
     if (audioRef.current) {
       audioRef.current.volume = clamped;
@@ -242,6 +307,209 @@ export function useMusicBoxController(): MusicBoxController {
     setCurrentTime(seconds);
   }, []);
 
+  const getBroadcastMusicState = useCallback((): PlayerMusicState | null => {
+    const audio = audioRef.current;
+    const track = currentTrackRef.current;
+    if (!audio || !track || audio.paused || !isPlayingRef.current) {
+      return null;
+    }
+    return {
+      filename: track.filename,
+      title: track.title,
+      isPlaying: true,
+      trackTime: Number((audio.currentTime || 0).toFixed(3)),
+      updatedAt: Date.now(),
+      volume: volumeRef.current,
+      loopTrack: loopRef.current,
+    };
+  }, []);
+
+  const syncRemotePlayersAudio = useCallback(
+    (
+      players: Map<string, PlayerState>,
+      selfId: string,
+      listenerX: number,
+      listenerY: number,
+      isGlobalMuted: boolean
+    ): NearbyShipAudioInfo[] => {
+      const nowPerf = performance.now();
+      const nowEpoch = Date.now();
+      const activeRemoteIds = new Set<string>();
+      const audibleList: NearbyShipAudioInfo[] = [];
+      const availableTracks =
+        tracksRef.current.length > 0 ? tracksRef.current : getBundledFallbackTracks();
+
+      for (const p of players.values()) {
+        if (p.id === selfId || !p.alive || !p.music || !p.music.isPlaying) {
+          continue;
+        }
+
+        const matchedTrack =
+          availableTracks.find((t) => t.filename === p.music!.filename) ||
+          availableTracks.find(
+            (t) => t.title.toLowerCase() === p.music!.title.toLowerCase()
+          );
+        if (!matchedTrack) continue;
+
+        activeRemoteIds.add(p.id);
+
+        const dx = shortestToroidalDeltaLocal(listenerX, p.x, ARENA_WIDTH);
+        const dy = shortestToroidalDeltaLocal(listenerY, p.y, ARENA_HEIGHT);
+        const dist = Math.hypot(dx, dy);
+
+        // Full volume inside 220u, smooth quadratic spatial falloff out to MUSIC_HEARING_RADIUS (1800u)
+        const innerRadius = 220;
+        const rawRatio =
+          dist <= innerRadius
+            ? 1
+            : dist >= MUSIC_HEARING_RADIUS
+            ? 0
+            : 1 - (dist - innerRadius) / (MUSIC_HEARING_RADIUS - innerRadius);
+        const audibility = rawRatio * rawRatio;
+        const senderVol = typeof p.music.volume === 'number' ? p.music.volume : 0.75;
+        const targetVol = isGlobalMuted
+          ? 0
+          : Math.max(0, Math.min(1, audibility * senderVol));
+
+        let stream = remoteStreamsRef.current.get(p.id);
+        if (!stream) {
+          const remoteAudio = new Audio();
+          remoteAudio.preload = 'auto';
+          const newStream: RemoteAudioStream = {
+            audio: remoteAudio,
+            filename: '',
+            lastPacketUpdatedAt: 0,
+            lastPacketTrackTime: -1,
+            anchorTrackTime: p.music.trackTime || 0,
+            anchorPerfNow: nowPerf,
+            loopTrack: Boolean(p.music.loopTrack),
+          };
+
+          const syncOnReady = () => {
+            const liveExpected =
+              newStream.anchorTrackTime +
+              Math.max(0, (performance.now() - newStream.anchorPerfNow) / 1000);
+            const dur = remoteAudio.duration;
+            const targetTime =
+              dur > 0 && Number.isFinite(dur)
+                ? newStream.loopTrack
+                  ? liveExpected % dur
+                  : Math.min(liveExpected, Math.max(0, dur - 0.05))
+                : liveExpected;
+            if (Number.isFinite(targetTime) && targetTime >= 0) {
+              try {
+                remoteAudio.currentTime = targetTime;
+              } catch {
+                // Ignore if seek not yet ready
+              }
+            }
+          };
+
+          remoteAudio.addEventListener('loadedmetadata', syncOnReady);
+          remoteAudio.addEventListener('canplay', syncOnReady);
+          stream = newStream;
+          remoteStreamsRef.current.set(p.id, stream);
+        }
+
+        // Update time anchor whenever a fresh network packet arrives from this remote player
+        if (
+          p.music.updatedAt !== stream.lastPacketUpdatedAt ||
+          Math.abs(p.music.trackTime - stream.lastPacketTrackTime) > 0.02
+        ) {
+          const clockDiffSec = (nowEpoch - p.music.updatedAt) / 1000;
+          // If clocks are NTP-aligned within 2s, use exact clock delta; otherwise use ~0.06s transit estimate
+          const transitOffset =
+            clockDiffSec >= 0 && clockDiffSec <= 2.0 ? clockDiffSec : 0.06;
+          stream.anchorTrackTime = Math.max(0, (p.music.trackTime || 0) + transitOffset);
+          stream.anchorPerfNow = nowPerf;
+          stream.lastPacketUpdatedAt = p.music.updatedAt;
+          stream.lastPacketTrackTime = p.music.trackTime;
+          stream.loopTrack = Boolean(p.music.loopTrack);
+        }
+
+        // Switch audio source if remote player changed songs
+        if (stream.filename !== matchedTrack.filename) {
+          stream.filename = matchedTrack.filename;
+          stream.audio.src = matchedTrack.url;
+          stream.audio.loop = Boolean(p.music.loopTrack);
+          stream.audio.load();
+        } else {
+          stream.audio.loop = Boolean(p.music.loopTrack);
+        }
+
+        // Compute exact live playback timestamp right now
+        let expectedTime =
+          stream.anchorTrackTime + Math.max(0, (nowPerf - stream.anchorPerfNow) / 1000);
+        const dur = stream.audio.duration;
+        if (dur > 0 && Number.isFinite(dur)) {
+          expectedTime = stream.loopTrack
+            ? expectedTime % dur
+            : Math.min(expectedTime, Math.max(0, dur - 0.05));
+        }
+
+        // Keep remote playback head tightly locked to the sender's current timestamp (within 0.45s)
+        if (
+          stream.audio.readyState >= 1 &&
+          Number.isFinite(expectedTime) &&
+          Math.abs(stream.audio.currentTime - expectedTime) > 0.45
+        ) {
+          try {
+            stream.audio.currentTime = expectedTime;
+          } catch {
+            // Ignore seek errors during buffering
+          }
+        }
+
+        stream.audio.volume = targetVol;
+
+        if (targetVol > 0.002) {
+          if (stream.audio.paused) {
+            if (
+              stream.audio.readyState >= 1 &&
+              Number.isFinite(expectedTime) &&
+              Math.abs(stream.audio.currentTime - expectedTime) > 0.2
+            ) {
+              try {
+                stream.audio.currentTime = expectedTime;
+              } catch {
+                // Ignore
+              }
+            }
+            stream.audio.play().catch(() => {});
+          }
+          audibleList.push({
+            playerId: p.id,
+            playerName: p.name,
+            playerColor: p.color,
+            trackTitle: matchedTrack.title,
+            distance: Math.round(dist),
+            audibility,
+          });
+        } else if (dist > MUSIC_HEARING_RADIUS + 250 && !stream.audio.paused) {
+          stream.audio.pause();
+        }
+      }
+
+      // Clean up streams for remote players who stopped playing music, died, or left the game
+      for (const [remoteId, stream] of remoteStreamsRef.current.entries()) {
+        if (!activeRemoteIds.has(remoteId)) {
+          stream.audio.pause();
+          stream.audio.src = '';
+          remoteStreamsRef.current.delete(remoteId);
+        }
+      }
+
+      audibleList.sort((a, b) => a.distance - b.distance);
+      if (nowPerf - lastNearbyUiSyncRef.current > 180) {
+        lastNearbyUiSyncRef.current = nowPerf;
+        setNearbyStreams(audibleList);
+      }
+
+      return audibleList;
+    },
+    []
+  );
+
   return {
     tracks,
     currentTrack,
@@ -252,6 +520,7 @@ export function useMusicBoxController(): MusicBoxController {
     duration,
     isLoading,
     pinnedWindowOpen,
+    nearbyStreams,
     setPinnedWindowOpen,
     playTrack,
     togglePlayPause,
@@ -262,6 +531,8 @@ export function useMusicBoxController(): MusicBoxController {
     setVolume,
     seek,
     refreshFolder,
+    getBroadcastMusicState,
+    syncRemotePlayersAudio,
   };
 }
 

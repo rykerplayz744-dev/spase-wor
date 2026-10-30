@@ -1,6 +1,32 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { CheatActionType, PlayerCheats, PlayerState } from '../shared/types.ts';
 import { MusicBoxContent, MusicBoxController } from './MusicBox.tsx';
+
+export interface ShipPngOption {
+  filename: string;
+  title: string;
+  url: string;
+  sizeBytes?: number;
+}
+
+const bundledShipPngs = import.meta.glob('./ships/*.png', {
+  eager: true,
+  query: '?url',
+  import: 'default',
+}) as Record<string, string>;
+
+function getBundledShipPngOptions(): ShipPngOption[] {
+  return Object.entries(bundledShipPngs)
+    .map(([relPath, url]) => {
+      const filename = relPath.split('/').pop() || relPath;
+      return {
+        filename,
+        title: filename.replace(/\.png$/i, '').replace(/[_-]+/g, ' '),
+        url,
+      };
+    })
+    .sort((a, b) => a.filename.localeCompare(b.filename));
+}
 
 interface CheatMenuModalProps {
   isOpen: boolean;
@@ -15,6 +41,10 @@ interface CheatMenuModalProps {
   musicBox: MusicBoxController;
   spectateTargetId: string | null;
   onSelectSpectateTarget: (targetId: string | null) => void;
+  warpSpeedActive: boolean;
+  onToggleWarpSpeed: () => void;
+  selectedShipPng: string | null;
+  onSelectShipPng: (filename: string | null) => void;
 }
 
 export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
@@ -30,14 +60,42 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
   musicBox,
   spectateTargetId,
   onSelectSpectateTarget,
+  warpSpeedActive,
+  onToggleWarpSpeed,
+  selectedShipPng,
+  onSelectShipPng,
 }) => {
   const [draftNames, setDraftNames] = useState<Record<string, string>>({});
   const [batchName, setBatchName] = useState<string>('');
+  const [shipPngFiles, setShipPngFiles] = useState<ShipPngOption[]>(() =>
+    getBundledShipPngOptions()
+  );
+  const [loadingPngs, setLoadingPngs] = useState<boolean>(false);
 
   const otherShips = players.filter((p) => p.id !== selfId);
 
+  const refreshShipPngs = useCallback(async () => {
+    setLoadingPngs(true);
+    try {
+      const res = await fetch('/api/ship-pngs');
+      if (res.ok) {
+        const data = (await res.json()) as { files?: ShipPngOption[] };
+        if (Array.isArray(data.files) && data.files.length > 0) {
+          setShipPngFiles(data.files);
+          setLoadingPngs(false);
+          return;
+        }
+      }
+    } catch {
+      // Fallback to Vite glob bundled .png files
+    }
+    setShipPngFiles(getBundledShipPngOptions());
+    setLoadingPngs(false);
+  }, []);
+
   useEffect(() => {
     if (!isOpen) return;
+    refreshShipPngs();
     setDraftNames((prev) => {
       const next = { ...prev };
       for (const p of players) {
@@ -47,7 +105,7 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
       }
       return next;
     });
-  }, [isOpen, players, selfId]);
+  }, [isOpen, players, refreshShipPngs, selfId]);
 
   if (!isOpen) return null;
 
@@ -323,7 +381,21 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
         {/* Instant Trigger Actions */}
         <div className="mt-5 border-t border-slate-800 pt-4">
           <div className="text-xs font-medium text-slate-300">
-            Instant Actions & Target Spawner
+            Instant Actions, Warp Speed Drive &amp; Target Spawner
+          </div>
+          <div className="mt-2.5 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+            <button
+              onClick={onToggleWarpSpeed}
+              className={`sm:col-span-2 rounded-lg border px-4 py-3 text-xs font-bold transition-colors whitespace-nowrap shrink-0 ${
+                warpSpeedActive
+                  ? 'border-cyan-400 bg-cyan-500 text-slate-950 hover:bg-cyan-400'
+                  : 'border-cyan-500/60 bg-cyan-950/35 text-cyan-300 hover:border-cyan-400 hover:text-white'
+              }`}
+            >
+              {warpSpeedActive
+                ? '⏹ STOP WARP SPEED & ZERO MOMENTUM HERE (E) · [INVINCIBLE ACTIVE]'
+                : '⚡ ENGAGE WARP SPEED DRIVE · INVINCIBLE + CLICK AGAIN TO STOP AT 0 u/s (E)'}
+            </button>
           </div>
           <div className="mt-2.5 grid grid-cols-1 gap-2.5 sm:grid-cols-3">
             <button
@@ -375,6 +447,100 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
                 Remove All Target Ships
               </button>
             </div>
+          </div>
+        </div>
+
+        {/* ADMIN SHIP PNG SPRITE SELECTOR SECTION */}
+        <div className="mt-5 border-t border-slate-800 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <div>
+              <h3 className="font-display text-sm font-bold text-cyan-400">
+                Admin Ship PNG Sprite Override
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                Select any <span className="font-mono-tabular text-slate-200">.png</span> image on the server (<span className="font-mono-tabular text-slate-200">src/components/ships/</span>) to replace your ship hull. Syncs live to all players!
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {selectedShipPng && (
+                <button
+                  onClick={() => onSelectShipPng(null)}
+                  className="rounded-lg border border-rose-500/50 bg-rose-950/30 px-2.5 py-1.5 text-xs font-semibold text-rose-300 hover:border-rose-400 hover:text-white whitespace-nowrap shrink-0"
+                >
+                  Reset to Vector Ship
+                </button>
+              )}
+              <button
+                onClick={refreshShipPngs}
+                disabled={loadingPngs}
+                className="rounded-lg border border-slate-700 bg-[#060913] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-cyan-400 hover:text-white whitespace-nowrap shrink-0"
+              >
+                {loadingPngs ? 'Scanning...' : 'Refresh PNG Folder'}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+            {/* Option 0: Standard Vector Hull */}
+            <button
+              onClick={() => onSelectShipPng(null)}
+              className={`flex flex-col items-center justify-between rounded-lg border p-3 text-center transition-colors ${
+                !selectedShipPng
+                  ? 'border-cyan-400 bg-cyan-950/30 text-white'
+                  : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+              }`}
+            >
+              <div className="flex h-12 w-12 items-center justify-center rounded-md border border-slate-800 bg-[#0B1120]">
+                <svg viewBox="-22 -22 44 44" className="h-8 w-8">
+                  <polygon
+                    points="16,0 -11,-7 -6,0 -11,7"
+                    fill="none"
+                    stroke="#38BDF8"
+                    strokeWidth="2.4"
+                  />
+                </svg>
+              </div>
+              <div className="mt-2 w-full">
+                <div className="truncate font-display text-xs font-bold text-white">
+                  Default Vector
+                </div>
+                <div className="font-mono-tabular text-[10px] text-slate-400">
+                  {!selectedShipPng ? '● ACTIVE' : 'Standard Hull'}
+                </div>
+              </div>
+            </button>
+
+            {/* Server PNG Options */}
+            {shipPngFiles.map((png) => {
+              const isSelected = selectedShipPng === png.filename;
+              return (
+                <button
+                  key={png.filename}
+                  onClick={() => onSelectShipPng(png.filename)}
+                  className={`flex flex-col items-center justify-between rounded-lg border p-3 text-center transition-colors ${
+                    isSelected
+                      ? 'border-cyan-400 bg-cyan-950/30 text-white'
+                      : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex h-12 w-12 items-center justify-center overflow-hidden rounded-md border border-slate-800 bg-[#0B1120] p-1">
+                    <img
+                      src={png.url}
+                      alt={png.title}
+                      className="h-full w-full object-contain"
+                    />
+                  </div>
+                  <div className="mt-2 w-full">
+                    <div className="truncate font-display text-xs font-bold capitalize text-white">
+                      {png.title}
+                    </div>
+                    <div className="truncate font-mono-tabular text-[10px] text-slate-400">
+                      {isSelected ? '● ACTIVE ON SHIP' : png.filename}
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 

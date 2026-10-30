@@ -102,6 +102,7 @@ export class InputManager {
       window.addEventListener('keydown', this.onKeyDown);
       window.addEventListener('keyup', this.onKeyUp);
       window.addEventListener('blur', this.onBlur);
+      window.addEventListener('focusin', this.onFocusIn);
       window.addEventListener('mousemove', this.onMouseMove);
       window.addEventListener('mousedown', this.onMouseDown);
       window.addEventListener('mouseup', this.onMouseUp);
@@ -114,6 +115,7 @@ export class InputManager {
       window.removeEventListener('keydown', this.onKeyDown);
       window.removeEventListener('keyup', this.onKeyUp);
       window.removeEventListener('blur', this.onBlur);
+      window.removeEventListener('focusin', this.onFocusIn);
       window.removeEventListener('mousemove', this.onMouseMove);
       window.removeEventListener('mousedown', this.onMouseDown);
       window.removeEventListener('mouseup', this.onMouseUp);
@@ -148,6 +150,16 @@ export class InputManager {
 
   private onKeyUp = (e: KeyboardEvent) => {
     this.heldKeys.delete(e.code);
+  };
+
+  private onFocusIn = (e: FocusEvent) => {
+    const tag = (e.target as HTMLElement)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      this.heldKeys.clear();
+      this.justPressedKeys.clear();
+      this.mouseLeftDown = false;
+      this.mouseRightDown = false;
+    }
   };
 
   private onBlur = () => {

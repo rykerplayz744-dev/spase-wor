@@ -10,6 +10,7 @@ import {
   ARENA_WIDTH,
   AsteroidState,
   BulletState,
+  ChatMessage,
   ClientToServerMessage,
   DEFAULT_PLAYER_CHEATS,
   expandSalvoToBullets,
@@ -20,13 +21,16 @@ import {
   HULL_SPECS,
   INITIAL_PLANETS,
   KillFeedEntry,
+  parseChatInput,
   PLAYER_COLORS,
   PlanetState,
   PlayerState,
   RoomSummary,
   SalvoSpawnPayload,
   ServerToClientMessage,
+  SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
+  WARP_DRIVE_SPEED,
 } from './src/shared/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -40,6 +44,7 @@ interface RoomState {
   asteroids: Map<string, AsteroidState>;
   planets: PlanetState[];
   killFeed: KillFeedEntry[];
+  chatMessages: ChatMessage[];
   clients: Set<WebSocket>;
   colorIndex: number;
 }
@@ -123,6 +128,7 @@ function getOrCreateRoom(_roomId?: string): RoomState {
       asteroids: new Map(),
       planets,
       killFeed: [],
+      chatMessages: [],
       clients: new Set(),
       colorIndex: 0,
     };
@@ -269,6 +275,7 @@ function recordKill(
     cause,
     speedAtKill: Math.round(speedAtKill),
     timestamp: Date.now(),
+    deathSound: victim.deathSound,
   };
 
   room.killFeed.unshift(entry);
@@ -524,9 +531,11 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         room.players.size <= 12 && Math.sin(nowSec * 3.5 + player.x * 0.01) > 0.78;
     }
 
-    if (player.cheats?.godMode) {
-      player.hp = player.maxHp;
-      player.invulnerableTimer = 0.25;
+    if (player.cheats?.godMode || player.warping) {
+      if (player.cheats?.godMode) {
+        player.hp = player.maxHp;
+      }
+      player.invulnerableTimer = Math.max(player.invulnerableTimer, 0.25);
     } else if (player.invulnerableTimer > 0) {
       player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
     }
@@ -535,6 +544,7 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     if (player.spectating) {
       player.thrusting = false;
       player.shooting = false;
+      player.warping = false;
       player.vx = 0;
       player.vy = 0;
       continue;
@@ -542,7 +552,12 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
 
     const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
 
-    if (player.thrusting) {
+    if (player.warping) {
+      const currentSpd = Math.hypot(player.vx, player.vy);
+      const warpSpd = Math.max(WARP_DRIVE_SPEED, currentSpd);
+      player.vx = Math.cos(player.angle) * warpSpd;
+      player.vy = Math.sin(player.angle) * warpSpd;
+    } else if (player.thrusting) {
       player.vx += Math.cos(player.angle) * spec.thrustAccel * dt;
       player.vy += Math.sin(player.angle) * spec.thrustAccel * dt;
     }
@@ -555,7 +570,7 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
 
       if (dist < GRAVITY_STAR_RADIUS + spec.radius - 4) {
         const safePt = getSafeSpawnPoint(room, player.id);
-        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode) {
+        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
           const speed = Math.hypot(player.vx, player.vy);
           broadcastRoom(room, {
             type: 'combat:hit',
@@ -568,23 +583,31 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
             damage: player.hp,
             fatal: true,
             color: '#F59E0B',
+            cause: 'star',
+            deathSound: player.deathSound,
           });
           recordKill(room, null, player, 'star', speed);
-          // Immediately place player at safe orbit around the Sun so they respawn outside the Sun
+          // Immediately respawn player at safe orbit around the Sun
+          player.alive = true;
+          player.hp = player.maxHp;
+          player.respawnTimer = 0;
+          player.invulnerableTimer = 2.0;
           player.x = safePt.x;
           player.y = safePt.y;
           player.vx = 0;
           player.vy = 0;
           continue;
         } else {
-          // If invulnerable or in God Mode, teleport out around the Sun so they never get stuck inside it
+          // If invulnerable, warping, or in God Mode, teleport out around the Sun so they never get stuck inside it
           player.x = safePt.x;
           player.y = safePt.y;
-          player.vx = 0;
-          player.vy = 0;
+          if (!player.warping) {
+            player.vx = 0;
+            player.vy = 0;
+          }
           player.invulnerableTimer = 2.0;
         }
-      } else if (dist < 9500 && dist > 100) {
+      } else if (!player.warping && dist < 9500 && dist > 100) {
         const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
         player.vx += (dx / dist) * pullAccel * dt;
         player.vy += (dy / dist) * pullAccel * dt;
@@ -623,7 +646,7 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           player.vy -= 1.85 * normalVel * ny;
         }
 
-        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode) {
+        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
           const impactDmg = Math.min(45, Math.max(14, Math.round(currentSpeed * 0.025)));
           player.hp -= impactDmg;
           player.invulnerableTimer = 0.25;
@@ -668,12 +691,12 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         const relVx = player.vx - planet.vx;
         const relVy = player.vy - planet.vy;
         const normalVel = relVx * nx + relVy * ny;
-        if (normalVel < 0) {
+        if (normalVel < 0 && !player.warping) {
           player.vx -= 1.85 * normalVel * nx;
           player.vy -= 1.85 * normalVel * ny;
         }
 
-        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode) {
+        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
           const impactDmg = Math.min(55, Math.max(18, Math.round(currentSpeed * 0.03)));
           player.hp -= impactDmg;
           player.invulnerableTimer = 0.3;
@@ -695,11 +718,105 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
             break;
           }
         }
-      } else if (distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
+      } else if (!player.warping && distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
         const dist = Math.sqrt(distSq);
         const pullAccel = Math.min(380, planet.gravityStrength / Math.max(180000, distSq));
         player.vx += (dx / dist) * pullAccel * dt;
         player.vy += (dy / dist) * pullAccel * dt;
+      }
+    }
+  }
+
+  // Ship-to-Ship Collision & High-Force (1,000+ u/s) Smash Check
+  const activeShipList = Array.from(room.players.values()).filter(
+    (p) => p.alive && !p.spectating
+  );
+  for (let i = 0; i < activeShipList.length; i++) {
+    const p1 = activeShipList[i];
+    if (!p1.alive) continue;
+    const spec1 = HULL_SPECS[p1.hull] || HULL_SPECS.needle;
+
+    for (let j = i + 1; j < activeShipList.length; j++) {
+      const p2 = activeShipList[j];
+      if (!p2.alive) continue;
+      const spec2 = HULL_SPECS[p2.hull] || HULL_SPECS.needle;
+
+      const minSep = spec1.radius + spec2.radius;
+      const dx = shortestToroidalDelta(p2.x, p1.x, ARENA_WIDTH);
+      if (Math.abs(dx) > minSep) continue;
+      const dy = shortestToroidalDelta(p2.y, p1.y, ARENA_HEIGHT);
+      if (Math.abs(dy) > minSep) continue;
+
+      const distSq = dx * dx + dy * dy;
+      if (distSq <= minSep * minSep && distSq > 0.0001) {
+        const dist = Math.sqrt(distSq);
+        const nx = dx / dist;
+        const ny = dy / dist;
+
+        const relVx = p1.vx - p2.vx;
+        const relVy = p1.vy - p2.vy;
+        const relSpeed = Math.hypot(relVx, relVy);
+        const spd1 = Math.hypot(p1.vx, p1.vy);
+        const spd2 = Math.hypot(p2.vx, p2.vy);
+        const smashForce = Math.max(relSpeed, spd1, spd2);
+
+        if (smashForce >= SHIP_SMASH_SPEED_THRESHOLD) {
+          // High-force (1,000+ u/s) smash: ships are destroyed unless God Mode or Warp Speed invincibility is on
+          const p1Fatal = !p1.cheats?.godMode && !p1.warping;
+          const p2Fatal = !p2.cheats?.godMode && !p2.warping;
+
+          broadcastRoom(room, {
+            type: 'combat:hit',
+            targetId: p1.id,
+            attackerId: p2.id,
+            x: Math.round(p1.x),
+            y: Math.round(p1.y),
+            vx: Math.round(p1.vx),
+            vy: Math.round(p1.vy),
+            damage: p1Fatal ? p1.hp : 0,
+            fatal: p1Fatal,
+            color: '#F43F5E',
+            cause: 'collision',
+            deathSound: p1.deathSound,
+          });
+          broadcastRoom(room, {
+            type: 'combat:hit',
+            targetId: p2.id,
+            attackerId: p1.id,
+            x: Math.round(p2.x),
+            y: Math.round(p2.y),
+            vx: Math.round(p2.vx),
+            vy: Math.round(p2.vy),
+            damage: p2Fatal ? p2.hp : 0,
+            fatal: p2Fatal,
+            color: '#F43F5E',
+            cause: 'collision',
+            deathSound: p2.deathSound,
+          });
+
+          if (p1Fatal) {
+            recordKill(room, p2, p1, 'collision', smashForce);
+          }
+          if (p2Fatal) {
+            recordKill(room, p1, p2, 'collision', smashForce);
+          }
+          break;
+        } else {
+          // Sub-1000 u/s bump: separate ships and exchange elastic normal impulse
+          const overlap = (minSep - dist) * 0.5 + 1.5;
+          p1.x = wrapCoord(p1.x + nx * overlap, ARENA_WIDTH);
+          p1.y = wrapCoord(p1.y + ny * overlap, ARENA_HEIGHT);
+          p2.x = wrapCoord(p2.x - nx * overlap, ARENA_WIDTH);
+          p2.y = wrapCoord(p2.y - ny * overlap, ARENA_HEIGHT);
+
+          const normalVel = relVx * nx + relVy * ny;
+          if (normalVel < 0) {
+            p1.vx -= normalVel * nx;
+            p1.vy -= normalVel * ny;
+            p2.vx += normalVel * nx;
+            p2.vy += normalVel * ny;
+          }
+        }
       }
     }
   }
@@ -798,23 +915,45 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       if (!target.alive || target.id === bullet.ownerId) continue;
 
       const r = bullet.isMissile ? entry.missileRadius : entry.hitRadius;
-      const dx = shortestToroidalDelta(bullet.x, target.x, ARENA_WIDTH);
-      if (Math.abs(dx) > r) continue;
-      const dy = shortestToroidalDelta(bullet.y, target.y, ARENA_HEIGHT);
-      if (Math.abs(dy) > r) continue;
-
       const rSq = bullet.isMissile ? entry.missileRadiusSq : entry.hitRadiusSq;
-      if (dx * dx + dy * dy <= rSq) {
+      const dx = shortestToroidalDelta(bullet.x, target.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(bullet.y, target.y, ARENA_HEIGHT);
+      const hitShip =
+        Math.abs(dx) <= r && Math.abs(dy) <= r && dx * dx + dy * dy <= rSq;
+
+      let hitCursor = false;
+      if (
+        !hitShip &&
+        target.spectating &&
+        typeof target.cursorX === 'number' &&
+        typeof target.cursorY === 'number'
+      ) {
+        const cursorR = bullet.isMissile ? 40 : 34;
+        const cdx = shortestToroidalDelta(bullet.x, target.cursorX, ARENA_WIDTH);
+        const cdy = shortestToroidalDelta(bullet.y, target.cursorY, ARENA_HEIGHT);
+        hitCursor =
+          Math.abs(cdx) <= cursorR &&
+          Math.abs(cdy) <= cursorR &&
+          cdx * cdx + cdy * cdy <= cursorR * cursorR;
+      }
+
+      if (hitShip || hitCursor) {
         hitSomething = true;
-        if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+        if (
+          (target.invulnerableTimer <= 0 || target.spectating) &&
+          !target.cheats?.godMode &&
+          !target.warping
+        ) {
           target.hp -= bullet.damage;
         }
-        const knockback = bullet.isMissile ? 95 : 65;
-        target.vx += Math.cos(bullet.angle) * knockback;
-        target.vy += Math.sin(bullet.angle) * knockback;
+        if (!target.spectating && !target.warping) {
+          const knockback = bullet.isMissile ? 95 : 65;
+          target.vx += Math.cos(bullet.angle) * knockback;
+          target.vy += Math.sin(bullet.angle) * knockback;
+        }
 
         const attacker = room.players.get(bullet.ownerId) || null;
-        const fatal = target.hp <= 0 && !target.cheats?.godMode;
+        const fatal = target.hp <= 0 && !target.cheats?.godMode && !target.warping;
 
         broadcastRoom(room, {
           type: 'combat:hit',
@@ -897,6 +1036,18 @@ async function startServer() {
   }
   app.use('/music-box', express.static(musicDir));
 
+  const deathSoundsDir = path.join(__dirname, 'src', 'components', 'deathsounds');
+  if (!fs.existsSync(deathSoundsDir)) {
+    fs.mkdirSync(deathSoundsDir, { recursive: true });
+  }
+  app.use('/death-sounds', express.static(deathSoundsDir));
+
+  const shipsDir = path.join(__dirname, 'src', 'components', 'ships');
+  if (!fs.existsSync(shipsDir)) {
+    fs.mkdirSync(shipsDir, { recursive: true });
+  }
+  app.use('/ship-pngs', express.static(shipsDir));
+
   getOrCreateRoom('SECTOR-01');
 
   app.get('/api/health', (_req, res) => {
@@ -904,6 +1055,62 @@ async function startServer() {
       status: 'ok',
       rooms: getRoomSummaries(),
     });
+  });
+
+  app.get('/api/deathsounds', (_req, res) => {
+    try {
+      if (!fs.existsSync(deathSoundsDir)) {
+        fs.mkdirSync(deathSoundsDir, { recursive: true });
+      }
+      const entries = fs.readdirSync(deathSoundsDir);
+      const files = entries
+        .filter((f) => f.toLowerCase().endsWith('.ogg'))
+        .sort((a, b) => a.localeCompare(b))
+        .map((filename) => {
+          const stat = fs.statSync(path.join(deathSoundsDir, filename));
+          return {
+            filename,
+            title: filename.replace(/\.ogg$/i, '').replace(/[_-]+/g, ' '),
+            url: `/death-sounds/${encodeURIComponent(filename)}`,
+            sizeBytes: stat.size,
+          };
+        });
+      res.json({
+        folder: 'src/components/deathsounds',
+        files,
+      });
+    } catch (err) {
+      console.error('Failed to scan src/components/deathsounds:', err);
+      res.json({ folder: 'src/components/deathsounds', files: [] });
+    }
+  });
+
+  app.get('/api/ship-pngs', (_req, res) => {
+    try {
+      if (!fs.existsSync(shipsDir)) {
+        fs.mkdirSync(shipsDir, { recursive: true });
+      }
+      const entries = fs.readdirSync(shipsDir);
+      const files = entries
+        .filter((f) => f.toLowerCase().endsWith('.png'))
+        .sort((a, b) => a.localeCompare(b))
+        .map((filename) => {
+          const stat = fs.statSync(path.join(shipsDir, filename));
+          return {
+            filename,
+            title: filename.replace(/\.png$/i, '').replace(/[_-]+/g, ' '),
+            url: `/ship-pngs/${encodeURIComponent(filename)}`,
+            sizeBytes: stat.size,
+          };
+        });
+      res.json({
+        folder: 'src/components/ships',
+        files,
+      });
+    } catch (err) {
+      console.error('Failed to scan src/components/ships:', err);
+      res.json({ folder: 'src/components/ships', files: [] });
+    }
   });
 
   app.get('/api/music', (_req, res) => {
@@ -1077,12 +1284,20 @@ async function startServer() {
               lastFireTime: 0,
               inputSource: msg.inputSource || 'keyboard',
               cheats: { ...DEFAULT_PLAYER_CHEATS },
+              deathSound: msg.deathSound,
+              shipPng: msg.shipPng ?? null,
             };
             room.players.set(playerId, player);
           } else {
             player.name = cleanJoinName;
             player.hull = hull;
             player.inputSource = msg.inputSource || player.inputSource;
+            if (msg.deathSound) {
+              player.deathSound = msg.deathSound;
+            }
+            if (msg.shipPng !== undefined) {
+              player.shipPng = msg.shipPng;
+            }
           }
 
           sendMsg(ws, {
@@ -1095,6 +1310,7 @@ async function startServer() {
             asteroids: Array.from(room.asteroids.values()),
             planets: room.planets,
             killFeed: room.killFeed,
+            chatMessages: room.chatMessages,
             rooms: getRoomSummaries(),
           });
 
@@ -1146,13 +1362,24 @@ async function startServer() {
             player.cursorY = wrapCoord(msg.cursorY, ARENA_HEIGHT);
           }
 
+          if (msg.music !== undefined) {
+            player.music = msg.music;
+          }
+          if (msg.deathSound) {
+            player.deathSound = msg.deathSound;
+          }
+          if (msg.shipPng !== undefined) {
+            player.shipPng = msg.shipPng;
+          }
+
+          const wasWarping = Boolean(player.warping);
+          player.warping = player.spectating ? false : Boolean(msg.warping);
           player.thrusting = player.spectating ? false : Boolean(msg.thrusting);
           player.shooting = player.spectating ? false : Boolean(msg.shooting);
           player.inputSource = msg.inputSource;
 
           if (
             player.alive &&
-            player.invulnerableTimer <= 1.6 &&
             typeof msg.x === 'number' &&
             typeof msg.y === 'number' &&
             typeof msg.vx === 'number' &&
@@ -1175,13 +1402,9 @@ async function startServer() {
             }
           }
 
-          if (msg.warpRequested && player.alive && !player.spectating) {
-            const pt = getRandomWarpPoint(room);
-            player.x = pt.x;
-            player.y = pt.y;
-            const currentMomentum = Math.hypot(player.vx, player.vy);
-            player.vx = Math.cos(player.angle) * currentMomentum;
-            player.vy = Math.sin(player.angle) * currentMomentum;
+          if (wasWarping && !player.warping) {
+            player.vx = 0;
+            player.vy = 0;
           }
           return;
         }
@@ -1200,6 +1423,9 @@ async function startServer() {
             freeCam: Boolean(msg.cheats.freeCam),
           };
           player.spectating = Boolean(msg.cheats.freeCam);
+          if (player.spectating) {
+            player.warping = false;
+          }
           return;
         }
 
@@ -1211,12 +1437,26 @@ async function startServer() {
 
           if (msg.action === 'missile_swarm' && player.alive) {
             spawnMissileSwarm(room, player, 8);
+          } else if (msg.action === 'toggle_warp_speed' && player.alive && !player.spectating) {
+            player.warping = !player.warping;
+            if (player.warping) {
+              player.invulnerableTimer = Math.max(player.invulnerableTimer, 0.5);
+              player.vx = Math.cos(player.angle) * WARP_DRIVE_SPEED;
+              player.vy = Math.sin(player.angle) * WARP_DRIVE_SPEED;
+              if (WARP_DRIVE_SPEED > player.peakSpeed) {
+                player.peakSpeed = WARP_DRIVE_SPEED;
+              }
+            } else {
+              player.vx = 0;
+              player.vy = 0;
+            }
           } else if (msg.action === 'momentum_boost' && player.alive) {
             player.vx += Math.cos(player.angle) * 2500;
             player.vy += Math.sin(player.angle) * 2500;
             const spd = Math.hypot(player.vx, player.vy);
             if (spd > player.peakSpeed) player.peakSpeed = Math.round(spd);
           } else if (msg.action === 'momentum_zero' && player.alive) {
+            player.warping = false;
             player.vx = 0;
             player.vy = 0;
           } else if (msg.action === 'spawn_drone' || msg.action === 'spawn_drones_100') {
@@ -1365,6 +1605,48 @@ async function startServer() {
 
         if (msg.type === 'room:toggle_star') {
           room.gravityStarEnabled = Boolean(msg.enabled);
+          return;
+        }
+
+        if (msg.type === 'chat:send') {
+          const parsed = parseChatInput(msg.text);
+          if (!parsed) return;
+
+          const player = room.players.get(msg.playerId);
+          const senderName =
+            (player?.name || msg.senderName || 'PILOT').trim().slice(0, 16) || 'PILOT';
+          const senderColor =
+            player?.color && PLAYER_COLORS.includes(player.color)
+              ? player.color
+              : msg.senderColor && PLAYER_COLORS.includes(msg.senderColor)
+              ? msg.senderColor
+              : '#38BDF8';
+
+          const msgId =
+            msg.id && typeof msg.id === 'string' && msg.id.length <= 64
+              ? msg.id
+              : nextId('chat');
+
+          if (room.chatMessages.some((m) => m.id === msgId)) {
+            return;
+          }
+
+          const chatEntry: ChatMessage = {
+            id: msgId,
+            senderId: msg.playerId,
+            senderName,
+            senderColor,
+            text: parsed.text,
+            isServerWide: parsed.isServerWide,
+            timestamp: Date.now(),
+          };
+
+          room.chatMessages.push(chatEntry);
+          if (room.chatMessages.length > 60) {
+            room.chatMessages.splice(0, room.chatMessages.length - 60);
+          }
+
+          broadcastRoom(room, { type: 'chat:message', message: chatEntry });
           return;
         }
       } catch (err) {

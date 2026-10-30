@@ -8,9 +8,11 @@ import {
   GRAVITY_STAR_Y,
   GRAVITY_STRENGTH,
   HULL_SPECS,
+  MUSIC_HEARING_RADIUS,
   PlanetState,
   PlayerState,
   ShipHullType,
+  WARP_DRIVE_SPEED,
 } from '../shared/types.ts';
 
 export interface Particle {
@@ -97,6 +99,18 @@ export function drawShipHullPath(
   }
 }
 
+const bundledShipPngModules = import.meta.glob('../components/ships/*.png', {
+  eager: true,
+  query: '?url',
+  import: 'default',
+}) as Record<string, string>;
+
+const bundledShipPngUrlByName = new Map<string, string>();
+for (const [relPath, url] of Object.entries(bundledShipPngModules)) {
+  const filename = (relPath.split('/').pop() || relPath).toLowerCase();
+  bundledShipPngUrlByName.set(filename, url);
+}
+
 export class SpacewarRenderer {
   private stars: StarPoint[] = [];
   public particles: Particle[] = [];
@@ -106,6 +120,31 @@ export class SpacewarRenderer {
   private camX = GRAVITY_STAR_X;
   private camY = GRAVITY_STAR_Y;
   private lastCursorTrail = new Map<string, { x: number; y: number }>();
+  private shipImageCache = new Map<string, HTMLImageElement>();
+
+  private getShipSpriteImage(filename?: string | null): HTMLImageElement | null {
+    if (!filename || typeof window === 'undefined') return null;
+    const key = filename.trim();
+    if (!key) return null;
+
+    let img = this.shipImageCache.get(key);
+    if (!img) {
+      img = new Image();
+      const bundledUrl = bundledShipPngUrlByName.get(key.toLowerCase());
+      img.src = bundledUrl || `/ship-pngs/${encodeURIComponent(key)}`;
+      img.onerror = () => {
+        if (bundledUrl && img && img.src !== bundledUrl) {
+          img.src = bundledUrl;
+        }
+      };
+      this.shipImageCache.set(key, img);
+    }
+
+    if (img.complete && img.naturalWidth > 0) {
+      return img;
+    }
+    return null;
+  }
 
   constructor() {
     for (let i = 0; i < 420; i++) {
@@ -180,14 +219,62 @@ export class SpacewarRenderer {
   ) {
     if (!player.alive) return;
 
-    if (player.cheats?.godMode) {
-      player.hp = player.maxHp;
-      player.invulnerableTimer = 0.25;
+    if (player.cheats?.godMode || player.warping) {
+      if (player.cheats?.godMode) {
+        player.hp = player.maxHp;
+      }
+      player.invulnerableTimer = Math.max(player.invulnerableTimer, 0.25);
     } else if (player.invulnerableTimer > 0) {
       player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
     }
 
     const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
+
+    if (player.warping) {
+      // Continuous Warp Speed along exact ship facing direction + full invincibility
+      const currentSpd = Math.hypot(player.vx, player.vy);
+      const warpSpd = Math.max(WARP_DRIVE_SPEED, currentSpd);
+      player.vx = Math.cos(player.angle) * warpSpd;
+      player.vy = Math.sin(player.angle) * warpSpd;
+
+      // Dense cyan/violet warp-tunnel plasma trail
+      for (let w = 0; w < 2; w++) {
+        if (this.particles.length > 450) {
+          this.particles.shift();
+        }
+        const rearX = wrapCoord(
+          player.x - Math.cos(player.angle) * (spec.radius * 1.1),
+          ARENA_WIDTH
+        );
+        const rearY = wrapCoord(
+          player.y - Math.sin(player.angle) * (spec.radius * 1.1),
+          ARENA_HEIGHT
+        );
+        const spread = (Math.random() - 0.5) * 0.55;
+        const ejectAngle = player.angle + Math.PI + spread;
+        const ejectSpeed = 320 + Math.random() * 280;
+        this.particles.push({
+          x: rearX,
+          y: rearY,
+          vx: player.vx * 0.25 + Math.cos(ejectAngle) * ejectSpeed,
+          vy: player.vy * 0.25 + Math.sin(ejectAngle) * ejectSpeed,
+          color: Math.random() < 0.55 ? '#38BDF8' : '#A855F7',
+          size: 8 + Math.random() * 7,
+          alpha: 0.95,
+          life: 0.26,
+          maxLife: 0.26,
+          isLine: true,
+          angle: player.angle,
+        });
+      }
+
+      player.x = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
+      player.y = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+      if (warpSpd > player.peakSpeed) {
+        player.peakSpeed = Math.round(warpSpd);
+      }
+      return;
+    }
 
     // 1. Apply thrust in exact ship facing angle (NO DRAG, NO SPEED CAP -> INFINITE MOMENTUM)
     if (player.thrusting) {
@@ -265,6 +352,163 @@ export class SpacewarRenderer {
     const speed = Math.hypot(player.vx, player.vy);
     if (speed > player.peakSpeed) {
       player.peakSpeed = Math.round(speed);
+    }
+  }
+
+  /**
+   * Smoothly dead-reckons and exponentially blends remote players (and their spectator cursors)
+   * at 60fps so choppy HTTP relay updates on Vercel appear completely fluid on screen.
+   */
+  public stepRemotePlayerSmooth(
+    player: PlayerState,
+    dt: number,
+    gravityStarEnabled: boolean,
+    planets: PlanetState[] = []
+  ) {
+    // 1. Smoothly interpolate remote spectator cursor if detached in Free-Cam / Spectate
+    if (
+      player.spectating &&
+      typeof player.netTargetCursorX === 'number' &&
+      typeof player.netTargetCursorY === 'number'
+    ) {
+      if (typeof player.cursorX !== 'number' || typeof player.cursorY !== 'number') {
+        player.cursorX = player.netTargetCursorX;
+        player.cursorY = player.netTargetCursorY;
+      } else {
+        const cdx = shortestToroidalDelta(player.cursorX, player.netTargetCursorX, ARENA_WIDTH);
+        const cdy = shortestToroidalDelta(player.cursorY, player.netTargetCursorY, ARENA_HEIGHT);
+        const cursorLerp = 1 - Math.exp(-18 * dt);
+        player.cursorX = wrapCoord(player.cursorX + cdx * cursorLerp, ARENA_WIDTH);
+        player.cursorY = wrapCoord(player.cursorY + cdy * cursorLerp, ARENA_HEIGHT);
+      }
+    }
+
+    if (!player.alive) return;
+
+    const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
+
+    // If parked in spectator mode, smoothly settle ship to its parked coordinates
+    if (player.spectating) {
+      player.vx = 0;
+      player.vy = 0;
+      player.thrusting = false;
+      player.shooting = false;
+      if (typeof player.netTargetX === 'number' && typeof player.netTargetY === 'number') {
+        const dx = shortestToroidalDelta(player.x, player.netTargetX, ARENA_WIDTH);
+        const dy = shortestToroidalDelta(player.y, player.netTargetY, ARENA_HEIGHT);
+        const posLerp = 1 - Math.exp(-12 * dt);
+        player.x = wrapCoord(player.x + dx * posLerp, ARENA_WIDTH);
+        player.y = wrapCoord(player.y + dy * posLerp, ARENA_HEIGHT);
+      }
+      return;
+    }
+
+    if (typeof player.netTargetX !== 'number' || typeof player.netTargetY !== 'number') {
+      player.netTargetX = player.x;
+      player.netTargetY = player.y;
+      player.netTargetVx = player.vx;
+      player.netTargetVy = player.vy;
+      player.netTargetAngle = player.angle;
+    }
+
+    let tx = player.netTargetX;
+    let ty = player.netTargetY;
+    let tvx = player.netTargetVx ?? player.vx;
+    let tvy = player.netTargetVy ?? player.vy;
+    const tAngle = player.netTargetAngle ?? player.angle;
+
+    // Step the predicted target forward using the exact same orbital & thrust physics
+    if (player.thrusting) {
+      tvx += Math.cos(tAngle) * spec.thrustAccel * dt;
+      tvy += Math.sin(tAngle) * spec.thrustAccel * dt;
+    }
+
+    if (gravityStarEnabled) {
+      const sdx = GRAVITY_STAR_X - tx;
+      const sdy = GRAVITY_STAR_Y - ty;
+      const distSq = sdx * sdx + sdy * sdy;
+      const dist = Math.sqrt(distSq);
+      if (dist < 9500 && dist > 100) {
+        const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
+        tvx += (sdx / dist) * pullAccel * dt;
+        tvy += (sdy / dist) * pullAccel * dt;
+      }
+    }
+
+    for (let i = 0; i < planets.length; i++) {
+      const planet = planets[i];
+      const pdx = planet.x - tx;
+      const pdy = planet.y - ty;
+      const distSq = pdx * pdx + pdy * pdy;
+      if (distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
+        const dist = Math.sqrt(distSq);
+        const pullAccel = Math.min(380, planet.gravityStrength / Math.max(180000, distSq));
+        tvx += (pdx / dist) * pullAccel * dt;
+        tvy += (pdy / dist) * pullAccel * dt;
+      }
+    }
+
+    tx = wrapCoord(tx + tvx * dt, ARENA_WIDTH);
+    ty = wrapCoord(ty + tvy * dt, ARENA_HEIGHT);
+
+    player.netTargetX = tx;
+    player.netTargetY = ty;
+    player.netTargetVx = tvx;
+    player.netTargetVy = tvy;
+
+    // Smoothly blend visual velocity, position, and rotation toward the dead-reckoned target
+    const velLerp = 1 - Math.exp(-14 * dt);
+    player.vx += (tvx - player.vx) * velLerp;
+    player.vy += (tvy - player.vy) * velLerp;
+
+    const nextPredX = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
+    const nextPredY = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+
+    const errX = shortestToroidalDelta(nextPredX, tx, ARENA_WIDTH);
+    const errY = shortestToroidalDelta(nextPredY, ty, ARENA_HEIGHT);
+    const posLerp = 1 - Math.exp(-11 * dt);
+
+    player.x = wrapCoord(nextPredX + errX * posLerp, ARENA_WIDTH);
+    player.y = wrapCoord(nextPredY + errY * posLerp, ARENA_HEIGHT);
+
+    const angleDiff = normalizeAngleDiff(tAngle - player.angle);
+    const angleLerp = 1 - Math.exp(-18 * dt);
+    player.angle = player.angle + angleDiff * angleLerp;
+
+    // Emit thruster or warp exhaust particles for remote ships
+    if (player.warping && this.particles.length < 440) {
+      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 1.1), ARENA_WIDTH);
+      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 1.1), ARENA_HEIGHT);
+      this.particles.push({
+        x: rearX,
+        y: rearY,
+        vx: player.vx * 0.2,
+        vy: player.vy * 0.2,
+        color: Math.random() < 0.55 ? '#38BDF8' : '#A855F7',
+        size: 8 + Math.random() * 6,
+        alpha: 0.9,
+        life: 0.24,
+        maxLife: 0.24,
+        isLine: true,
+        angle: player.angle,
+      });
+    } else if (player.thrusting && Math.random() < 0.75 && this.particles.length < 440) {
+      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 0.85), ARENA_WIDTH);
+      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 0.85), ARENA_HEIGHT);
+      const spread = (Math.random() - 0.5) * 0.42;
+      const ejectAngle = player.angle + Math.PI + spread;
+      const ejectSpeed = 160 + Math.random() * 140;
+      this.particles.push({
+        x: rearX,
+        y: rearY,
+        vx: player.vx * 0.5 + Math.cos(ejectAngle) * ejectSpeed,
+        vy: player.vy * 0.5 + Math.sin(ejectAngle) * ejectSpeed,
+        color: Math.random() < 0.45 ? '#F59E0B' : player.color,
+        size: 2.2,
+        alpha: 0.85,
+        life: 0.2,
+        maxLife: 0.2,
+      });
     }
   }
 
@@ -920,6 +1164,42 @@ export class SpacewarRenderer {
       const isLocal = localPlayer && player.id === localPlayer.id;
       const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
 
+      // If this ship is playing music, draw its spatial audio hearing radius & soundwave ripples
+      if (player.music?.isPlaying) {
+        if (
+          sx > -MUSIC_HEARING_RADIUS - 100 &&
+          sx < width + MUSIC_HEARING_RADIUS + 100 &&
+          sy > -MUSIC_HEARING_RADIUS - 100 &&
+          sy < height + MUSIC_HEARING_RADIUS + 100
+        ) {
+          ctx.save();
+          ctx.translate(sx, sy);
+          // Outer hearing radius boundary ring (1800u)
+          ctx.setLineDash([8, 10]);
+          ctx.strokeStyle = isLocal
+            ? 'rgba(245, 158, 11, 0.22)'
+            : 'rgba(56, 189, 248, 0.24)';
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.arc(0, 0, MUSIC_HEARING_RADIUS, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Animated concentric acoustic wave rings around the broadcasting ship
+          ctx.setLineDash([]);
+          for (let w = 0; w < 2; w++) {
+            const phase = ((nowSec * 0.65 + w * 0.5) % 1);
+            const waveR = spec.radius + 14 + phase * 85;
+            const waveAlpha = (1 - phase) * 0.42;
+            ctx.strokeStyle = `rgba(245, 158, 11, ${waveAlpha.toFixed(3)})`;
+            ctx.lineWidth = 1.4;
+            ctx.beginPath();
+            ctx.arc(0, 0, waveR, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+
       // Draw Target-Lock Diamond Reticle if a Homing Missile is actively tracking this ship
       if (lockedTargetIds.has(player.id)) {
         const lockSize = spec.radius + 16 + Math.sin(nowSec * 18) * 3;
@@ -1019,7 +1299,20 @@ export class SpacewarRenderer {
       ctx.rotate(player.angle);
 
       // Invulnerability shield ring on spawn
-      if (player.invulnerableTimer > 0) {
+      // Invulnerability or Warp Field shield ring
+      if (player.warping) {
+        ctx.strokeStyle = `rgba(56, 189, 248, ${0.7 + 0.25 * Math.sin(nowSec * 22)})`;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, spec.radius + 15, spec.radius + 9, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = `rgba(168, 85, 247, ${0.6 + 0.3 * Math.cos(nowSec * 26)})`;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(0, 0, spec.radius + 11, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (player.invulnerableTimer > 0) {
         ctx.strokeStyle = `rgba(56, 189, 248, ${0.35 + 0.25 * Math.sin(nowSec * 16)})`;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -1027,8 +1320,17 @@ export class SpacewarRenderer {
         ctx.stroke();
       }
 
-      // Thruster flame cone when thrusting
-      if (player.thrusting) {
+      // Thruster or Warp Drive flame cone
+      if (player.warping) {
+        const warpFlameLen = spec.radius * (2.6 + Math.random() * 1.1);
+        ctx.fillStyle = '#38BDF8';
+        ctx.beginPath();
+        ctx.moveTo(-spec.radius * 0.75, -spec.radius * 0.38);
+        ctx.lineTo(-spec.radius * 0.75 - warpFlameLen, 0);
+        ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.38);
+        ctx.closePath();
+        ctx.fill();
+      } else if (player.thrusting) {
         const flameLen = spec.radius * (1.2 + Math.random() * 0.65);
         ctx.fillStyle = '#F59E0B';
         ctx.beginPath();
@@ -1040,19 +1342,39 @@ export class SpacewarRenderer {
       }
 
       const isFlashing = (this.hitFlashes.get(player.id) || 0) > 0;
-      ctx.fillStyle = isFlashing ? '#FFFFFF' : 'rgba(15, 23, 42, 0.92)';
-      ctx.strokeStyle = isFlashing ? '#FFFFFF' : player.color;
-      ctx.lineWidth = isLocal ? 2.4 : 2.0;
+      const spriteImg = this.getShipSpriteImage(player.shipPng);
 
-      drawShipHullPath(ctx, player.hull, spec.radius);
-      ctx.fill();
-      ctx.stroke();
+      if (spriteImg) {
+        const spriteSize = spec.radius * 2.8;
+        ctx.drawImage(
+          spriteImg,
+          -spriteSize * 0.5,
+          -spriteSize * 0.5,
+          spriteSize,
+          spriteSize
+        );
+        if (isFlashing) {
+          ctx.strokeStyle = '#FFFFFF';
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          ctx.arc(0, 0, spec.radius * 1.15, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      } else {
+        ctx.fillStyle = isFlashing ? '#FFFFFF' : 'rgba(15, 23, 42, 0.92)';
+        ctx.strokeStyle = isFlashing ? '#FFFFFF' : player.warping ? '#38BDF8' : player.color;
+        ctx.lineWidth = isLocal ? 2.4 : 2.0;
 
-      // Forward nose sight dot
-      ctx.fillStyle = '#FFFFFF';
-      ctx.beginPath();
-      ctx.arc(spec.radius * 0.85, 0, 1.8, 0, Math.PI * 2);
-      ctx.fill();
+        drawShipHullPath(ctx, player.hull, spec.radius);
+        ctx.fill();
+        ctx.stroke();
+
+        // Forward nose sight dot
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(spec.radius * 0.85, 0, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
 
       ctx.restore();
 
@@ -1060,10 +1382,10 @@ export class SpacewarRenderer {
       const spd = Math.round(Math.hypot(player.vx, player.vy));
       ctx.save();
       ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
-      ctx.fillStyle = isLocal ? '#F8FAFC' : '#CBD5E1';
+      ctx.fillStyle = player.warping ? '#38BDF8' : isLocal ? '#F8FAFC' : '#CBD5E1';
       ctx.textAlign = 'center';
       ctx.fillText(
-        `${player.name}${player.spectating ? ' [CAM DETACHED]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
+        `${player.name}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
         sx,
         sy + spec.radius + 18
       );
@@ -1079,6 +1401,17 @@ export class SpacewarRenderer {
       ctx.fillRect(barX, barY, barW, barH);
       ctx.fillStyle = hpRatio > 0.5 ? player.color : hpRatio > 0.25 ? '#F59E0B' : '#F43F5E';
       ctx.fillRect(barX, barY, barW * hpRatio, barH);
+
+      if (player.music?.isPlaying && player.music.title) {
+        ctx.font = '600 10px "JetBrains Mono", monospace';
+        ctx.fillStyle = '#FBBF24';
+        ctx.textAlign = 'center';
+        const shortTitle =
+          player.music.title.length > 26
+            ? player.music.title.slice(0, 24) + '…'
+            : player.music.title;
+        ctx.fillText(`♪ ${shortTitle}`, sx, barY + 14);
+      }
       ctx.restore();
     }
 
@@ -1126,6 +1459,7 @@ export class SpacewarRenderer {
     // 8c. Render Live Spectator / Free-Cam Mouse Cursors (Visible to ALL Players!)
     for (const player of players.values()) {
       if (
+        !player.alive ||
         !player.spectating ||
         typeof player.cursorX !== 'number' ||
         typeof player.cursorY !== 'number'
@@ -1202,70 +1536,85 @@ export class SpacewarRenderer {
       ctx.save();
       ctx.translate(sx, sy);
 
-      // Rotating outer tactical ring around spectator cursor
-      const pulseRadius = 18 + Math.sin(nowSec * 7) * 2.5;
+      const isCursorFlashing = (this.hitFlashes.get(player.id) || 0) > 0;
+
+      // Rotating outer tactical ring around spectator cursor (2x scale)
+      const pulseRadius = 36 + Math.sin(nowSec * 7) * 5;
       ctx.save();
       ctx.rotate(nowSec * 1.6);
-      ctx.strokeStyle = player.color;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([5, 5]);
+      ctx.strokeStyle = isCursorFlashing ? '#FFFFFF' : player.color;
+      ctx.lineWidth = 2.4;
+      ctx.setLineDash([8, 8]);
       ctx.beginPath();
       ctx.arc(0, 0, pulseRadius, 0, Math.PI * 2);
       ctx.stroke();
       ctx.restore();
 
-      // Precision crosshair ticks at cursor tip
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
-      ctx.lineWidth = 1.2;
+      // Precision crosshair ticks at cursor tip (2x scale)
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.moveTo(-7, 0);
-      ctx.lineTo(7, 0);
-      ctx.moveTo(0, -7);
-      ctx.lineTo(0, 7);
+      ctx.moveTo(-14, 0);
+      ctx.lineTo(14, 0);
+      ctx.moveTo(0, -14);
+      ctx.lineTo(0, 14);
       ctx.stroke();
 
-      // High-visibility Vector Mouse Pointer Arrow (tip at 0,0)
-      ctx.fillStyle = '#060913';
-      ctx.strokeStyle = player.color;
-      ctx.lineWidth = 2.4;
+      // High-visibility 2x Vector Mouse Pointer Arrow (tip at 0,0)
+      ctx.fillStyle = isCursorFlashing ? '#FFFFFF' : '#060913';
+      ctx.strokeStyle = isCursorFlashing ? '#FFFFFF' : player.color;
+      ctx.lineWidth = 3.8;
       ctx.lineJoin = 'round';
       ctx.beginPath();
       ctx.moveTo(0, 0);
-      ctx.lineTo(0, 22);
-      ctx.lineTo(5.8, 17.2);
-      ctx.lineTo(10.5, 26.5);
-      ctx.lineTo(14.5, 24.5);
-      ctx.lineTo(9.8, 15.2);
-      ctx.lineTo(17, 15.2);
+      ctx.lineTo(0, 44);
+      ctx.lineTo(11.6, 34.4);
+      ctx.lineTo(21, 53);
+      ctx.lineTo(29, 49);
+      ctx.lineTo(19.6, 30.4);
+      ctx.lineTo(34, 30.4);
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
 
-      // Bright core dot at cursor point
+      // Bright core dot at cursor point (2x scale)
       ctx.fillStyle = '#FFFFFF';
       ctx.beginPath();
-      ctx.arc(0, 0, 2.2, 0, Math.PI * 2);
+      ctx.arc(0, 0, 4.4, 0, Math.PI * 2);
       ctx.fill();
 
-      // Callsign Tag beside cursor
-      const label = `${player.name} · CURSOR`;
-      ctx.font = '700 10px "JetBrains Mono", monospace';
-      const textWidth = ctx.measureText(label).width;
-      const tagX = 18;
-      const tagY = 18;
+      // Callsign + Health Bar Tag beside 2x cursor
+      const hpPct = Math.max(0, Math.min(1, player.hp / Math.max(1, player.maxHp)));
+      const label = `${player.name} · ${Math.max(0, Math.ceil(player.hp))} HP`;
+      ctx.font = '700 12px "JetBrains Mono", monospace';
+      const textWidth = Math.max(84, ctx.measureText(label).width);
+      const tagX = 36;
+      const tagY = 32;
+      const boxW = textWidth + 16;
+      const boxH = 30;
 
-      ctx.fillStyle = 'rgba(11, 17, 32, 0.92)';
-      ctx.strokeStyle = player.color;
-      ctx.lineWidth = 1.2;
+      ctx.fillStyle = 'rgba(11, 17, 32, 0.94)';
+      ctx.strokeStyle = isCursorFlashing ? '#FFFFFF' : player.color;
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.roundRect(tagX, tagY, textWidth + 12, 18, 4);
+      ctx.roundRect(tagX, tagY, boxW, boxH, 6);
       ctx.fill();
       ctx.stroke();
 
       ctx.fillStyle = '#F8FAFC';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText(label, tagX + 6, tagY + 9.5);
+      ctx.fillText(label, tagX + 8, tagY + 11);
+
+      // Spectator Cursor Health Bar
+      const barX = tagX + 8;
+      const barY = tagY + 21;
+      const barW = boxW - 16;
+      const barH = 4.5;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillStyle = hpPct > 0.5 ? player.color : hpPct > 0.25 ? '#F59E0B' : '#F43F5E';
+      ctx.fillRect(barX, barY, barW * hpPct, barH);
 
       ctx.restore();
     }
