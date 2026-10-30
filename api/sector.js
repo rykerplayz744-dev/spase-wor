@@ -29,6 +29,17 @@ export default function handler(req, res) {
     }
 
     if (body.player && typeof body.player.id === 'string') {
+      // If another stale entry (> 1.5s without heartbeat) has the exact same name (from a page reload), remove the ghost copy
+      for (const [existingId, entry] of activePlayers.entries()) {
+        if (
+          existingId !== body.player.id &&
+          entry.player &&
+          entry.player.name === body.player.name &&
+          now - entry.updatedAt > 1500
+        ) {
+          activePlayers.delete(existingId);
+        }
+      }
       activePlayers.set(body.player.id, {
         player: body.player,
         updatedAt: now,
@@ -39,6 +50,10 @@ export default function handler(req, res) {
     if (Array.isArray(body.events)) {
       for (const pkt of body.events) {
         if (!pkt || typeof pkt.type !== 'string') continue;
+
+        if (pkt.type === 'peer:player_leave' && typeof pkt.playerId === 'string') {
+          activePlayers.delete(pkt.playerId);
+        }
 
         // Maintain shared target drones on the relay as well
         if (pkt.type === 'peer:cheat_action') {

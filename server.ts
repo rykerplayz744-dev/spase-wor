@@ -47,6 +47,7 @@ interface RoomState {
 const rooms = new Map<string, RoomState>();
 const socketToRoom = new Map<WebSocket, string>();
 const socketToPlayerIds = new Map<WebSocket, Set<string>>();
+const playerLastSeen = new Map<string, number>();
 
 let entitySeq = 1;
 function nextId(prefix: string): string {
@@ -479,8 +480,21 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     ast.angle += ast.vAngle * dt;
   }
 
+  const nowMs = Date.now();
+
   // Update players (including any spawned target drones)
   for (const player of room.players.values()) {
+    // Evict stale ghost human connections (> 6 seconds without any message/ping)
+    if (!player.isDrone) {
+      const lastSeen = playerLastSeen.get(player.id) ?? nowMs;
+      if (nowMs - lastSeen > 6000) {
+        room.players.delete(player.id);
+        playerLastSeen.delete(player.id);
+        broadcastRoom(room, { type: 'player:left', playerId: player.id });
+        continue;
+      }
+    }
+
     if (!player.alive) {
       player.respawnTimer -= dt;
       if (player.respawnTimer <= 0) {
@@ -515,6 +529,15 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       player.invulnerableTimer = 0.25;
     } else if (player.invulnerableTimer > 0) {
       player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
+    }
+
+    // When a player disconnects from their ship in Free-Cam / Spectate mode, keep their ship safely parked where they left it
+    if (player.spectating) {
+      player.thrusting = false;
+      player.shooting = false;
+      player.vx = 0;
+      player.vy = 0;
+      continue;
     }
 
     const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
@@ -953,6 +976,13 @@ async function startServer() {
         const msg = JSON.parse(rawData.toString()) as ClientToServerMessage;
 
         if (msg.type === 'ping') {
+          const ownedIds = socketToPlayerIds.get(ws);
+          if (ownedIds) {
+            const nowMs = Date.now();
+            for (const pid of ownedIds) {
+              playerLastSeen.set(pid, nowMs);
+            }
+          }
           sendMsg(ws, {
             type: 'pong',
             clientTime: msg.clientTime,
@@ -965,6 +995,16 @@ async function startServer() {
           const prevRoomId = socketToRoom.get(ws);
           const ownedIds = socketToPlayerIds.get(ws)!;
           const playerId = msg.playerId || nextId('plr');
+          const cleanJoinName = (msg.name || 'PILOT').trim().slice(0, 16) || 'PILOT';
+          const nowMs = Date.now();
+          playerLastSeen.set(playerId, nowMs);
+
+          // Transfer ownership if an older socket previously owned this playerId
+          for (const [otherWs, otherSet] of socketToPlayerIds.entries()) {
+            if (otherWs !== ws && otherSet.has(playerId)) {
+              otherSet.delete(playerId);
+            }
+          }
 
           if (prevRoomId && prevRoomId !== msg.roomId) {
             const oldRoom = rooms.get(prevRoomId);
@@ -983,10 +1023,29 @@ async function startServer() {
           room.clients.add(ws);
           ownedIds.add(playerId);
 
+          // Clean up any stale ghost duplicate with the same name from a recent page reload
+          for (const [existingId, existingPlayer] of room.players.entries()) {
+            if (
+              existingId !== playerId &&
+              !existingPlayer.isDrone &&
+              existingPlayer.name === cleanJoinName
+            ) {
+              const lastSeen = playerLastSeen.get(existingId) ?? 0;
+              if (nowMs - lastSeen > 1200) {
+                room.players.delete(existingId);
+                playerLastSeen.delete(existingId);
+                for (const set of socketToPlayerIds.values()) {
+                  set.delete(existingId);
+                }
+                broadcastRoom(room, { type: 'player:left', playerId: existingId });
+              }
+            }
+          }
+
           let player = room.players.get(playerId);
           const hull: ShipHullType = HULL_SPECS[msg.hull] ? msg.hull : 'needle';
           const spec = HULL_SPECS[hull];
-          const spawn = getSafeSpawnPoint(room);
+          const spawn = getSafeSpawnPoint(room, playerId);
           const color =
             msg.color && PLAYER_COLORS.includes(msg.color)
               ? msg.color
@@ -995,7 +1054,7 @@ async function startServer() {
           if (!player) {
             player = {
               id: playerId,
-              name: (msg.name || 'PILOT').trim().slice(0, 16) || 'PILOT',
+              name: cleanJoinName,
               color,
               hull,
               x: spawn.x,
@@ -1021,7 +1080,7 @@ async function startServer() {
             };
             room.players.set(playerId, player);
           } else {
-            player.name = (msg.name || player.name).trim().slice(0, 16);
+            player.name = cleanJoinName;
             player.hull = hull;
             player.inputSource = msg.inputSource || player.inputSource;
           }
@@ -1058,41 +1117,19 @@ async function startServer() {
             ownedIds = new Set();
             socketToPlayerIds.set(ws, ownedIds);
           }
-          let player = room.players.get(msg.playerId);
-          if (!player && msg.playerId) {
+          const player = room.players.get(msg.playerId);
+          if (!player) return;
+
+          // Ensure ownership is attached to the active socket sending input for this playerId
+          if (!ownedIds.has(msg.playerId)) {
+            for (const [otherWs, otherSet] of socketToPlayerIds.entries()) {
+              if (otherWs !== ws && otherSet.has(msg.playerId)) {
+                otherSet.delete(msg.playerId);
+              }
+            }
             ownedIds.add(msg.playerId);
-            const spawn = getSafeSpawnPoint(room);
-            const spec = HULL_SPECS.needle;
-            player = {
-              id: msg.playerId,
-              name: 'PILOT',
-              color: PLAYER_COLORS[room.colorIndex++ % PLAYER_COLORS.length],
-              hull: 'needle',
-              x: typeof msg.x === 'number' && Number.isFinite(msg.x) ? wrapCoord(msg.x, ARENA_WIDTH) : spawn.x,
-              y: typeof msg.y === 'number' && Number.isFinite(msg.y) ? wrapCoord(msg.y, ARENA_HEIGHT) : spawn.y,
-              vx: typeof msg.vx === 'number' && Number.isFinite(msg.vx) ? msg.vx : 0,
-              vy: typeof msg.vy === 'number' && Number.isFinite(msg.vy) ? msg.vy : 0,
-              angle: Number.isFinite(msg.angle) ? msg.angle : -Math.PI / 2,
-              thrusting: Boolean(msg.thrusting),
-              shooting: Boolean(msg.shooting),
-              hp: spec.maxHp,
-              maxHp: spec.maxHp,
-              score: 0,
-              kills: 0,
-              deaths: 0,
-              streak: 0,
-              peakSpeed: 0,
-              alive: true,
-              respawnTimer: 0,
-              invulnerableTimer: 1.5,
-              lastFireTime: 0,
-              inputSource: msg.inputSource || 'keyboard',
-              cheats: { ...DEFAULT_PLAYER_CHEATS },
-            };
-            room.players.set(msg.playerId, player);
-            broadcastRoom(room, { type: 'player:joined', player }, ws);
           }
-          if (!player || !ownedIds.has(msg.playerId)) return;
+          playerLastSeen.set(msg.playerId, Date.now());
 
           if (Number.isFinite(msg.angle)) {
             player.angle = msg.angle;

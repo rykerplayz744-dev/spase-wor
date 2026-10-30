@@ -312,17 +312,36 @@ export class PeerSectorSync {
       }
     }
 
-    // Queue discrete gameplay events (salvos, hits, drones, renames) for the /api/sector cloud relay
+    // Queue discrete gameplay events (salvos, hits, drones, renames, leaves) for the /api/sector cloud relay
     if (
       packet.type === 'peer:salvo' ||
       packet.type === 'peer:combat_hit' ||
       packet.type === 'peer:cheat_action' ||
       packet.type === 'peer:rename' ||
-      packet.type === 'peer:cheat_rename'
+      packet.type === 'peer:cheat_rename' ||
+      packet.type === 'peer:player_leave'
     ) {
       this.pendingCloudEvents.push(packet);
       if (this.pendingCloudEvents.length > 80) {
         this.pendingCloudEvents.shift();
+      }
+    }
+  }
+
+  public pruneStalePeers(players: Map<string, PlayerState>) {
+    const now = Date.now();
+    for (const [peerId, lastTime] of this.peerLastSeen.entries()) {
+      if (now - lastTime > 5000) {
+        this.peerLastSeen.delete(peerId);
+        const stale = players.get(peerId);
+        if (stale && !stale.isDrone && peerId !== this.selfId) {
+          players.delete(peerId);
+        }
+      }
+    }
+    for (const [pid, p] of players.entries()) {
+      if (pid !== this.selfId && !p.isDrone && !this.peerLastSeen.has(pid)) {
+        this.peerLastSeen.set(pid, now);
       }
     }
   }
@@ -332,16 +351,7 @@ export class PeerSectorSync {
    * The lowest lexicographical ID among active human peers steps shared drones.
    */
   public isLeader(players: Map<string, PlayerState>): boolean {
-    const now = Date.now();
-    for (const [peerId, lastTime] of this.peerLastSeen.entries()) {
-      if (now - lastTime > 5000) {
-        this.peerLastSeen.delete(peerId);
-        const stale = players.get(peerId);
-        if (stale && !stale.isDrone) {
-          players.delete(peerId);
-        }
-      }
-    }
+    this.pruneStalePeers(players);
 
     const humanIds: string[] = [this.selfId];
     for (const p of players.values()) {

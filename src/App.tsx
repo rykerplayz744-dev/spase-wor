@@ -137,6 +137,10 @@ export default function App() {
   selectedColorRef.current = selectedColor;
   const cheatsRef = useRef<PlayerCheats>(cheats);
   cheatsRef.current = cheats;
+  const cheatMenuOpenRef = useRef<boolean>(cheatMenuOpen);
+  cheatMenuOpenRef.current = cheatMenuOpen;
+  const controllerModalOpenRef = useRef<boolean>(controllerModalOpen);
+  controllerModalOpenRef.current = controllerModalOpen;
   const spectateTargetIdRef = useRef<string | null>(spectateTargetId);
   spectateTargetIdRef.current = spectateTargetId;
   const freeCamPosRef = useRef<{ x: number; y: number; initialized: boolean }>({
@@ -148,7 +152,19 @@ export default function App() {
   autoFireRef.current = autoFire;
   const lastDamagedRemoteAtRef = useRef<Map<string, number>>(new Map());
 
-  const selfIdRef = useRef<string>(`plr_${Math.random().toString(36).slice(2, 9)}`);
+  const selfIdRef = useRef<string>(
+    (() => {
+      try {
+        const saved = sessionStorage.getItem('spacewar_self_id');
+        if (saved && saved.startsWith('plr_')) return saved;
+        const fresh = `plr_${Math.random().toString(36).slice(2, 9)}`;
+        sessionStorage.setItem('spacewar_self_id', fresh);
+        return fresh;
+      } catch {
+        return `plr_${Math.random().toString(36).slice(2, 9)}`;
+      }
+    })()
+  );
   const coopIdRef = useRef<string>(`plr2_${Math.random().toString(36).slice(2, 9)}`);
   const coopActiveRef = useRef<boolean>(false);
 
@@ -397,8 +413,14 @@ export default function App() {
       sendWs({ type: 'ping', clientTime: Date.now() });
     }, 2500);
 
+    const handleBeforeUnload = () => {
+      sendWs({ type: 'player:leave', playerId: selfIdRef.current });
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
     return () => {
       unmounted = true;
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (pingInterval) clearInterval(pingInterval);
       wsRef.current?.close();
@@ -699,9 +721,10 @@ export default function App() {
   );
 
   const handleSelectSpectateTarget = useCallback((targetId: string | null) => {
-    setSpectateTargetId(targetId);
-    spectateTargetIdRef.current = targetId;
-    if (targetId === null) {
+    const safeTargetId = targetId === selfIdRef.current ? null : targetId;
+    setSpectateTargetId(safeTargetId);
+    spectateTargetIdRef.current = safeTargetId;
+    if (safeTargetId === null) {
       const cam = rendererRef.current?.getCameraPosition();
       if (cam) {
         freeCamPosRef.current = { x: cam.x, y: cam.y, initialized: true };
@@ -727,7 +750,7 @@ export default function App() {
             : otherPlayers.length - 1
           : (idx + dir + otherPlayers.length) % otherPlayers.length;
       const chosen = otherPlayers[nextIdx];
-      if (chosen) {
+      if (chosen && chosen.id !== selfIdRef.current) {
         handleSelectSpectateTarget(chosen.id);
         if (!cheatsRef.current.freeCam) {
           handleUpdateCheats({ ...cheatsRef.current, freeCam: true });
@@ -1016,9 +1039,19 @@ export default function App() {
         handleCycleSpectateTarget(sampled.spectateNextJustPressed ? 1 : -1);
       }
 
-      if (isTitle && sampled.startJustPressed && !controllerModalOpen && !cheatMenuOpen) {
+      if (
+        isTitle &&
+        sampled.startJustPressed &&
+        !controllerModalOpenRef.current &&
+        !cheatMenuOpenRef.current
+      ) {
         handleStartGame();
-      } else if (!isTitle && sampled.pauseJustPressed && !controllerModalOpen && !cheatMenuOpen) {
+      } else if (
+        !isTitle &&
+        sampled.pauseJustPressed &&
+        !controllerModalOpenRef.current &&
+        !cheatMenuOpenRef.current
+      ) {
         setShellState((prev) => (prev === 'PAUSED' ? 'PLAYING' : 'PAUSED'));
       }
 
@@ -1032,9 +1065,11 @@ export default function App() {
       } else if (!isTitle && !isPaused && localPlayer) {
         if (isFreeCam) {
           // Detached Camera / Spectator Mode:
-          // Ship controls are disconnected from your ship while you fly the camera or spectate!
+          // Ship controls and physics are parked while you fly the camera or spectate!
           localPlayer.thrusting = false;
           localPlayer.shooting = false;
+          localPlayer.vx = 0;
+          localPlayer.vy = 0;
           localPlayer.spectating = true;
           localPlayer.inputSource = sampled.inputSource;
 
@@ -1047,13 +1082,14 @@ export default function App() {
             };
           }
 
-          // If spectating a player that left or if user pushes WASD/Arrows/Stick to manually fly off:
-          const currentTargetId = spectateTargetIdRef.current;
+          // Never allow spectating yourself; if target left or user pushes WASD/Arrows/Stick to manually fly off:
+          const currentTargetId =
+            spectateTargetIdRef.current === selfIdRef.current ? null : spectateTargetIdRef.current;
           const targetExists = currentTargetId ? world.players.has(currentTargetId) : false;
           const manualPanActive =
             Math.abs(sampled.panVector.x) > 0.05 || Math.abs(sampled.panVector.y) > 0.05;
 
-          if (currentTargetId && !targetExists) {
+          if (spectateTargetIdRef.current && !targetExists) {
             spectateTargetIdRef.current = null;
             setSpectateTargetId(null);
           } else if (currentTargetId && manualPanActive) {
@@ -1087,74 +1123,75 @@ export default function App() {
           localPlayer.thrusting = sampled.thrusting && localPlayer.alive;
           localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
           localPlayer.inputSource = sampled.inputSource;
-        }
 
-        renderer.stepLocalPlayerPhysics(
-          localPlayer,
-          dt,
-          world.gravityStarEnabled,
-          world.planets
-        );
-
-        // Prevent getting stuck inside the giant Sun's gravity well:
-        // touching the Sun immediately teleports/respawns the ship to a safe orbit around the Sun.
-        if (world.gravityStarEnabled && localPlayer.alive) {
-          const hullRadius = (HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle).radius;
-          const distToSun = Math.hypot(
-            localPlayer.x - GRAVITY_STAR_X,
-            localPlayer.y - GRAVITY_STAR_Y
+          renderer.stepLocalPlayerPhysics(
+            localPlayer,
+            dt,
+            world.gravityStarEnabled,
+            world.planets
           );
-          if (distToSun < GRAVITY_STAR_RADIUS + hullRadius - 4) {
-            renderer.addBurst(
-              localPlayer.x,
-              localPlayer.y,
-              0,
-              0,
-              '#F59E0B',
-              32,
-              300,
-              true
+
+          // Prevent getting stuck inside the giant Sun's gravity well:
+          // touching the Sun immediately teleports/respawns the ship to a safe orbit around the Sun.
+          if (world.gravityStarEnabled && localPlayer.alive) {
+            const hullRadius = (HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle).radius;
+            const distToSun = Math.hypot(
+              localPlayer.x - GRAVITY_STAR_X,
+              localPlayer.y - GRAVITY_STAR_Y
             );
-            soundEngine.playHit(true);
-            const safeOrbit = getSafeSunOrbitPoint();
-            localPlayer.x = safeOrbit.x;
-            localPlayer.y = safeOrbit.y;
-            localPlayer.vx = 0;
-            localPlayer.vy = 0;
-            localPlayer.invulnerableTimer = 2.0;
-            if (!isWsConnected && !localPlayer.cheats?.godMode) {
-              localPlayer.deaths += 1;
-              localPlayer.streak = 0;
-              localPlayer.hp = localPlayer.maxHp;
-              const killEntry: KillFeedEntry = {
-                id: `kill_sun_${Date.now().toString(36)}`,
-                killerId: 'STAR',
-                killerName: 'GRAVITY STAR',
-                killerColor: '#F59E0B',
-                victimId: localPlayer.id,
-                victimName: localPlayer.name,
-                victimColor: localPlayer.color,
-                cause: 'star',
-                speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
-                timestamp: Date.now(),
-              };
-              world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+            if (distToSun < GRAVITY_STAR_RADIUS + hullRadius - 4) {
+              renderer.addBurst(
+                localPlayer.x,
+                localPlayer.y,
+                0,
+                0,
+                '#F59E0B',
+                32,
+                300,
+                true
+              );
+              soundEngine.playHit(true);
+              const safeOrbit = getSafeSunOrbitPoint();
+              localPlayer.x = safeOrbit.x;
+              localPlayer.y = safeOrbit.y;
+              localPlayer.vx = 0;
+              localPlayer.vy = 0;
+              localPlayer.invulnerableTimer = 2.0;
+              if (!isWsConnected && !localPlayer.cheats?.godMode) {
+                localPlayer.deaths += 1;
+                localPlayer.streak = 0;
+                localPlayer.hp = localPlayer.maxHp;
+                const killEntry: KillFeedEntry = {
+                  id: `kill_sun_${Date.now().toString(36)}`,
+                  killerId: 'STAR',
+                  killerName: 'GRAVITY STAR',
+                  killerColor: '#F59E0B',
+                  victimId: localPlayer.id,
+                  victimName: localPlayer.name,
+                  victimColor: localPlayer.color,
+                  cause: 'star',
+                  speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
+                  timestamp: Date.now(),
+                };
+                world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+              }
+              renderer.addBurst(
+                localPlayer.x,
+                localPlayer.y,
+                0,
+                0,
+                '#38BDF8',
+                24,
+                240,
+                false
+              );
             }
-            renderer.addBurst(
-              localPlayer.x,
-              localPlayer.y,
-              0,
-              0,
-              '#38BDF8',
-              24,
-              240,
-              false
-            );
           }
         }
 
         // If running on static Vercel / Peer mode without WebSocket backend, step respawn, remote players, drones, & asteroids
         if (!isWsConnected) {
+          peerSyncRef.current?.pruneStalePeers(world.players);
           if (!localPlayer.alive) {
             localPlayer.respawnTimer = Math.max(0, localPlayer.respawnTimer - dt);
             if (localPlayer.respawnTimer <= 0) {
@@ -1667,8 +1704,6 @@ export default function App() {
       soundEngine.stopThrust();
     };
   }, [
-    cheatMenuOpen,
-    controllerModalOpen,
     handleCycleSpectateTarget,
     handleStartGame,
     handleTriggerCheatAction,
@@ -2341,6 +2376,16 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
+                  if (cheatsRef.current.freeCam) {
+                    handleUpdateCheats({ ...cheatsRef.current, freeCam: false });
+                  }
+                  handleSelectSpectateTarget(null);
+                  worldRef.current.players.delete(selfIdRef.current);
+                  peerSyncRef.current?.send({
+                    type: 'peer:player_leave',
+                    senderId: selfIdRef.current,
+                    playerId: selfIdRef.current,
+                  });
                   sendWs({ type: 'player:leave', playerId: selfIdRef.current });
                   setShellState('TITLE_MENU');
                 }}
