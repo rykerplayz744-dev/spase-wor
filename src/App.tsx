@@ -10,6 +10,11 @@ import {
   InputManager,
   loadControllerMapping,
 } from './game/input.ts';
+import {
+  createTargetDronesBatch,
+  getColocatedSpawnPoint,
+  PeerSectorSync,
+} from './game/peerSync.ts';
 import { SpacewarRenderer } from './game/renderer.ts';
 import { soundEngine } from './game/sound.ts';
 import {
@@ -111,6 +116,7 @@ export default function App() {
   // Mutable simulation refs isolated from React render cycle for 60fps canvas loop
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const peerSyncRef = useRef<PeerSectorSync | null>(null);
   const inputRef = useRef<InputManager | null>(null);
   const rendererRef = useRef<SpacewarRenderer | null>(null);
   const shellStateRef = useRef<GameShellState>(shellState);
@@ -368,40 +374,209 @@ export default function App() {
     };
   }, [pilotName, roomId, selectedColor, selectedHull, sendWs]);
 
+  // Multi-Window & Vercel Serverless Peer Sync (ensures multiple windows share SECTOR-01 even without /ws)
+  useEffect(() => {
+    const peerSync = new PeerSectorSync(selfIdRef.current, (pkt) => {
+      const world = worldRef.current;
+
+      if (pkt.type === 'peer:hello') {
+        if (pkt.player && pkt.player.id !== selfIdRef.current) {
+          world.players.set(pkt.player.id, pkt.player);
+        }
+        peerSync.send({
+          type: 'peer:welcome',
+          senderId: selfIdRef.current,
+          players: Array.from(world.players.values()),
+          asteroids: world.asteroids,
+          planets: world.planets,
+          killFeed: world.killFeed,
+          gravityStarEnabled: world.gravityStarEnabled,
+        });
+        return;
+      }
+
+      if (pkt.type === 'peer:welcome') {
+        for (const p of pkt.players) {
+          if (p.id !== selfIdRef.current) {
+            world.players.set(p.id, p);
+          }
+        }
+        if (pkt.planets && pkt.planets.length === world.planets.length) {
+          for (let i = 0; i < pkt.planets.length; i++) {
+            world.planets[i].orbitAngle = pkt.planets[i].orbitAngle;
+          }
+        }
+        if (pkt.killFeed && pkt.killFeed.length > 0 && world.killFeed.length === 0) {
+          world.killFeed = pkt.killFeed;
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:player_state') {
+        if (pkt.player.id !== selfIdRef.current) {
+          world.players.set(pkt.player.id, pkt.player);
+        }
+        if (pkt.drones) {
+          for (const d of pkt.drones) {
+            world.players.set(d.id, d);
+          }
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:player_leave') {
+        if (pkt.playerId !== selfIdRef.current) {
+          world.players.delete(pkt.playerId);
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:salvo') {
+        const spawned = expandSalvoToBullets(pkt.salvo);
+        world.bullets.push(...spawned);
+        if (world.bullets.length > 1800) {
+          world.bullets.splice(0, world.bullets.length - 1800);
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:cheat_action') {
+        if (pkt.spawnedDrones) {
+          for (const d of pkt.spawnedDrones) {
+            world.players.set(d.id, d);
+          }
+        } else if (pkt.action === 'clear_drones') {
+          for (const [pid, p] of world.players.entries()) {
+            if (p.isDrone) {
+              world.players.delete(pid);
+            }
+          }
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:rename') {
+        const target = world.players.get(pkt.playerId);
+        if (target) target.name = pkt.newName;
+        return;
+      }
+
+      if (pkt.type === 'peer:cheat_rename') {
+        if (pkt.targetId === 'ALL_OTHERS') {
+          for (const p of world.players.values()) {
+            if (p.id !== pkt.requesterId) {
+              p.name = pkt.newName;
+              if (p.id === selfIdRef.current) {
+                setPilotName(pkt.newName);
+              }
+            }
+          }
+        } else {
+          const target = world.players.get(pkt.targetId);
+          if (target) {
+            target.name = pkt.newName;
+            if (target.id === selfIdRef.current) {
+              setPilotName(pkt.newName);
+            }
+          }
+        }
+        return;
+      }
+
+      if (pkt.type === 'peer:combat_hit') {
+        const target = world.players.get(pkt.targetId);
+        if (target && target.alive) {
+          if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+            target.hp = Math.max(0, target.hp - pkt.damage);
+          }
+          target.vx = pkt.vx;
+          target.vy = pkt.vy;
+          if (pkt.fatal && !target.cheats?.godMode) {
+            target.alive = false;
+            target.hp = 0;
+            target.deaths += 1;
+            target.respawnTimer = 2.8;
+          }
+        }
+        const renderer = rendererRef.current;
+        if (renderer) {
+          renderer.hitFlashes.set(pkt.targetId, 0.12);
+          renderer.addBurst(
+            pkt.x,
+            pkt.y,
+            pkt.vx * 0.25,
+            pkt.vy * 0.25,
+            pkt.color,
+            pkt.fatal ? 34 : 12,
+            pkt.fatal ? 320 : 180,
+            pkt.fatal
+          );
+          if (pkt.targetId === selfIdRef.current || pkt.attackerId === selfIdRef.current) {
+            renderer.cameraShake = pkt.fatal ? 14 : 5;
+            soundEngine.playHit(pkt.fatal);
+          }
+        }
+        if (pkt.killEntry) {
+          world.killFeed = [
+            pkt.killEntry,
+            ...world.killFeed.filter((k) => k.id !== pkt.killEntry!.id),
+          ].slice(0, 6);
+        }
+      }
+    });
+
+    peerSyncRef.current = peerSync;
+    peerSync.announceJoin();
+    peerSync.startCloudRelayPoll(
+      () => wsRef.current?.readyState === WebSocket.OPEN,
+      () => worldRef.current.players.get(selfIdRef.current)
+    );
+
+    return () => {
+      peerSync.destroy(selfIdRef.current);
+      peerSyncRef.current = null;
+    };
+  }, []);
+
   const handleStartGame = useCallback(() => {
     const cleanName = pilotName.trim().slice(0, 16) || 'PILOT';
     localStorage.setItem('spacewar_pilot_name', cleanName);
 
     const spec = HULL_SPECS[selectedHull];
-    const existing = worldRef.current.players.get(selfIdRef.current);
-    if (!existing) {
-      worldRef.current.players.set(selfIdRef.current, {
-        id: selfIdRef.current,
-        name: cleanName,
-        color: selectedColor,
-        hull: selectedHull,
-        x: ARENA_WIDTH * 0.5 + 3200,
-        y: ARENA_HEIGHT * 0.5,
-        vx: 0,
-        vy: 0,
-        angle: -Math.PI / 2,
-        thrusting: false,
-        shooting: false,
-        hp: spec.maxHp,
-        maxHp: spec.maxHp,
-        score: 0,
-        kills: 0,
-        deaths: 0,
-        streak: 0,
-        peakSpeed: 0,
-        alive: true,
-        respawnTimer: 0,
-        invulnerableTimer: 2.0,
-        lastFireTime: 0,
-        inputSource: 'keyboard',
-        cheats: cheatsRef.current,
-      });
-    }
+    const spawnPt = getColocatedSpawnPoint(
+      worldRef.current.players.values(),
+      selfIdRef.current
+    );
+
+    const localPlayerObj: PlayerState = {
+      id: selfIdRef.current,
+      name: cleanName,
+      color: selectedColor,
+      hull: selectedHull,
+      x: spawnPt.x,
+      y: spawnPt.y,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      shooting: false,
+      hp: spec.maxHp,
+      maxHp: spec.maxHp,
+      score: 0,
+      kills: 0,
+      deaths: 0,
+      streak: 0,
+      peakSpeed: 0,
+      alive: true,
+      respawnTimer: 0,
+      invulnerableTimer: 2.0,
+      lastFireTime: 0,
+      inputSource: 'keyboard',
+      cheats: cheatsRef.current,
+    };
+
+    worldRef.current.players.set(selfIdRef.current, localPlayerObj);
+    peerSyncRef.current?.announceJoin(localPlayerObj);
 
     sendWs({
       type: 'player:join',
@@ -477,6 +652,11 @@ export default function App() {
           if (world.bullets.length > 1800) {
             world.bullets.splice(0, world.bullets.length - 1800);
           }
+          peerSyncRef.current?.send({
+            type: 'peer:salvo',
+            senderId: selfIdRef.current,
+            salvo,
+          });
         }
       } else if (action === 'momentum_boost' && localPlayer && localPlayer.alive) {
         localPlayer.vx += Math.cos(localPlayer.angle) * 2500;
@@ -494,65 +674,33 @@ export default function App() {
         (action === 'spawn_drone' || action === 'spawn_drones_100')
       ) {
         const countToSpawn = action === 'spawn_drones_100' ? 100 : 1;
-        let droneNum = Array.from(world.players.values()).filter((p) => p.isDrone).length;
-        for (let i = 0; i < countToSpawn; i++) {
-          droneNum++;
-          const droneId = `drone_${Date.now().toString(36)}_${i}_${Math.random().toString(36).slice(2, 6)}`;
-          const hull = HULL_LIST[(world.players.size + i) % HULL_LIST.length];
-          const spec = HULL_SPECS[hull];
-          const color = PLAYER_COLORS[(world.players.size + i) % PLAYER_COLORS.length];
-          const frac = (i + 0.5) / countToSpawn;
-          const orbitRadius =
-            countToSpawn === 1
-              ? 1400 + Math.random() * 6800
-              : 1400 + Math.sqrt(frac) * 7200;
-          const theta =
-            countToSpawn === 1
-              ? Math.random() * Math.PI * 2
-              : i * 2.3999632 + Math.random() * 0.15;
-          const spawnX =
-            (((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) +
-              ARENA_WIDTH) %
-            ARENA_WIDTH;
-          const spawnY =
-            (((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) +
-              ARENA_HEIGHT) %
-            ARENA_HEIGHT;
-          const initAngle = theta + Math.PI * 0.5;
-          const initSpeed = 260 + Math.random() * 180;
-          world.players.set(droneId, {
-            id: droneId,
-            name: `TARGET-${droneNum}`,
-            color,
-            hull,
-            x: Math.round(spawnX),
-            y: Math.round(spawnY),
-            vx: Math.round(Math.cos(initAngle) * initSpeed),
-            vy: Math.round(Math.sin(initAngle) * initSpeed),
-            angle: initAngle,
-            thrusting: true,
-            shooting: false,
-            hp: spec.maxHp,
-            maxHp: spec.maxHp,
-            score: 0,
-            kills: 0,
-            deaths: 0,
-            streak: 0,
-            peakSpeed: Math.round(initSpeed),
-            alive: true,
-            respawnTimer: 0,
-            invulnerableTimer: 0.4,
-            lastFireTime: 0,
-            inputSource: 'keyboard',
-            isDrone: true,
-          });
+        const spawnedDrones = createTargetDronesBatch(
+          world.players,
+          countToSpawn,
+          localPlayer
+        );
+        for (const d of spawnedDrones) {
+          world.players.set(d.id, d);
         }
+        peerSyncRef.current?.send({
+          type: 'peer:cheat_action',
+          senderId: selfIdRef.current,
+          playerId: selfIdRef.current,
+          action,
+          spawnedDrones,
+        });
       } else if (!isWsConnected && action === 'clear_drones') {
         for (const [pid, p] of world.players.entries()) {
           if (p.isDrone) {
             world.players.delete(pid);
           }
         }
+        peerSyncRef.current?.send({
+          type: 'peer:cheat_action',
+          senderId: selfIdRef.current,
+          playerId: selfIdRef.current,
+          action: 'clear_drones',
+        });
       }
 
       sendWs({
@@ -593,6 +741,12 @@ export default function App() {
       if (localPlayer) {
         localPlayer.name = clean;
       }
+      peerSyncRef.current?.send({
+        type: 'peer:rename',
+        senderId: selfIdRef.current,
+        playerId: selfIdRef.current,
+        newName: clean,
+      });
       sendWs({
         type: 'player:rename',
         playerId: selfIdRef.current,
@@ -621,6 +775,14 @@ export default function App() {
         }
       }
 
+      peerSyncRef.current?.send({
+        type: 'peer:cheat_rename',
+        senderId: selfIdRef.current,
+        requesterId: selfIdRef.current,
+        targetId,
+        newName: clean,
+      });
+
       sendWs({
         type: 'player:cheat_rename',
         requesterId: selfIdRef.current,
@@ -632,6 +794,25 @@ export default function App() {
   );
 
   const handleRespawnNow = useCallback(() => {
+    const localPlayer = worldRef.current.players.get(selfIdRef.current);
+    if (localPlayer && wsRef.current?.readyState !== WebSocket.OPEN) {
+      const spawnPt = getColocatedSpawnPoint(
+        worldRef.current.players.values(),
+        selfIdRef.current
+      );
+      const spec = HULL_SPECS[selectedHull];
+      localPlayer.hull = selectedHull;
+      localPlayer.name = pilotName.trim().slice(0, 16) || localPlayer.name;
+      localPlayer.x = spawnPt.x;
+      localPlayer.y = spawnPt.y;
+      localPlayer.vx = 0;
+      localPlayer.vy = 0;
+      localPlayer.hp = spec.maxHp;
+      localPlayer.maxHp = spec.maxHp;
+      localPlayer.alive = true;
+      localPlayer.respawnTimer = 0;
+      localPlayer.invulnerableTimer = 2.0;
+    }
     sendWs({
       type: 'player:respawn',
       playerId: selfIdRef.current,
@@ -765,23 +946,60 @@ export default function App() {
         if (!isWsConnected && world.bullets.length > 0) {
           for (let i = world.bullets.length - 1; i >= 0; i--) {
             const b = world.bullets[i];
+            if (b.ownerId !== selfIdRef.current) continue;
             for (const target of world.players.values()) {
               if (!target.alive || target.id === b.ownerId) continue;
               const dx = b.x - target.x;
               const dy = b.y - target.y;
               if (Math.abs(dx) < 32 && Math.abs(dy) < 32 && dx * dx + dy * dy <= 900) {
-                target.hp -= b.damage;
+                const knockback = b.isMissile ? 95 : 65;
+                target.vx += Math.cos(b.angle) * knockback;
+                target.vy += Math.sin(b.angle) * knockback;
+                if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+                  target.hp -= b.damage;
+                }
                 world.bullets.splice(i, 1);
-                if (target.hp <= 0) {
+                const fatal = target.hp <= 0 && !target.cheats?.godMode;
+                let killEntry: KillFeedEntry | undefined;
+                if (fatal) {
                   target.alive = false;
+                  target.hp = 0;
+                  target.deaths += 1;
                   target.respawnTimer = 2.8;
                   localPlayer.kills += 1;
                   localPlayer.score += 150;
+                  killEntry = {
+                    id: `kill_${Date.now().toString(36)}`,
+                    killerId: localPlayer.id,
+                    killerName: localPlayer.name,
+                    killerColor: localPlayer.color,
+                    victimId: target.id,
+                    victimName: target.name,
+                    victimColor: target.color,
+                    cause: b.isMissile ? 'missile' : 'laser',
+                    speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
+                    timestamp: Date.now(),
+                  };
+                  world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
                   renderer.addBurst(target.x, target.y, target.vx * 0.2, target.vy * 0.2, target.color, 28, 280, true);
                   soundEngine.playHit(true);
                 } else {
                   renderer.addBurst(b.x, b.y, 0, 0, b.color, 8, 140, false);
                 }
+                peerSyncRef.current?.send({
+                  type: 'peer:combat_hit',
+                  senderId: selfIdRef.current,
+                  targetId: target.id,
+                  attackerId: localPlayer.id,
+                  x: Math.round(b.x),
+                  y: Math.round(b.y),
+                  vx: Math.round(target.vx),
+                  vy: Math.round(target.vy),
+                  damage: b.damage,
+                  fatal,
+                  color: b.color,
+                  killEntry,
+                });
                 break;
               }
             }
@@ -833,6 +1051,11 @@ export default function App() {
             if (world.bullets.length > 1800) {
               world.bullets.splice(0, world.bullets.length - 1800);
             }
+            peerSyncRef.current?.send({
+              type: 'peer:salvo',
+              senderId: selfIdRef.current,
+              salvo,
+            });
           }
         }
 
@@ -886,6 +1109,11 @@ export default function App() {
 
         if (now - lastNetSend >= 32 || sampled.warpJustPressed) {
           lastNetSend = now;
+          peerSyncRef.current?.send({
+            type: 'peer:player_state',
+            senderId: selfIdRef.current,
+            player: localPlayer,
+          });
           sendWs({
             type: 'player:input',
             playerId: selfIdRef.current,

@@ -134,26 +134,43 @@ function getOrCreateRoom(_roomId?: string): RoomState {
   return room;
 }
 
-function getSafeSpawnPoint(room: RoomState): { x: number; y: number } {
+function getSafeSpawnPoint(room: RoomState, excludeId?: string): { x: number; y: number } {
+  // 1. If another human player is alive in SECTOR-01, spawn right near them on the same screen!
+  for (const p of room.players.values()) {
+    if (p.alive && !p.isDrone && p.id !== excludeId) {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 160 + Math.random() * 140;
+        const x = wrapCoord(p.x + Math.cos(angle) * dist, ARENA_WIDTH);
+        const y = wrapCoord(p.y + Math.sin(angle) * dist, ARENA_HEIGHT);
+        if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > GRAVITY_STAR_RADIUS + 140) {
+          return { x: Math.round(x), y: Math.round(y) };
+        }
+      }
+    }
+  }
+
+  // 2. Otherwise spawn at the shared SECTOR-01 Rendezvous Zone so all windows start in the same area
+  const angleOffset = (Math.random() - 0.5) * 0.12;
+  const radius = 2900 + (Math.random() - 0.5) * 180;
+  return {
+    x: Math.round(wrapCoord(GRAVITY_STAR_X + Math.cos(angleOffset) * radius, ARENA_WIDTH)),
+    y: Math.round(wrapCoord(GRAVITY_STAR_Y + Math.sin(angleOffset) * radius, ARENA_HEIGHT)),
+  };
+}
+
+function getRandomWarpPoint(room: RoomState): { x: number; y: number } {
   for (let attempt = 0; attempt < 24; attempt++) {
-    const orbitRadius = 1400 + Math.random() * 6800;
+    const orbitRadius = 1500 + Math.random() * 6500;
     const theta = Math.random() * Math.PI * 2;
     const x = wrapCoord(GRAVITY_STAR_X + Math.cos(theta) * orbitRadius, ARENA_WIDTH);
     const y = wrapCoord(GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius, ARENA_HEIGHT);
 
     let safe = true;
-    for (const p of room.players.values()) {
-      if (p.alive && Math.hypot(p.x - x, p.y - y) < 220) {
+    for (const planet of room.planets) {
+      if (Math.hypot(planet.x - x, planet.y - y) < planet.radius + 140) {
         safe = false;
         break;
-      }
-    }
-    if (safe) {
-      for (const planet of room.planets) {
-        if (Math.hypot(planet.x - x, planet.y - y) < planet.radius + 140) {
-          safe = false;
-          break;
-        }
       }
     }
     if (safe) return { x, y };
@@ -1037,7 +1054,7 @@ async function startServer() {
           }
 
           if (msg.warpRequested && player.alive) {
-            const pt = getSafeSpawnPoint(room);
+            const pt = getRandomWarpPoint(room);
             player.x = pt.x;
             player.y = pt.y;
             const currentMomentum = Math.hypot(player.vx, player.vy);
@@ -1096,10 +1113,11 @@ async function startServer() {
               let initSpeed: number;
 
               if (countToSpawn === 1) {
-                const spawn = getSafeSpawnPoint(room);
-                spawnX = spawn.x;
-                spawnY = spawn.y;
-                initAngle = Math.random() * Math.PI * 2;
+                const theta = Math.random() * Math.PI * 2;
+                const dist = 260 + Math.random() * 220;
+                spawnX = wrapCoord(player.x + Math.cos(theta) * dist, ARENA_WIDTH);
+                spawnY = wrapCoord(player.y + Math.sin(theta) * dist, ARENA_HEIGHT);
+                initAngle = theta + Math.PI * 0.5;
                 initSpeed = 240 + Math.random() * 140;
               } else {
                 // Golden-angle spiral distribution across the 10x star system for 100 target ships at once
