@@ -47,7 +47,6 @@ export interface MusicBoxController {
   setVolume: (vol: number) => void;
   seek: (seconds: number) => void;
   refreshFolder: () => Promise<void>;
-  uploadOggFile: (file: File) => Promise<void>;
 }
 
 export function useMusicBoxController(): MusicBoxController {
@@ -243,34 +242,6 @@ export function useMusicBoxController(): MusicBoxController {
     setCurrentTime(seconds);
   }, []);
 
-  const uploadOggFile = useCallback(
-    async (file: File) => {
-      const arrayBuf = await file.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuf);
-      let binary = '';
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64Data = btoa(binary);
-      const res = await fetch('/api/music/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename: file.name,
-          base64Data,
-        }),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { file?: OggTrack };
-        await refreshFolder();
-        if (data.file) {
-          playTrack(data.file);
-        }
-      }
-    },
-    [playTrack, refreshFolder]
-  );
-
   return {
     tracks,
     currentTrack,
@@ -291,7 +262,6 @@ export function useMusicBoxController(): MusicBoxController {
     setVolume,
     seek,
     refreshFolder,
-    uploadOggFile,
   };
 }
 
@@ -311,39 +281,15 @@ export const MusicBoxContent: React.FC<MusicBoxContentProps> = ({
   controller,
   compact = false,
 }) => {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      await controller.uploadOggFile(file);
-      e.target.value = '';
-    }
-  };
-
   return (
     <div className="space-y-3">
-      {/* Folder Path & Pin Toggle Row */}
+      {/* Folder Path & Refresh Row */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="font-mono-tabular text-[11px] text-slate-400">
           Folder: <span className="text-amber-400">src/components/music/*.ogg</span> ({controller.tracks.length} files)
         </div>
 
         <div className="flex items-center gap-1.5">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".ogg,audio/ogg"
-            onChange={handleFileChange}
-            className="hidden"
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            title="Add an .ogg file into src/components/music/"
-            className="rounded border border-slate-700 bg-[#060913] px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0"
-          >
-            + Add .OGG
-          </button>
           <button
             onClick={() => controller.refreshFolder()}
             className="rounded border border-slate-700 bg-[#060913] px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-slate-500 hover:text-white whitespace-nowrap shrink-0"
@@ -442,9 +388,7 @@ export const MusicBoxContent: React.FC<MusicBoxContentProps> = ({
         {controller.tracks.length === 0 ? (
           <div className="rounded-lg border border-slate-800/80 bg-[#060913] px-3 py-2.5 text-xs text-slate-400">
             No <span className="font-mono-tabular text-slate-200">.ogg</span> files found in{' '}
-            <span className="font-mono-tabular text-amber-400">src/components/music/</span>. Place{' '}
-            <span className="font-mono-tabular text-slate-200">.ogg</span> files in that folder or click{' '}
-            <span className="text-slate-200">+ Add .OGG</span>.
+            <span className="font-mono-tabular text-amber-400">src/components/music/</span>.
           </div>
         ) : (
           controller.tracks.map((track) => {
