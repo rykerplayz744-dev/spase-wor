@@ -52,6 +52,12 @@ export interface SampledInput {
   gamepadName: string;
   stickVector: { x: number; y: number; magnitude: number; active: boolean };
   pressedButtonIndices: number[];
+  mouseScreenX: number;
+  mouseScreenY: number;
+  panVector: { x: number; y: number };
+  boostHeld: boolean;
+  spectatePrevJustPressed: boolean;
+  spectateNextJustPressed: boolean;
 }
 
 export function loadControllerMapping(): ControllerMapping {
@@ -79,7 +85,10 @@ export class InputManager {
   private heldKeys = new Set<string>();
   private justPressedKeys = new Set<string>();
   private prevGamepadButtons = new Map<number, boolean[]>();
-  private mousePos = { x: 0, y: 0 };
+  private mousePos = {
+    x: typeof window !== 'undefined' ? window.innerWidth * 0.5 : 640,
+    y: typeof window !== 'undefined' ? window.innerHeight * 0.5 : 360,
+  };
   private mouseMovedRecently = false;
   private mouseLeftDown = false;
   private mouseRightDown = false;
@@ -362,6 +371,25 @@ export class InputManager {
     const cheatMenuJustPressed = this.justPressedKeys.has('KeyK');
     const missileSwarmJustPressed = this.heldKeys.has('KeyM') || this.justPressedKeys.has('KeyM');
     const autoFireToggleJustPressed = this.justPressedKeys.has('KeyF') || gpAutoFireJustPressed;
+    const spectatePrevJustPressed = this.justPressedKeys.has('BracketLeft');
+    const spectateNextJustPressed = this.justPressedKeys.has('BracketRight');
+
+    // Compute camera pan vector for Free-Cam / Spectator mode (WASD, Arrows, or Gamepad Stick)
+    let panX = (kbRight ? 1 : 0) - (kbLeft ? 1 : 0);
+    let panY = (kbDown ? 1 : 0) - (kbUp ? 1 : 0);
+    if (panX !== 0 && panY !== 0) {
+      const inv = 1 / Math.SQRT2;
+      panX *= inv;
+      panY *= inv;
+    } else if (panX === 0 && panY === 0 && stickVector.active) {
+      panX = stickVector.x * stickVector.magnitude;
+      panY = stickVector.y * stickVector.magnitude;
+    }
+
+    const boostHeld =
+      this.heldKeys.has('ShiftLeft') ||
+      this.heldKeys.has('ShiftRight') ||
+      gpThrust;
 
     this.justPressedKeys.clear();
 
@@ -380,6 +408,12 @@ export class InputManager {
       gamepadName: gp ? gp.id : '',
       stickVector,
       pressedButtonIndices,
+      mouseScreenX: this.mousePos.x,
+      mouseScreenY: this.mousePos.y,
+      panVector: { x: panX, y: panY },
+      boostHeld,
+      spectatePrevJustPressed,
+      spectateNextJustPressed,
     };
   }
 }

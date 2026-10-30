@@ -97,6 +97,7 @@ export interface PlayerCheats {
   rapidFire: boolean;
   novaSpread: boolean;
   godMode: boolean;
+  freeCam: boolean;
 }
 
 export const DEFAULT_PLAYER_CHEATS: PlayerCheats = {
@@ -104,6 +105,7 @@ export const DEFAULT_PLAYER_CHEATS: PlayerCheats = {
   rapidFire: false,
   novaSpread: false,
   godMode: false,
+  freeCam: false,
 };
 
 export interface PlayerState {
@@ -132,6 +134,10 @@ export interface PlayerState {
   inputSource: 'gamepad' | 'keyboard';
   cheats?: PlayerCheats;
   isDrone?: boolean;
+  spectating?: boolean;
+  spectateTargetId?: string | null;
+  cursorX?: number;
+  cursorY?: number;
 }
 
 export interface BulletState {
@@ -285,6 +291,10 @@ export type ClientToServerMessage =
       y?: number;
       vx?: number;
       vy?: number;
+      spectating?: boolean;
+      spectateTargetId?: string | null;
+      cursorX?: number;
+      cursorY?: number;
     }
   | {
       type: 'player:cheats';
@@ -379,13 +389,11 @@ export function expandSalvoToBullets(salvo: SalvoSpawnPayload): BulletState[] {
     const dirX = Math.cos(shotAngle);
     const dirY = Math.sin(shotAngle);
 
-    const forwardVel = vx * dirX + vy * dirY;
-    const effectiveMuzzle = Math.max(baseMuzzle, forwardVel + baseMuzzle * 0.85);
-    const lateralVx = vx - forwardVel * dirX;
-    const lateralVy = vy - forwardVel * dirY;
+    const forwardBoost = Math.max(0, vx * dirX + vy * dirY);
+    const effectiveMuzzle = baseMuzzle + forwardBoost * 0.85;
 
-    const bvx = dirX * effectiveMuzzle + lateralVx * 0.92;
-    const bvy = dirY * effectiveMuzzle + lateralVy * 0.92;
+    const bvx = dirX * effectiveMuzzle;
+    const bvy = dirY * effectiveMuzzle;
 
     const bx = (((x + dirX * noseDist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
     const by = (((y + dirY * noseDist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
@@ -399,7 +407,7 @@ export function expandSalvoToBullets(salvo: SalvoSpawnPayload): BulletState[] {
       y: by,
       vx: bvx,
       vy: bvy,
-      angle: Math.atan2(bvy, bvx),
+      angle: shotAngle,
       damage,
       ttl,
       maxTtl: ttl,

@@ -13,6 +13,8 @@ interface CheatMenuModalProps {
   selfId: string;
   onCheatRenameShip: (targetId: string | 'ALL_OTHERS', newName: string) => void;
   musicBox: MusicBoxController;
+  spectateTargetId: string | null;
+  onSelectSpectateTarget: (targetId: string | null) => void;
 }
 
 export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
@@ -26,6 +28,8 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
   selfId,
   onCheatRenameShip,
   musicBox,
+  spectateTargetId,
+  onSelectSpectateTarget,
 }) => {
   const [draftNames, setDraftNames] = useState<Record<string, string>>({});
   const [batchName, setBatchName] = useState<string>('');
@@ -198,6 +202,122 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
               Full invulnerability against enemy fire, asteroid impacts, and the central Gravity Star.
             </p>
           </button>
+
+          {/* 5. Disconnect Ship / Free-Cam & Spectate Mode (Spans 2 columns) */}
+          <div
+            className={`sm:col-span-2 rounded-lg border p-4 transition-colors ${
+              cheats.freeCam
+                ? 'border-cyan-400 bg-cyan-950/25 text-white'
+                : 'border-slate-800 bg-[#060913] text-slate-300'
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2.5">
+                  <span className="font-display text-sm font-bold text-white">
+                    Disconnect Ship · Free-Cam &amp; Spectate Mode
+                  </span>
+                  <span
+                    className={`rounded px-2 py-0.5 font-mono-tabular text-[11px] font-bold ${
+                      cheats.freeCam
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                        : 'bg-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {cheats.freeCam
+                      ? spectateTargetId
+                        ? 'SPECTATING PLAYER'
+                        : 'FREE-CAM ACTIVE'
+                      : 'ATTACHED TO SHIP'}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                  Disconnects the camera from your ship so you can fly freely around the sector (<span className="font-mono-tabular text-slate-200">WASD / Arrows / Stick</span>, hold <span className="font-mono-tabular text-slate-200">Shift</span> to boost) or lock onto other players. <span className="text-cyan-300 font-medium">Other players can see your mouse cursor live on their screen!</span>
+                </p>
+              </div>
+
+              <button
+                onClick={() => {
+                  const nextActive = !cheats.freeCam;
+                  if (!nextActive) {
+                    onSelectSpectateTarget(null);
+                  }
+                  onUpdateCheats({
+                    ...cheats,
+                    freeCam: nextActive,
+                  });
+                }}
+                className={`rounded-lg px-4 py-2 text-xs font-bold transition-colors whitespace-nowrap shrink-0 ${
+                  cheats.freeCam
+                    ? 'bg-rose-600 text-white hover:bg-rose-500'
+                    : 'bg-cyan-500 text-slate-950 hover:bg-cyan-400'
+                }`}
+              >
+                {cheats.freeCam ? 'Reconnect to Ship' : 'Disconnect & Fly Camera'}
+              </button>
+            </div>
+
+            {/* Spectate Other Players / Free-Fly Selector */}
+            <div className="mt-3.5 border-t border-slate-800/80 pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                  Camera Mode &amp; Spectate Target (Press [ or ] in-game to cycle players)
+                </span>
+                <button
+                  onClick={() => {
+                    onSelectSpectateTarget(null);
+                    if (!cheats.freeCam) {
+                      onUpdateCheats({ ...cheats, freeCam: true });
+                    }
+                  }}
+                  className={`rounded-md border px-2.5 py-1 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                    cheats.freeCam && !spectateTargetId
+                      ? 'border-cyan-400 bg-cyan-500/20 text-cyan-300'
+                      : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-cyan-500/50 hover:text-white'
+                  }`}
+                >
+                  Free-Fly Camera (WASD / Stick)
+                </button>
+              </div>
+
+              {otherShips.length === 0 ? (
+                <div className="mt-2 text-xs text-slate-500">
+                  No other ships in sector yet. Spawn target ships below or wait for another player to join to spectate them.
+                </div>
+              ) : (
+                <div className="mt-2 flex max-h-28 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                  {otherShips.map((ship) => {
+                    const isSpectatingThis = cheats.freeCam && spectateTargetId === ship.id;
+                    return (
+                      <button
+                        key={ship.id}
+                        onClick={() => {
+                          onSelectSpectateTarget(ship.id);
+                          if (!cheats.freeCam) {
+                            onUpdateCheats({ ...cheats, freeCam: true });
+                          }
+                        }}
+                        className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-mono-tabular transition-colors ${
+                          isSpectatingThis
+                            ? 'border-cyan-400 bg-cyan-500/25 text-white font-bold'
+                            : 'border-slate-800 bg-[#0B1120] text-slate-300 hover:border-slate-600 hover:text-white'
+                        }`}
+                      >
+                        <span
+                          className="h-2 w-2 rounded-full shrink-0"
+                          style={{ backgroundColor: ship.color }}
+                        />
+                        <span className="truncate max-w-[110px]">{ship.name}</span>
+                        <span className="text-[10px] text-slate-400">
+                          {isSpectatingThis ? '● VIEWING' : 'Spectate'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* Instant Trigger Actions */}
@@ -384,14 +504,16 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
         {/* Footer */}
         <div className="mt-5 flex items-center justify-between border-t border-slate-800 pt-4">
           <button
-            onClick={() =>
+            onClick={() => {
+              onSelectSpectateTarget(null);
               onUpdateCheats({
                 homingMissiles: false,
                 rapidFire: false,
                 novaSpread: false,
                 godMode: false,
-              })
-            }
+                freeCam: false,
+              });
+            }}
             className="text-xs font-medium text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0"
           >
             Disable All Cheats

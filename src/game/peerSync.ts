@@ -71,6 +71,7 @@ export type PeerSyncPacket =
   | {
       type: 'peer:combat_hit';
       senderId: string;
+      hitId?: string;
       targetId: string;
       attackerId: string;
       x: number;
@@ -83,10 +84,18 @@ export type PeerSyncPacket =
       killEntry?: KillFeedEntry;
     };
 
+export function getSafeSunOrbitPoint(): { x: number; y: number } {
+  const theta = Math.random() * Math.PI * 2;
+  const orbitRadius = 2200 + Math.random() * 1600; // Well outside the 440-radius Sun
+  const x = (((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+  const y = (((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
 /**
  * Computes a co-located spawn point in SECTOR-01 so players opening multiple windows
- * always spawn right near existing human players (or at the shared Sector-01 Rendezvous point)
- * instead of thousands of units apart across the 10x star system.
+ * spawn near existing human players (if that player is safely outside the Sun),
+ * or in a safe orbit around the Sun.
  */
 export function getColocatedSpawnPoint(
   players: Iterable<PlayerState>,
@@ -94,21 +103,52 @@ export function getColocatedSpawnPoint(
 ): { x: number; y: number } {
   for (const p of players) {
     if (p.alive && !p.isDrone && p.id !== excludeId) {
-      const angleOffset = Math.random() * Math.PI * 2;
-      const dist = 160 + Math.random() * 140; // Right on the same screen!
-      const x = (((p.x + Math.cos(angleOffset) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-      const y = (((p.y + Math.sin(angleOffset) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-      return { x: Math.round(x), y: Math.round(y) };
+      const distFromSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
+      if (distFromSun > 1950) {
+        const angleOffset = Math.random() * Math.PI * 2;
+        const dist = 160 + Math.random() * 140;
+        const x = (((p.x + Math.cos(angleOffset) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+        const y = (((p.y + Math.sin(angleOffset) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+        if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > 1800) {
+          return { x: Math.round(x), y: Math.round(y) };
+        }
+      }
     }
   }
 
-  // Default Sector-01 Rendezvous Beacon (safe orbital zone to the right of the central Sun)
-  const angleOffset = (Math.random() - 0.5) * 0.12;
-  const radius = 2900 + (Math.random() - 0.5) * 180;
-  return {
-    x: Math.round(GRAVITY_STAR_X + Math.cos(angleOffset) * radius),
-    y: Math.round(GRAVITY_STAR_Y + Math.sin(angleOffset) * radius),
-  };
+  return getSafeSunOrbitPoint();
+}
+
+export function createInitialClientAsteroids(count: number = 24): AsteroidState[] {
+  const list: AsteroidState[] = [];
+  for (let i = 0; i < count; i++) {
+    const theta = (i / count) * Math.PI * 2 + (i % 3) * 0.4;
+    const dist = 2000 + ((i * 571) % 6200);
+    const x = (((GRAVITY_STAR_X + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+    const y = (((GRAVITY_STAR_Y + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+    const radius = 40 + ((i * 19) % 48);
+    const speed = 40 + ((i * 23) % 65);
+    const moveAngle = theta + Math.PI * 0.5;
+    const vertices: number[] = [];
+    for (let v = 0; v < 10; v++) {
+      vertices.push(0.8 + (((i + v) * 13) % 35) * 0.01);
+    }
+    const maxHp = Math.round(radius * 2.2);
+    list.push({
+      id: `ast_init_${i}`,
+      x: Math.round(x),
+      y: Math.round(y),
+      vx: Math.cos(moveAngle) * speed,
+      vy: Math.sin(moveAngle) * speed,
+      radius,
+      angle: (i * 0.7) % (Math.PI * 2),
+      vAngle: (i % 2 === 0 ? 1 : -1) * 0.45,
+      hp: maxHp,
+      maxHp,
+      vertices,
+    });
+  }
+  return list;
 }
 
 export function createTargetDronesBatch(
@@ -170,7 +210,7 @@ export function createTargetDronesBatch(
       peakSpeed: Math.round(initSpeed),
       alive: true,
       respawnTimer: 0,
-      invulnerableTimer: 0.4,
+      invulnerableTimer: 0,
       lastFireTime: 0,
       inputSource: 'keyboard',
       isDrone: true,
@@ -191,6 +231,11 @@ export class PeerSectorSync {
   private peerLastSeen = new Map<string, number>();
   private onPacket: (packet: PeerSyncPacket) => void;
   private pollTimer: number | null = null;
+  private pendingCloudEvents: PeerSyncPacket[] = [];
+  private lastCloudSeq = 0;
+  private seenSalvos = new Set<string>();
+  private seenHits = new Set<string>();
+  private isPolling = false;
 
   constructor(selfId: string, onPacket: (packet: PeerSyncPacket) => void) {
     this.selfId = selfId;
@@ -201,13 +246,46 @@ export class PeerSectorSync {
         this.channel = new BroadcastChannel('vector_spacewar_sector_01_sync');
         this.channel.onmessage = (ev) => {
           const pkt = ev.data as PeerSyncPacket;
-          if (!pkt || pkt.senderId === this.selfId) return;
-          this.peerLastSeen.set(pkt.senderId, Date.now());
-          this.onPacket(pkt);
+          this.handleIncomingPacket(pkt);
         };
       } catch {
         // Ignore if BroadcastChannel is blocked
       }
+    }
+  }
+
+  private handleIncomingPacket(pkt: PeerSyncPacket) {
+    if (!pkt || pkt.senderId === this.selfId) return;
+    this.peerLastSeen.set(pkt.senderId, Date.now());
+
+    if (pkt.type === 'peer:salvo') {
+      if (this.seenSalvos.has(pkt.salvo.idPrefix)) return;
+      this.seenSalvos.add(pkt.salvo.idPrefix);
+      if (this.seenSalvos.size > 600) {
+        const first = this.seenSalvos.values().next().value;
+        if (first) this.seenSalvos.delete(first);
+      }
+    } else if (pkt.type === 'peer:combat_hit' && pkt.hitId) {
+      if (this.seenHits.has(pkt.hitId)) return;
+      this.seenHits.add(pkt.hitId);
+      if (this.seenHits.size > 600) {
+        const first = this.seenHits.values().next().value;
+        if (first) this.seenHits.delete(first);
+      }
+    }
+
+    this.onPacket(pkt);
+  }
+
+  public hasSeenHit(hitId: string): boolean {
+    return this.seenHits.has(hitId);
+  }
+
+  public markHitSeen(hitId: string) {
+    this.seenHits.add(hitId);
+    if (this.seenHits.size > 600) {
+      const first = this.seenHits.values().next().value;
+      if (first) this.seenHits.delete(first);
     }
   }
 
@@ -220,11 +298,31 @@ export class PeerSectorSync {
   }
 
   public send(packet: PeerSyncPacket) {
+    if (packet.type === 'peer:salvo') {
+      this.seenSalvos.add(packet.salvo.idPrefix);
+    } else if (packet.type === 'peer:combat_hit' && packet.hitId) {
+      this.seenHits.add(packet.hitId);
+    }
+
     if (this.channel) {
       try {
         this.channel.postMessage(packet);
       } catch {
         // Ignore channel errors
+      }
+    }
+
+    // Queue discrete gameplay events (salvos, hits, drones, renames) for the /api/sector cloud relay
+    if (
+      packet.type === 'peer:salvo' ||
+      packet.type === 'peer:combat_hit' ||
+      packet.type === 'peer:cheat_action' ||
+      packet.type === 'peer:rename' ||
+      packet.type === 'peer:cheat_rename'
+    ) {
+      this.pendingCloudEvents.push(packet);
+      if (this.pendingCloudEvents.length > 80) {
+        this.pendingCloudEvents.shift();
       }
     }
   }
@@ -236,7 +334,7 @@ export class PeerSectorSync {
   public isLeader(players: Map<string, PlayerState>): boolean {
     const now = Date.now();
     for (const [peerId, lastTime] of this.peerLastSeen.entries()) {
-      if (now - lastTime > 4000) {
+      if (now - lastTime > 5000) {
         this.peerLastSeen.delete(peerId);
         const stale = players.get(peerId);
         if (stale && !stale.isDrone) {
@@ -261,19 +359,31 @@ export class PeerSectorSync {
   ) {
     if (this.pollTimer) window.clearInterval(this.pollTimer);
     this.pollTimer = window.setInterval(async () => {
-      if (isWsConnected()) return;
+      if (isWsConnected() || this.isPolling) return;
       const localPlayer = getLocalPlayer();
-      if (!localPlayer) return;
+      const eventsToSend = this.pendingCloudEvents.splice(0, this.pendingCloudEvents.length);
+      if (!localPlayer && eventsToSend.length === 0) return;
+
+      this.isPolling = true;
       try {
         const res = await fetch('/api/sector', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             player: localPlayer,
+            sinceSeq: this.lastCloudSeq,
+            events: eventsToSend,
           }),
         });
         if (res.ok) {
-          const data = (await res.json()) as { players?: PlayerState[] };
+          const data = (await res.json()) as {
+            latestSeq?: number;
+            players?: PlayerState[];
+            events?: PeerSyncPacket[];
+          };
+          if (typeof data.latestSeq === 'number' && data.latestSeq > this.lastCloudSeq) {
+            this.lastCloudSeq = data.latestSeq;
+          }
           if (Array.isArray(data.players)) {
             for (const remote of data.players) {
               if (remote.id !== this.selfId) {
@@ -286,11 +396,18 @@ export class PeerSectorSync {
               }
             }
           }
+          if (Array.isArray(data.events)) {
+            for (const pkt of data.events) {
+              this.handleIncomingPacket(pkt);
+            }
+          }
         }
       } catch {
         // Ignore if /api/sector is unavailable
+      } finally {
+        this.isPolling = false;
       }
-    }, 250);
+    }, 120);
   }
 
   public destroy(localPlayerId: string) {

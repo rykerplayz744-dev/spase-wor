@@ -135,27 +135,43 @@ function getOrCreateRoom(_roomId?: string): RoomState {
 }
 
 function getSafeSpawnPoint(room: RoomState, excludeId?: string): { x: number; y: number } {
-  // 1. If another human player is alive in SECTOR-01, spawn right near them on the same screen!
+  // 1. If another human player is alive and safely outside the Sun's deep gravity well, spawn near them!
   for (const p of room.players.values()) {
     if (p.alive && !p.isDrone && p.id !== excludeId) {
-      for (let attempt = 0; attempt < 12; attempt++) {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 160 + Math.random() * 140;
-        const x = wrapCoord(p.x + Math.cos(angle) * dist, ARENA_WIDTH);
-        const y = wrapCoord(p.y + Math.sin(angle) * dist, ARENA_HEIGHT);
-        if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > GRAVITY_STAR_RADIUS + 140) {
-          return { x: Math.round(x), y: Math.round(y) };
+      const distFromSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
+      if (distFromSun > GRAVITY_STAR_RADIUS + 1500) {
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const angle = Math.random() * Math.PI * 2;
+          const dist = 160 + Math.random() * 140;
+          const x = wrapCoord(p.x + Math.cos(angle) * dist, ARENA_WIDTH);
+          const y = wrapCoord(p.y + Math.sin(angle) * dist, ARENA_HEIGHT);
+          if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > GRAVITY_STAR_RADIUS + 1400) {
+            return { x: Math.round(x), y: Math.round(y) };
+          }
         }
       }
     }
   }
 
-  // 2. Otherwise spawn at the shared SECTOR-01 Rendezvous Zone so all windows start in the same area
-  const angleOffset = (Math.random() - 0.5) * 0.12;
-  const radius = 2900 + (Math.random() - 0.5) * 180;
+  // 2. Otherwise teleport to a safe orbit around the Sun (2,200 - 3,800 units out, never inside the Sun!)
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const theta = Math.random() * Math.PI * 2;
+    const orbitRadius = GRAVITY_STAR_RADIUS + 1800 + Math.random() * 1600;
+    const x = wrapCoord(GRAVITY_STAR_X + Math.cos(theta) * orbitRadius, ARENA_WIDTH);
+    const y = wrapCoord(GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius, ARENA_HEIGHT);
+    let safe = true;
+    for (const planet of room.planets) {
+      if (Math.hypot(planet.x - x, planet.y - y) < planet.radius + 160) {
+        safe = false;
+        break;
+      }
+    }
+    if (safe) return { x: Math.round(x), y: Math.round(y) };
+  }
+
   return {
-    x: Math.round(wrapCoord(GRAVITY_STAR_X + Math.cos(angleOffset) * radius, ARENA_WIDTH)),
-    y: Math.round(wrapCoord(GRAVITY_STAR_Y + Math.sin(angleOffset) * radius, ARENA_HEIGHT)),
+    x: Math.round(wrapCoord(GRAVITY_STAR_X + 2900, ARENA_WIDTH)),
+    y: Math.round(wrapCoord(GRAVITY_STAR_Y, ARENA_HEIGHT)),
   };
 }
 
@@ -515,6 +531,7 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       const dist = Math.sqrt(distSq);
 
       if (dist < GRAVITY_STAR_RADIUS + spec.radius - 4) {
+        const safePt = getSafeSpawnPoint(room, player.id);
         if (player.invulnerableTimer <= 0 && !player.cheats?.godMode) {
           const speed = Math.hypot(player.vx, player.vy);
           broadcastRoom(room, {
@@ -530,7 +547,19 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
             color: '#F59E0B',
           });
           recordKill(room, null, player, 'star', speed);
+          // Immediately place player at safe orbit around the Sun so they respawn outside the Sun
+          player.x = safePt.x;
+          player.y = safePt.y;
+          player.vx = 0;
+          player.vy = 0;
           continue;
+        } else {
+          // If invulnerable or in God Mode, teleport out around the Sun so they never get stuck inside it
+          player.x = safePt.x;
+          player.y = safePt.y;
+          player.vx = 0;
+          player.vy = 0;
+          player.invulnerableTimer = 2.0;
         }
       } else if (dist < 9500 && dist > 100) {
         const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
@@ -1014,26 +1043,79 @@ async function startServer() {
           return;
         }
 
-        const roomId = socketToRoom.get(ws);
-        if (!roomId) return;
-        const room = rooms.get(roomId);
-        if (!room) return;
+        let roomId = socketToRoom.get(ws);
+        if (!roomId) {
+          roomId = 'SECTOR-01';
+          const defaultRoom = getOrCreateRoom(roomId);
+          socketToRoom.set(ws, defaultRoom.id);
+          defaultRoom.clients.add(ws);
+        }
+        const room = getOrCreateRoom(roomId);
 
         if (msg.type === 'player:input') {
-          const ownedIds = socketToPlayerIds.get(ws);
-          if (!ownedIds || !ownedIds.has(msg.playerId)) return;
-          const player = room.players.get(msg.playerId);
-          if (!player) return;
+          let ownedIds = socketToPlayerIds.get(ws);
+          if (!ownedIds) {
+            ownedIds = new Set();
+            socketToPlayerIds.set(ws, ownedIds);
+          }
+          let player = room.players.get(msg.playerId);
+          if (!player && msg.playerId) {
+            ownedIds.add(msg.playerId);
+            const spawn = getSafeSpawnPoint(room);
+            const spec = HULL_SPECS.needle;
+            player = {
+              id: msg.playerId,
+              name: 'PILOT',
+              color: PLAYER_COLORS[room.colorIndex++ % PLAYER_COLORS.length],
+              hull: 'needle',
+              x: typeof msg.x === 'number' && Number.isFinite(msg.x) ? wrapCoord(msg.x, ARENA_WIDTH) : spawn.x,
+              y: typeof msg.y === 'number' && Number.isFinite(msg.y) ? wrapCoord(msg.y, ARENA_HEIGHT) : spawn.y,
+              vx: typeof msg.vx === 'number' && Number.isFinite(msg.vx) ? msg.vx : 0,
+              vy: typeof msg.vy === 'number' && Number.isFinite(msg.vy) ? msg.vy : 0,
+              angle: Number.isFinite(msg.angle) ? msg.angle : -Math.PI / 2,
+              thrusting: Boolean(msg.thrusting),
+              shooting: Boolean(msg.shooting),
+              hp: spec.maxHp,
+              maxHp: spec.maxHp,
+              score: 0,
+              kills: 0,
+              deaths: 0,
+              streak: 0,
+              peakSpeed: 0,
+              alive: true,
+              respawnTimer: 0,
+              invulnerableTimer: 1.5,
+              lastFireTime: 0,
+              inputSource: msg.inputSource || 'keyboard',
+              cheats: { ...DEFAULT_PLAYER_CHEATS },
+            };
+            room.players.set(msg.playerId, player);
+            broadcastRoom(room, { type: 'player:joined', player }, ws);
+          }
+          if (!player || !ownedIds.has(msg.playerId)) return;
 
           if (Number.isFinite(msg.angle)) {
             player.angle = msg.angle;
           }
-          player.thrusting = Boolean(msg.thrusting);
-          player.shooting = Boolean(msg.shooting);
+          player.spectating = Boolean(msg.spectating);
+          player.spectateTargetId = msg.spectateTargetId ?? null;
+          if (
+            typeof msg.cursorX === 'number' &&
+            typeof msg.cursorY === 'number' &&
+            Number.isFinite(msg.cursorX) &&
+            Number.isFinite(msg.cursorY)
+          ) {
+            player.cursorX = wrapCoord(msg.cursorX, ARENA_WIDTH);
+            player.cursorY = wrapCoord(msg.cursorY, ARENA_HEIGHT);
+          }
+
+          player.thrusting = player.spectating ? false : Boolean(msg.thrusting);
+          player.shooting = player.spectating ? false : Boolean(msg.shooting);
           player.inputSource = msg.inputSource;
 
           if (
             player.alive &&
+            player.invulnerableTimer <= 1.6 &&
             typeof msg.x === 'number' &&
             typeof msg.y === 'number' &&
             typeof msg.vx === 'number' &&
@@ -1043,17 +1125,20 @@ async function startServer() {
             Number.isFinite(msg.vx) &&
             Number.isFinite(msg.vy)
           ) {
-            player.x = wrapCoord(msg.x, ARENA_WIDTH);
-            player.y = wrapCoord(msg.y, ARENA_HEIGHT);
-            player.vx = msg.vx;
-            player.vy = msg.vy;
-            const spd = Math.hypot(player.vx, player.vy);
-            if (spd > player.peakSpeed) {
-              player.peakSpeed = Math.round(spd);
+            const clientDistToSun = Math.hypot(msg.x - GRAVITY_STAR_X, msg.y - GRAVITY_STAR_Y);
+            if (!room.gravityStarEnabled || clientDistToSun >= GRAVITY_STAR_RADIUS) {
+              player.x = wrapCoord(msg.x, ARENA_WIDTH);
+              player.y = wrapCoord(msg.y, ARENA_HEIGHT);
+              player.vx = msg.vx;
+              player.vy = msg.vy;
+              const spd = Math.hypot(player.vx, player.vy);
+              if (spd > player.peakSpeed) {
+                player.peakSpeed = Math.round(spd);
+              }
             }
           }
 
-          if (msg.warpRequested && player.alive) {
+          if (msg.warpRequested && player.alive && !player.spectating) {
             const pt = getRandomWarpPoint(room);
             player.x = pt.x;
             player.y = pt.y;
@@ -1075,7 +1160,9 @@ async function startServer() {
             rapidFire: Boolean(msg.cheats.rapidFire),
             novaSpread: Boolean(msg.cheats.novaSpread),
             godMode: Boolean(msg.cheats.godMode),
+            freeCam: Boolean(msg.cheats.freeCam),
           };
+          player.spectating = Boolean(msg.cheats.freeCam);
           return;
         }
 

@@ -11,11 +11,17 @@ import {
   loadControllerMapping,
 } from './game/input.ts';
 import {
+  createInitialClientAsteroids,
   createTargetDronesBatch,
   getColocatedSpawnPoint,
+  getSafeSunOrbitPoint,
   PeerSectorSync,
 } from './game/peerSync.ts';
-import { SpacewarRenderer } from './game/renderer.ts';
+import {
+  shortestToroidalDelta,
+  SpacewarRenderer,
+  wrapCoord,
+} from './game/renderer.ts';
 import { soundEngine } from './game/sound.ts';
 import {
   ARENA_HEIGHT,
@@ -26,6 +32,7 @@ import {
   ClientToServerMessage,
   DEFAULT_PLAYER_CHEATS,
   expandSalvoToBullets,
+  GRAVITY_STAR_RADIUS,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
   HULL_SPECS,
@@ -85,6 +92,7 @@ export default function App() {
   const [ownNameDraft, setOwnNameDraft] = useState<string>('');
   const [autoFire, setAutoFire] = useState<boolean>(false);
   const [cheats, setCheats] = useState<PlayerCheats>({ ...DEFAULT_PLAYER_CHEATS });
+  const [spectateTargetId, setSpectateTargetId] = useState<string | null>(null);
   const musicBox = useMusicBoxController();
   const [mapping, setMapping] = useState<ControllerMapping>(() => loadControllerMapping());
   const [copiedInvite, setCopiedInvite] = useState<boolean>(false);
@@ -121,10 +129,24 @@ export default function App() {
   const rendererRef = useRef<SpacewarRenderer | null>(null);
   const shellStateRef = useRef<GameShellState>(shellState);
   shellStateRef.current = shellState;
+  const pilotNameRef = useRef<string>(pilotName);
+  pilotNameRef.current = pilotName;
+  const selectedHullRef = useRef<ShipHullType>(selectedHull);
+  selectedHullRef.current = selectedHull;
+  const selectedColorRef = useRef<string>(selectedColor);
+  selectedColorRef.current = selectedColor;
   const cheatsRef = useRef<PlayerCheats>(cheats);
   cheatsRef.current = cheats;
+  const spectateTargetIdRef = useRef<string | null>(spectateTargetId);
+  spectateTargetIdRef.current = spectateTargetId;
+  const freeCamPosRef = useRef<{ x: number; y: number; initialized: boolean }>({
+    x: GRAVITY_STAR_X,
+    y: GRAVITY_STAR_Y,
+    initialized: false,
+  });
   const autoFireRef = useRef<boolean>(autoFire);
   autoFireRef.current = autoFire;
+  const lastDamagedRemoteAtRef = useRef<Map<string, number>>(new Map());
 
   const selfIdRef = useRef<string>(`plr_${Math.random().toString(36).slice(2, 9)}`);
   const coopIdRef = useRef<string>(`plr2_${Math.random().toString(36).slice(2, 9)}`);
@@ -141,7 +163,7 @@ export default function App() {
   }>({
     players: new Map(),
     bullets: [],
-    asteroids: [],
+    asteroids: createInitialClientAsteroids(24),
     planets: INITIAL_PLANETS.map((p) => ({
       ...p,
       x: GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius,
@@ -181,9 +203,9 @@ export default function App() {
               type: 'player:join',
               roomId,
               playerId: selfIdRef.current,
-              name: pilotName,
-              hull: selectedHull,
-              color: selectedColor,
+              name: pilotNameRef.current.trim().slice(0, 16) || 'PILOT',
+              hull: selectedHullRef.current,
+              color: selectedColorRef.current,
               inputSource: 'keyboard',
             } satisfies ClientToServerMessage)
           );
@@ -257,7 +279,16 @@ export default function App() {
                 existing.respawnTimer = serverPlayer.respawnTimer;
                 existing.invulnerableTimer = serverPlayer.invulnerableTimer;
 
-                if (!wasAlive && serverPlayer.alive) {
+                const distToSun = Math.hypot(
+                  existing.x - GRAVITY_STAR_X,
+                  existing.y - GRAVITY_STAR_Y
+                );
+                if (
+                  !serverPlayer.alive ||
+                  (!wasAlive && serverPlayer.alive) ||
+                  serverPlayer.invulnerableTimer > 1.6 ||
+                  distToSun < GRAVITY_STAR_RADIUS + 20
+                ) {
                   existing.x = serverPlayer.x;
                   existing.y = serverPlayer.y;
                   existing.vx = serverPlayer.vx;
@@ -372,11 +403,14 @@ export default function App() {
       if (pingInterval) clearInterval(pingInterval);
       wsRef.current?.close();
     };
-  }, [pilotName, roomId, selectedColor, selectedHull, sendWs]);
+  }, [roomId, sendWs]);
 
   // Multi-Window & Vercel Serverless Peer Sync (ensures multiple windows share SECTOR-01 even without /ws)
   useEffect(() => {
     const peerSync = new PeerSectorSync(selfIdRef.current, (pkt) => {
+      // When the authoritative WebSocket server is connected, ignore peer fallback packets so they don't overwrite server state
+      if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
       const world = worldRef.current;
 
       if (pkt.type === 'peer:hello') {
@@ -414,7 +448,28 @@ export default function App() {
 
       if (pkt.type === 'peer:player_state') {
         if (pkt.player.id !== selfIdRef.current) {
-          world.players.set(pkt.player.id, pkt.player);
+          const existing = world.players.get(pkt.player.id);
+          const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
+          const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
+
+          if (existing && recentlyDamagedLocally) {
+            // Preserve local combat damage / kill state against stale in-flight poll packets
+            const merged: PlayerState = {
+              ...pkt.player,
+              hp: Math.min(existing.hp, pkt.player.hp),
+              alive: existing.alive ? pkt.player.alive : false,
+              deaths: Math.max(existing.deaths, pkt.player.deaths),
+              respawnTimer: !existing.alive ? existing.respawnTimer : pkt.player.respawnTimer,
+              lastFireTime: existing.lastFireTime,
+            };
+            world.players.set(pkt.player.id, merged);
+          } else {
+            const prevFireTime = existing?.lastFireTime ?? 0;
+            world.players.set(pkt.player.id, {
+              ...pkt.player,
+              lastFireTime: Math.max(prevFireTime, pkt.player.lastFireTime || 0),
+            });
+          }
         }
         if (pkt.drones) {
           for (const d of pkt.drones) {
@@ -432,6 +487,10 @@ export default function App() {
       }
 
       if (pkt.type === 'peer:salvo') {
+        const owner = world.players.get(pkt.salvo.ownerId);
+        if (owner) {
+          owner.lastFireTime = performance.now() / 1000;
+        }
         const spawned = expandSalvoToBullets(pkt.salvo);
         world.bullets.push(...spawned);
         if (world.bullets.length > 1800) {
@@ -491,11 +550,19 @@ export default function App() {
           }
           target.vx = pkt.vx;
           target.vy = pkt.vy;
-          if (pkt.fatal && !target.cheats?.godMode) {
+          const isFatal = (pkt.fatal || target.hp <= 0) && !target.cheats?.godMode;
+          if (isFatal) {
             target.alive = false;
             target.hp = 0;
             target.deaths += 1;
+            target.streak = 0;
             target.respawnTimer = 2.8;
+            const attacker = world.players.get(pkt.attackerId);
+            if (attacker && attacker.id !== target.id) {
+              attacker.kills += 1;
+              attacker.streak += 1;
+              attacker.score += 150;
+            }
           }
         }
         const renderer = rendererRef.current;
@@ -575,8 +642,13 @@ export default function App() {
       cheats: cheatsRef.current,
     };
 
+    shellStateRef.current = 'PLAYING';
+    setShellState('PLAYING');
+
     worldRef.current.players.set(selfIdRef.current, localPlayerObj);
-    peerSyncRef.current?.announceJoin(localPlayerObj);
+    if (wsRef.current?.readyState !== WebSocket.OPEN) {
+      peerSyncRef.current?.announceJoin(localPlayerObj);
+    }
 
     sendWs({
       type: 'player:join',
@@ -593,8 +665,6 @@ export default function App() {
       playerId: selfIdRef.current,
       cheats: cheatsRef.current,
     });
-
-    setShellState('PLAYING');
   }, [pilotName, roomId, selectedColor, selectedHull, sendWs]);
 
   const handleUpdateCheats = useCallback(
@@ -604,6 +674,20 @@ export default function App() {
       const localPlayer = worldRef.current.players.get(selfIdRef.current);
       if (localPlayer) {
         localPlayer.cheats = nextCheats;
+        localPlayer.spectating = Boolean(nextCheats.freeCam);
+        if (!nextCheats.freeCam) {
+          localPlayer.spectateTargetId = null;
+        }
+      }
+      if (!nextCheats.freeCam) {
+        freeCamPosRef.current.initialized = false;
+      } else if (!freeCamPosRef.current.initialized) {
+        const cam = rendererRef.current?.getCameraPosition();
+        freeCamPosRef.current = {
+          x: cam ? cam.x : localPlayer ? localPlayer.x : GRAVITY_STAR_X,
+          y: cam ? cam.y : localPlayer ? localPlayer.y : GRAVITY_STAR_Y,
+          initialized: true,
+        };
       }
       sendWs({
         type: 'player:cheats',
@@ -612,6 +696,45 @@ export default function App() {
       });
     },
     [sendWs]
+  );
+
+  const handleSelectSpectateTarget = useCallback((targetId: string | null) => {
+    setSpectateTargetId(targetId);
+    spectateTargetIdRef.current = targetId;
+    if (targetId === null) {
+      const cam = rendererRef.current?.getCameraPosition();
+      if (cam) {
+        freeCamPosRef.current = { x: cam.x, y: cam.y, initialized: true };
+      }
+    }
+  }, []);
+
+  const handleCycleSpectateTarget = useCallback(
+    (dir: -1 | 1) => {
+      const otherPlayers = Array.from(worldRef.current.players.values()).filter(
+        (p) => p.id !== selfIdRef.current
+      );
+      if (otherPlayers.length === 0) {
+        handleSelectSpectateTarget(null);
+        return;
+      }
+      const currentId = spectateTargetIdRef.current;
+      const idx = otherPlayers.findIndex((p) => p.id === currentId);
+      const nextIdx =
+        idx === -1
+          ? dir > 0
+            ? 0
+            : otherPlayers.length - 1
+          : (idx + dir + otherPlayers.length) % otherPlayers.length;
+      const chosen = otherPlayers[nextIdx];
+      if (chosen) {
+        handleSelectSpectateTarget(chosen.id);
+        if (!cheatsRef.current.freeCam) {
+          handleUpdateCheats({ ...cheatsRef.current, freeCam: true });
+        }
+      }
+    },
+    [handleSelectSpectateTarget, handleUpdateCheats]
   );
 
   const handleTriggerCheatAction = useCallback(
@@ -884,8 +1007,13 @@ export default function App() {
       }
 
       // Press M during gameplay to fire an Homing Missile Swarm
-      if (!isTitle && sampled.missileSwarmJustPressed) {
+      if (!isTitle && sampled.missileSwarmJustPressed && !cheatsRef.current.freeCam) {
         handleTriggerCheatAction('missile_swarm');
+      }
+
+      // Press [ or ] to cycle spectated players (also activates Free-Cam / Spectator mode)
+      if (!isTitle && (sampled.spectatePrevJustPressed || sampled.spectateNextJustPressed)) {
+        handleCycleSpectateTarget(sampled.spectateNextJustPressed ? 1 : -1);
       }
 
       if (isTitle && sampled.startJustPressed && !controllerModalOpen && !cheatMenuOpen) {
@@ -897,13 +1025,69 @@ export default function App() {
       // Step client-side planetary orbits smoothly at 60fps
       renderer.stepClientPlanets(world.planets, dt);
 
+      const isFreeCam = Boolean(cheatsRef.current.freeCam);
+
       if (renderer.hitstopTimer > 0) {
         renderer.hitstopTimer = Math.max(0, renderer.hitstopTimer - dt);
       } else if (!isTitle && !isPaused && localPlayer) {
-        localPlayer.angle = sampled.angle;
-        localPlayer.thrusting = sampled.thrusting && localPlayer.alive;
-        localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
-        localPlayer.inputSource = sampled.inputSource;
+        if (isFreeCam) {
+          // Detached Camera / Spectator Mode:
+          // Ship controls are disconnected from your ship while you fly the camera or spectate!
+          localPlayer.thrusting = false;
+          localPlayer.shooting = false;
+          localPlayer.spectating = true;
+          localPlayer.inputSource = sampled.inputSource;
+
+          if (!freeCamPosRef.current.initialized) {
+            const cam = renderer.getCameraPosition();
+            freeCamPosRef.current = {
+              x: cam.x || localPlayer.x,
+              y: cam.y || localPlayer.y,
+              initialized: true,
+            };
+          }
+
+          // If spectating a player that left or if user pushes WASD/Arrows/Stick to manually fly off:
+          const currentTargetId = spectateTargetIdRef.current;
+          const targetExists = currentTargetId ? world.players.has(currentTargetId) : false;
+          const manualPanActive =
+            Math.abs(sampled.panVector.x) > 0.05 || Math.abs(sampled.panVector.y) > 0.05;
+
+          if (currentTargetId && !targetExists) {
+            spectateTargetIdRef.current = null;
+            setSpectateTargetId(null);
+          } else if (currentTargetId && manualPanActive) {
+            // Smoothly detach from spectated ship into free-fly camera when moving WASD/Arrows/Stick
+            const cam = renderer.getCameraPosition();
+            freeCamPosRef.current = { x: cam.x, y: cam.y, initialized: true };
+            spectateTargetIdRef.current = null;
+            setSpectateTargetId(null);
+          }
+
+          if (!spectateTargetIdRef.current) {
+            const camSpeed = sampled.boostHeld ? 3600 : 1450;
+            freeCamPosRef.current.x = wrapCoord(
+              freeCamPosRef.current.x + sampled.panVector.x * camSpeed * dt,
+              ARENA_WIDTH
+            );
+            freeCamPosRef.current.y = wrapCoord(
+              freeCamPosRef.current.y + sampled.panVector.y * camSpeed * dt,
+              ARENA_HEIGHT
+            );
+          }
+
+          localPlayer.spectateTargetId = spectateTargetIdRef.current;
+        } else {
+          if (freeCamPosRef.current.initialized) {
+            freeCamPosRef.current.initialized = false;
+          }
+          localPlayer.spectating = false;
+          localPlayer.spectateTargetId = null;
+          localPlayer.angle = sampled.angle;
+          localPlayer.thrusting = sampled.thrusting && localPlayer.alive;
+          localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
+          localPlayer.inputSource = sampled.inputSource;
+        }
 
         renderer.stepLocalPlayerPhysics(
           localPlayer,
@@ -912,26 +1096,175 @@ export default function App() {
           world.planets
         );
 
-        // If running on static Vercel without WebSocket backend, step drones & local weapon salvos
+        // Prevent getting stuck inside the giant Sun's gravity well:
+        // touching the Sun immediately teleports/respawns the ship to a safe orbit around the Sun.
+        if (world.gravityStarEnabled && localPlayer.alive) {
+          const hullRadius = (HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle).radius;
+          const distToSun = Math.hypot(
+            localPlayer.x - GRAVITY_STAR_X,
+            localPlayer.y - GRAVITY_STAR_Y
+          );
+          if (distToSun < GRAVITY_STAR_RADIUS + hullRadius - 4) {
+            renderer.addBurst(
+              localPlayer.x,
+              localPlayer.y,
+              0,
+              0,
+              '#F59E0B',
+              32,
+              300,
+              true
+            );
+            soundEngine.playHit(true);
+            const safeOrbit = getSafeSunOrbitPoint();
+            localPlayer.x = safeOrbit.x;
+            localPlayer.y = safeOrbit.y;
+            localPlayer.vx = 0;
+            localPlayer.vy = 0;
+            localPlayer.invulnerableTimer = 2.0;
+            if (!isWsConnected && !localPlayer.cheats?.godMode) {
+              localPlayer.deaths += 1;
+              localPlayer.streak = 0;
+              localPlayer.hp = localPlayer.maxHp;
+              const killEntry: KillFeedEntry = {
+                id: `kill_sun_${Date.now().toString(36)}`,
+                killerId: 'STAR',
+                killerName: 'GRAVITY STAR',
+                killerColor: '#F59E0B',
+                victimId: localPlayer.id,
+                victimName: localPlayer.name,
+                victimColor: localPlayer.color,
+                cause: 'star',
+                speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
+                timestamp: Date.now(),
+              };
+              world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+            }
+            renderer.addBurst(
+              localPlayer.x,
+              localPlayer.y,
+              0,
+              0,
+              '#38BDF8',
+              24,
+              240,
+              false
+            );
+          }
+        }
+
+        // If running on static Vercel / Peer mode without WebSocket backend, step respawn, remote players, drones, & asteroids
         if (!isWsConnected) {
+          if (!localPlayer.alive) {
+            localPlayer.respawnTimer = Math.max(0, localPlayer.respawnTimer - dt);
+            if (localPlayer.respawnTimer <= 0) {
+              const spawnPt = getColocatedSpawnPoint(world.players.values(), localPlayer.id);
+              const spec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
+              localPlayer.x = spawnPt.x;
+              localPlayer.y = spawnPt.y;
+              localPlayer.vx = 0;
+              localPlayer.vy = 0;
+              localPlayer.hp = spec.maxHp;
+              localPlayer.maxHp = spec.maxHp;
+              localPlayer.alive = true;
+              localPlayer.invulnerableTimer = 2.0;
+            }
+          }
+
+          if (world.asteroids.length < 12) {
+            const extra = createInitialClientAsteroids(4);
+            for (const ast of extra) {
+              ast.id = `ast_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+              world.asteroids.push(ast);
+            }
+          }
+          for (const ast of world.asteroids) {
+            ast.x = wrapCoord(ast.x + ast.vx * dt, ARENA_WIDTH);
+            ast.y = wrapCoord(ast.y + ast.vy * dt, ARENA_HEIGHT);
+            ast.angle += ast.vAngle * dt;
+          }
+
           for (const p of world.players.values()) {
-            if (!p.isDrone) continue;
+            if (p.id === selfIdRef.current) continue;
+
             if (!p.alive) {
-              p.respawnTimer -= dt;
-              if (p.respawnTimer <= 0) {
+              p.respawnTimer = Math.max(0, p.respawnTimer - dt);
+              if (p.respawnTimer <= 0 && p.isDrone) {
+                const safePt = getSafeSunOrbitPoint();
+                p.x = safePt.x;
+                p.y = safePt.y;
                 p.alive = true;
                 p.hp = p.maxHp;
+                p.invulnerableTimer = 0.5;
               }
               continue;
             }
-            const dxStar = p.x - GRAVITY_STAR_X;
-            const dyStar = p.y - GRAVITY_STAR_Y;
-            const distStar = Math.hypot(dxStar, dyStar);
-            const orbitAngle =
-              Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
-            p.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
-            p.x = (((p.x + p.vx * dt) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-            p.y = (((p.y + p.vy * dt) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+
+            if (p.cheats?.godMode) {
+              p.hp = p.maxHp;
+              p.invulnerableTimer = 0.25;
+            } else if (p.invulnerableTimer > 0) {
+              p.invulnerableTimer = Math.max(0, p.invulnerableTimer - dt);
+            }
+
+            if (p.isDrone) {
+              const dxStar = p.x - GRAVITY_STAR_X;
+              const dyStar = p.y - GRAVITY_STAR_Y;
+              const distStar = Math.hypot(dxStar, dyStar);
+              const orbitAngle =
+                Math.atan2(dyStar, dxStar) + Math.PI * 0.58 + Math.sin(nowSec * 1.4) * 0.35;
+              p.angle = distStar < 1100 ? Math.atan2(-dyStar, -dxStar) : orbitAngle;
+            } else if (p.shooting) {
+              // Ensure remote player shooting is always visible even between /api/sector HTTP polls
+              const rSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
+              const rCheats = p.cheats || DEFAULT_PLAYER_CHEATS;
+              const rCooldown = rCheats.novaSpread || rCheats.rapidFire ? 0.08 : rSpec.fireCooldown;
+              if (nowSec - (p.lastFireTime || 0) >= rCooldown * 1.25) {
+                p.lastFireTime = nowSec;
+                const count = rCheats.novaSpread ? 360 : rSpec.spreadCount;
+                const targetIds: string[] = [];
+                if (rCheats.homingMissiles) {
+                  for (const tp of world.players.values()) {
+                    if (tp.alive && tp.id !== p.id) targetIds.push(tp.id);
+                  }
+                }
+                const remoteSalvo = {
+                  idPrefix: `rem_${p.id}_${Date.now().toString(36)}`,
+                  ownerId: p.id,
+                  ownerName: p.name,
+                  color: rCheats.homingMissiles ? '#F43F5E' : p.color,
+                  x: p.x,
+                  y: p.y,
+                  vx: p.vx,
+                  vy: p.vy,
+                  angle: p.angle,
+                  noseDist: rSpec.radius + 10,
+                  count,
+                  spreadAngle: rSpec.spreadAngle,
+                  novaSpread: Boolean(rCheats.novaSpread),
+                  baseMuzzle: rCheats.homingMissiles ? 860 : rSpec.bulletSpeed,
+                  damage: rCheats.homingMissiles ? (rCheats.novaSpread ? 26 : 38) : rSpec.bulletDamage,
+                  ttl: rCheats.homingMissiles ? 4.0 : 2.6,
+                  isMissile: Boolean(rCheats.homingMissiles),
+                  targetIds,
+                };
+                world.bullets.push(...expandSalvoToBullets(remoteSalvo));
+                if (world.bullets.length > 1800) {
+                  world.bullets.splice(0, world.bullets.length - 1800);
+                }
+              }
+            }
+
+            p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
+            p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
+          }
+        } else {
+          // Even in WebSocket mode, smoothly interpolate remote player positions between 30Hz snapshots
+          for (const p of world.players.values()) {
+            if (p.id !== selfIdRef.current && p.alive) {
+              p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
+              p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
+            }
           }
         }
 
@@ -939,67 +1272,128 @@ export default function App() {
           world.bullets,
           world.players,
           world.asteroids,
-          dt
+          dt,
+          world.planets,
+          world.gravityStarEnabled
         );
 
-        // Local collision check when running on static Vercel without WebSocket backend
+        // Collision check when running on static Vercel / Peer mode without WebSocket backend
         if (!isWsConnected && world.bullets.length > 0) {
           for (let i = world.bullets.length - 1; i >= 0; i--) {
             const b = world.bullets[i];
-            if (b.ownerId !== selfIdRef.current) continue;
+            let bulletConsumed = false;
+
+            // 1. Check bullet vs all alive players (both local and remote bullets!)
             for (const target of world.players.values()) {
               if (!target.alive || target.id === b.ownerId) continue;
-              const dx = b.x - target.x;
-              const dy = b.y - target.y;
-              if (Math.abs(dx) < 32 && Math.abs(dy) < 32 && dx * dx + dy * dy <= 900) {
-                const knockback = b.isMissile ? 95 : 65;
-                target.vx += Math.cos(b.angle) * knockback;
-                target.vy += Math.sin(b.angle) * knockback;
-                if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
-                  target.hp -= b.damage;
-                }
+              const tSpec = HULL_SPECS[target.hull] || HULL_SPECS.needle;
+              const hitRadius = tSpec.radius + (b.isMissile ? 14 : 9);
+              const dx = shortestToroidalDelta(b.x, target.x, ARENA_WIDTH);
+              if (Math.abs(dx) > hitRadius) continue;
+              const dy = shortestToroidalDelta(b.y, target.y, ARENA_HEIGHT);
+              if (Math.abs(dy) > hitRadius) continue;
+
+              if (dx * dx + dy * dy <= hitRadius * hitRadius) {
                 world.bullets.splice(i, 1);
-                const fatal = target.hp <= 0 && !target.cheats?.godMode;
-                let killEntry: KillFeedEntry | undefined;
-                if (fatal) {
-                  target.alive = false;
-                  target.hp = 0;
-                  target.deaths += 1;
-                  target.respawnTimer = 2.8;
-                  localPlayer.kills += 1;
-                  localPlayer.score += 150;
-                  killEntry = {
-                    id: `kill_${Date.now().toString(36)}`,
-                    killerId: localPlayer.id,
-                    killerName: localPlayer.name,
-                    killerColor: localPlayer.color,
-                    victimId: target.id,
-                    victimName: target.name,
-                    victimColor: target.color,
-                    cause: b.isMissile ? 'missile' : 'laser',
-                    speedAtKill: Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)),
-                    timestamp: Date.now(),
-                  };
-                  world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
-                  renderer.addBurst(target.x, target.y, target.vx * 0.2, target.vy * 0.2, target.color, 28, 280, true);
-                  soundEngine.playHit(true);
+                bulletConsumed = true;
+
+                const hitId = `hit_${b.id}`;
+                const alreadyProcessed = peerSyncRef.current?.hasSeenHit(hitId) ?? false;
+
+                if (!alreadyProcessed && (b.ownerId === selfIdRef.current || target.id === selfIdRef.current)) {
+                  peerSyncRef.current?.markHitSeen(hitId);
+                  const knockback = b.isMissile ? 95 : 65;
+                  target.vx += Math.cos(b.angle) * knockback;
+                  target.vy += Math.sin(b.angle) * knockback;
+                  if (target.invulnerableTimer <= 0 && !target.cheats?.godMode) {
+                    target.hp = Math.max(0, target.hp - b.damage);
+                  }
+                  if (target.id !== selfIdRef.current) {
+                    lastDamagedRemoteAtRef.current.set(target.id, Date.now());
+                  }
+
+                  const attacker = world.players.get(b.ownerId);
+                  const fatal = target.hp <= 0 && !target.cheats?.godMode;
+                  let killEntry: KillFeedEntry | undefined;
+
+                  if (fatal) {
+                    target.alive = false;
+                    target.hp = 0;
+                    target.deaths += 1;
+                    target.streak = 0;
+                    target.respawnTimer = 2.8;
+                    if (attacker && attacker.id !== target.id) {
+                      attacker.kills += 1;
+                      attacker.streak += 1;
+                      attacker.score += 150;
+                    }
+                    killEntry = {
+                      id: `kill_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+                      killerId: b.ownerId,
+                      killerName: attacker?.name || b.ownerName || 'PILOT',
+                      killerColor: attacker?.color || b.color,
+                      victimId: target.id,
+                      victimName: target.name,
+                      victimColor: target.color,
+                      cause: b.isMissile ? 'missile' : 'laser',
+                      speedAtKill: attacker ? Math.round(Math.hypot(attacker.vx, attacker.vy)) : 0,
+                      timestamp: Date.now(),
+                    };
+                    world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+                    renderer.addBurst(target.x, target.y, target.vx * 0.2, target.vy * 0.2, target.color, 32, 300, true);
+                    soundEngine.playHit(true);
+                  } else {
+                    renderer.hitFlashes.set(target.id, 0.12);
+                    renderer.addBurst(b.x, b.y, 0, 0, b.color, 10, 160, false);
+                    soundEngine.playHit(false);
+                  }
+
+                  peerSyncRef.current?.send({
+                    type: 'peer:combat_hit',
+                    senderId: selfIdRef.current,
+                    hitId,
+                    targetId: target.id,
+                    attackerId: b.ownerId,
+                    x: Math.round(b.x),
+                    y: Math.round(b.y),
+                    vx: Math.round(target.vx),
+                    vy: Math.round(target.vy),
+                    damage: b.damage,
+                    fatal,
+                    color: b.color,
+                    killEntry,
+                  });
                 } else {
+                  renderer.hitFlashes.set(target.id, 0.12);
                   renderer.addBurst(b.x, b.y, 0, 0, b.color, 8, 140, false);
                 }
-                peerSyncRef.current?.send({
-                  type: 'peer:combat_hit',
-                  senderId: selfIdRef.current,
-                  targetId: target.id,
-                  attackerId: localPlayer.id,
-                  x: Math.round(b.x),
-                  y: Math.round(b.y),
-                  vx: Math.round(target.vx),
-                  vy: Math.round(target.vy),
-                  damage: b.damage,
-                  fatal,
-                  color: b.color,
-                  killEntry,
-                });
+                break;
+              }
+            }
+
+            if (bulletConsumed) continue;
+
+            // 2. Check bullet vs asteroids
+            for (let aIdx = world.asteroids.length - 1; aIdx >= 0; aIdx--) {
+              const ast = world.asteroids[aIdx];
+              const r = ast.radius + (b.isMissile ? 6 : 0);
+              const dx = shortestToroidalDelta(b.x, ast.x, ARENA_WIDTH);
+              if (Math.abs(dx) > r) continue;
+              const dy = shortestToroidalDelta(b.y, ast.y, ARENA_HEIGHT);
+              if (Math.abs(dy) > r) continue;
+              if (dx * dx + dy * dy <= r * r) {
+                world.bullets.splice(i, 1);
+                ast.hp -= b.damage;
+                ast.vx += Math.cos(b.angle) * 24;
+                ast.vy += Math.sin(b.angle) * 24;
+                renderer.addBurst(b.x, b.y, 0, 0, '#94A3B8', 8, 130, false);
+                if (ast.hp <= 0) {
+                  renderer.addBurst(ast.x, ast.y, ast.vx * 0.2, ast.vy * 0.2, '#94A3B8', 22, 220, true);
+                  world.asteroids.splice(aIdx, 1);
+                  if (b.ownerId === selfIdRef.current) {
+                    localPlayer.score += 25;
+                  }
+                }
                 break;
               }
             }
@@ -1012,11 +1406,13 @@ export default function App() {
         const hullSpec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
         const activeCheats = cheatsRef.current;
 
-        if (!isWsConnected && localPlayer.shooting) {
+        if (!isWsConnected && localPlayer.shooting && localPlayer.alive) {
           const effCooldown =
             activeCheats.novaSpread || activeCheats.rapidFire ? 0 : hullSpec.fireCooldown;
           if (effCooldown === 0 || nowSec - lastOfflineShot >= effCooldown) {
+            const prevShotTime = lastOfflineShot;
             lastOfflineShot = nowSec;
+            localPlayer.lastFireTime = nowSec;
             const count = activeCheats.novaSpread ? 360 : hullSpec.spreadCount;
             const targetIds: string[] = [];
             if (activeCheats.homingMissiles) {
@@ -1051,11 +1447,13 @@ export default function App() {
             if (world.bullets.length > 1800) {
               world.bullets.splice(0, world.bullets.length - 1800);
             }
-            peerSyncRef.current?.send({
-              type: 'peer:salvo',
-              senderId: selfIdRef.current,
-              salvo,
-            });
+            if (effCooldown > 0 || nowSec - prevShotTime >= 0.055) {
+              peerSyncRef.current?.send({
+                type: 'peer:salvo',
+                senderId: selfIdRef.current,
+                salvo,
+              });
+            }
           }
         }
 
@@ -1063,7 +1461,7 @@ export default function App() {
           activeCheats.novaSpread || activeCheats.rapidFire
             ? 0.065
             : hullSpec.fireCooldown;
-        if (localPlayer.shooting && nowSec - lastLocalFire >= sfxInterval) {
+        if (localPlayer.shooting && localPlayer.alive && nowSec - lastLocalFire >= sfxInterval) {
           lastLocalFire = nowSec;
           if (activeCheats.homingMissiles) {
             soundEngine.playMissileLaunch();
@@ -1072,7 +1470,7 @@ export default function App() {
           }
         }
 
-        if (sampled.warpJustPressed && localPlayer.alive) {
+        if (sampled.warpJustPressed && localPlayer.alive && !isFreeCam) {
           soundEngine.playWarp();
           // Burst at departure coordinates
           renderer.addBurst(
@@ -1086,7 +1484,7 @@ export default function App() {
             false
           );
           // Teleport to a safe orbital point across the 10x star system away from the central Gravity Star
-          const orbitRadius = 1500 + Math.random() * 6500;
+          const orbitRadius = 2200 + Math.random() * 5800;
           const theta = Math.random() * Math.PI * 2;
           localPlayer.x = ((ARENA_WIDTH * 0.5 + Math.cos(theta) * orbitRadius) % ARENA_WIDTH + ARENA_WIDTH) % ARENA_WIDTH;
           localPlayer.y = ((ARENA_HEIGHT * 0.5 + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT + ARENA_HEIGHT) % ARENA_HEIGHT;
@@ -1107,25 +1505,51 @@ export default function App() {
           );
         }
 
-        if (now - lastNetSend >= 32 || sampled.warpJustPressed) {
+        // Compute world-space coordinates for the local mouse cursor when in Free-Cam / Spectator Mode
+        if (isFreeCam) {
+          let refCamX = freeCamPosRef.current.x;
+          let refCamY = freeCamPosRef.current.y;
+          if (spectateTargetIdRef.current) {
+            const specTarget = world.players.get(spectateTargetIdRef.current);
+            if (specTarget) {
+              const curCam = renderer.getCameraPosition();
+              refCamX = curCam.x;
+              refCamY = curCam.y;
+            }
+          }
+          localPlayer.cursorX = Math.round(
+            wrapCoord(refCamX + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
+          );
+          localPlayer.cursorY = Math.round(
+            wrapCoord(refCamY + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
+          );
+        }
+
+        if (now - lastNetSend >= 32 || (sampled.warpJustPressed && !isFreeCam)) {
           lastNetSend = now;
-          peerSyncRef.current?.send({
-            type: 'peer:player_state',
-            senderId: selfIdRef.current,
-            player: localPlayer,
-          });
+          if (!isWsConnected) {
+            peerSyncRef.current?.send({
+              type: 'peer:player_state',
+              senderId: selfIdRef.current,
+              player: localPlayer,
+            });
+          }
           sendWs({
             type: 'player:input',
             playerId: selfIdRef.current,
             angle: localPlayer.angle,
             thrusting: localPlayer.thrusting,
             shooting: localPlayer.shooting,
-            warpRequested: sampled.warpJustPressed,
+            warpRequested: sampled.warpJustPressed && !isFreeCam,
             inputSource: sampled.inputSource,
             x: localPlayer.x,
             y: localPlayer.y,
             vx: localPlayer.vx,
             vy: localPlayer.vy,
+            spectating: localPlayer.spectating,
+            spectateTargetId: localPlayer.spectateTargetId,
+            cursorX: localPlayer.cursorX,
+            cursorY: localPlayer.cursorY,
           });
         }
 
@@ -1162,6 +1586,15 @@ export default function App() {
         soundEngine.stopThrust();
       }
 
+      const cameraOverride = cheatsRef.current.freeCam
+        ? {
+            mode: spectateTargetIdRef.current ? ('spectate' as const) : ('freecam' as const),
+            x: freeCamPosRef.current.x,
+            y: freeCamPosRef.current.y,
+            targetId: spectateTargetIdRef.current,
+          }
+        : null;
+
       renderer.render(
         ctx,
         window.innerWidth,
@@ -1175,8 +1608,20 @@ export default function App() {
         world.planets,
         world.gravityStarEnabled,
         sampled.stickVector,
-        isTitle
+        isTitle,
+        cameraOverride
       );
+
+      // Keep local cursor world position synced with rendered camera even while paused or right after camera lerp
+      if (localPlayer && cheatsRef.current.freeCam) {
+        const camAfter = renderer.getCameraPosition();
+        localPlayer.cursorX = Math.round(
+          wrapCoord(camAfter.x + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
+        );
+        localPlayer.cursorY = Math.round(
+          wrapCoord(camAfter.y + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
+        );
+      }
 
       if (now - lastHudSync > 80) {
         lastHudSync = now;
@@ -1221,7 +1666,14 @@ export default function App() {
       input.destroy();
       soundEngine.stopThrust();
     };
-  }, [cheatMenuOpen, controllerModalOpen, handleStartGame, handleTriggerCheatAction, sendWs]);
+  }, [
+    cheatMenuOpen,
+    controllerModalOpen,
+    handleCycleSpectateTarget,
+    handleStartGame,
+    handleTriggerCheatAction,
+    sendWs,
+  ]);
 
   const handleUpdateMapping = useCallback((next: ControllerMapping) => {
     setMapping(next);
@@ -1248,7 +1700,15 @@ export default function App() {
   };
 
   const anyCheatActive =
-    cheats.homingMissiles || cheats.rapidFire || cheats.novaSpread || cheats.godMode;
+    cheats.homingMissiles ||
+    cheats.rapidFire ||
+    cheats.novaSpread ||
+    cheats.godMode ||
+    cheats.freeCam;
+
+  const spectatedPlayerObj = spectateTargetId
+    ? worldRef.current.players.get(spectateTargetId) || null
+    : null;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#060913] select-none">
@@ -1610,12 +2070,64 @@ export default function App() {
                     cheats.rapidFire && 'RAPID FIRE',
                     cheats.novaSpread && '360° NOVA',
                     cheats.godMode && 'GOD MODE',
+                    cheats.freeCam && (spectateTargetId ? 'SPECTATING' : 'FREE-CAM'),
                   ]
                     .filter(Boolean)
                     .join(' · ')}
                 </div>
               )}
             </div>
+
+            {/* Top-Center Detached Camera / Spectator Control Banner */}
+            {cheats.freeCam && (
+              <div className="pointer-events-auto flex flex-col items-center gap-1.5 rounded-xl border border-cyan-500/50 bg-[#0B1120]/95 px-4 py-2.5 shadow-2xl">
+                <div className="flex items-center gap-2 text-xs font-mono-tabular">
+                  <span className="h-2 w-2 rounded-full bg-cyan-400 animate-pulse" />
+                  <span className="font-display font-bold text-cyan-300">
+                    {spectatedPlayerObj
+                      ? `SPECTATING: ${spectatedPlayerObj.name}`
+                      : 'FREE-CAM DETACHED'}
+                  </span>
+                  <span className="text-slate-500">·</span>
+                  <span className="text-slate-300 text-[11px]">
+                    Other players can see your mouse cursor!
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-1.5">
+                  <button
+                    onClick={() => handleCycleSpectateTarget(-1)}
+                    className="rounded border border-slate-700 bg-[#060913] px-2.5 py-1 font-mono-tabular text-[11px] text-slate-200 hover:border-cyan-400 hover:text-white whitespace-nowrap shrink-0"
+                  >
+                    ◀ Prev Player ([)
+                  </button>
+                  <button
+                    onClick={() => handleSelectSpectateTarget(null)}
+                    className={`rounded border px-2.5 py-1 font-mono-tabular text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                      !spectateTargetId
+                        ? 'border-cyan-400 bg-cyan-500/20 text-cyan-300'
+                        : 'border-slate-700 bg-[#060913] text-slate-300 hover:border-cyan-400 hover:text-white'
+                    }`}
+                  >
+                    Free-Fly (WASD / Shift)
+                  </button>
+                  <button
+                    onClick={() => handleCycleSpectateTarget(1)}
+                    className="rounded border border-slate-700 bg-[#060913] px-2.5 py-1 font-mono-tabular text-[11px] text-slate-200 hover:border-cyan-400 hover:text-white whitespace-nowrap shrink-0"
+                  >
+                    Next Player (]) ▶
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleSelectSpectateTarget(null);
+                      handleUpdateCheats({ ...cheats, freeCam: false });
+                    }}
+                    className="rounded bg-rose-600 px-2.5 py-1 font-display text-[11px] font-bold text-white hover:bg-rose-500 whitespace-nowrap shrink-0"
+                  >
+                    Reconnect Ship
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Top-Right Perimeter Cluster: Live Multiplayer Roster & Controls */}
             <div className="flex flex-col items-end gap-2">
@@ -1662,25 +2174,50 @@ export default function App() {
                   <span>SECTOR PILOTS ({hud.playerCount})</span>
                   <span className="font-mono-tabular">K / D · VELOCITY</span>
                 </div>
-                <div className="mt-1.5 space-y-1">
+                <div className="mt-1.5 space-y-1 pointer-events-auto">
                   {hud.leaderboard.slice(0, 6).map((p) => {
                     const pSpeed = Math.round(Math.hypot(p.vx, p.vy));
                     const isMe = p.id === selfIdRef.current;
+                    const isSpectatingThis = cheats.freeCam && spectateTargetId === p.id;
                     return (
                       <div
                         key={p.id}
-                        className="flex items-center justify-between text-xs font-mono-tabular"
+                        className="flex items-center justify-between gap-1 text-xs font-mono-tabular"
                       >
                         <span
-                          className="truncate max-w-[115px] font-medium"
+                          className="truncate max-w-[105px] font-medium"
                           style={{ color: p.color }}
                         >
                           {p.name}
                           {isMe ? ' (YOU)' : ''}
                         </span>
-                        <span className="text-slate-300">
-                          {p.kills}/{p.deaths} · {pSpeed} u/s
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-slate-300">
+                            {p.kills}/{p.deaths} · {pSpeed} u/s
+                          </span>
+                          {!isMe && (
+                            <button
+                              onClick={() => {
+                                if (isSpectatingThis) {
+                                  handleSelectSpectateTarget(null);
+                                } else {
+                                  handleSelectSpectateTarget(p.id);
+                                  if (!cheats.freeCam) {
+                                    handleUpdateCheats({ ...cheats, freeCam: true });
+                                  }
+                                }
+                              }}
+                              title={isSpectatingThis ? 'Stop spectating this ship' : `Spectate ${p.name}`}
+                              className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                                isSpectatingThis
+                                  ? 'border-cyan-400 bg-cyan-500/25 text-cyan-300'
+                                  : 'border-slate-700 bg-[#060913] text-slate-400 hover:border-cyan-500/60 hover:text-white'
+                              }`}
+                            >
+                              {isSpectatingThis ? 'Viewing' : 'View'}
+                            </button>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -1841,6 +2378,8 @@ export default function App() {
         selfId={selfIdRef.current}
         onCheatRenameShip={handleCheatRenameShip}
         musicBox={musicBox}
+        spectateTargetId={spectateTargetId}
+        onSelectSpectateTarget={handleSelectSpectateTarget}
       />
     </div>
   );
