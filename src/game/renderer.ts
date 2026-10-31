@@ -9,6 +9,7 @@ import {
   GRAVITY_STRENGTH,
   HULL_SPECS,
   MUSIC_HEARING_RADIUS,
+  PLANET_LANDING_SPEED_THRESHOLD,
   PlanetState,
   PlayerState,
   ShipHullType,
@@ -215,15 +216,24 @@ export class SpacewarRenderer {
     player: PlayerState,
     dt: number,
     gravityStarEnabled: boolean,
-    planets: PlanetState[] = []
+    planets: PlanetState[] = [],
+    asteroids: AsteroidState[] = [],
+    onEnvironmentHit?: (
+      target: PlayerState,
+      cause: 'asteroid' | 'planet',
+      sourceId: string,
+      sourceName: string,
+      sourceColor: string,
+      damage: number,
+      fatal: boolean,
+      impactSpeed: number
+    ) => void
   ) {
     if (!player.alive) return;
 
-    if (player.cheats?.godMode || player.warping) {
-      if (player.cheats?.godMode) {
-        player.hp = player.maxHp;
-      }
-      player.invulnerableTimer = Math.max(player.invulnerableTimer, 0.25);
+    if (player.cheats?.godMode) {
+      player.hp = player.maxHp;
+      player.invulnerableTimer = 0;
     } else if (player.invulnerableTimer > 0) {
       player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
     }
@@ -231,6 +241,8 @@ export class SpacewarRenderer {
     const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
 
     if (player.warping) {
+      player.landedPlanetId = null;
+      player.landedSurfaceAngle = undefined;
       // Continuous Warp Speed along exact ship facing direction + full invincibility
       const currentSpd = Math.hypot(player.vx, player.vy);
       const warpSpd = Math.max(WARP_DRIVE_SPEED, currentSpd);
@@ -276,6 +288,50 @@ export class SpacewarRenderer {
       return;
     }
 
+    // 0. If currently anchored/landed on a planet, ride the planet's surface so the pilot can freely aim & shoot from there
+    if (player.landedPlanetId && !player.isDrone) {
+      const landedPlanet = planets.find((p) => p.id === player.landedPlanetId);
+      if (landedPlanet) {
+        const surfaceAngle =
+          typeof player.landedSurfaceAngle === 'number'
+            ? player.landedSurfaceAngle
+            : Math.atan2(player.y - landedPlanet.y, player.x - landedPlanet.x);
+        player.landedSurfaceAngle = surfaceAngle;
+
+        // Launch off the planet if the pilot thrusts while aiming away from the planet's surface
+        const outwardAlignment = Math.cos(player.angle - surfaceAngle);
+        if (player.thrusting && outwardAlignment > 0.2) {
+          player.landedPlanetId = null;
+          player.landedSurfaceAngle = undefined;
+          const outX = Math.cos(surfaceAngle);
+          const outY = Math.sin(surfaceAngle);
+          const launchDist = landedPlanet.radius + spec.radius + 9;
+          player.x = wrapCoord(landedPlanet.x + outX * launchDist, ARENA_WIDTH);
+          player.y = wrapCoord(landedPlanet.y + outY * launchDist, ARENA_HEIGHT);
+          const launchBoost = Math.max(195, spec.thrustAccel * 0.36);
+          player.vx = landedPlanet.vx + Math.cos(player.angle) * launchBoost + outX * 85;
+          player.vy = landedPlanet.vy + Math.sin(player.angle) * launchBoost + outY * 85;
+        } else {
+          // Stay anchored on the planet surface at surfaceAngle
+          const anchorDist = landedPlanet.radius + spec.radius + 2;
+          player.x = wrapCoord(
+            landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
+            ARENA_WIDTH
+          );
+          player.y = wrapCoord(
+            landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
+            ARENA_HEIGHT
+          );
+          player.vx = landedPlanet.vx;
+          player.vy = landedPlanet.vy;
+          return;
+        }
+      } else {
+        player.landedPlanetId = null;
+        player.landedSurfaceAngle = undefined;
+      }
+    }
+
     // 1. Apply thrust in exact ship facing angle (NO DRAG, NO SPEED CAP -> INFINITE MOMENTUM)
     if (player.thrusting) {
       player.vx += Math.cos(player.angle) * spec.thrustAccel * dt;
@@ -315,29 +371,14 @@ export class SpacewarRenderer {
       }
     }
 
-    // 2b. Apply Orbiting Planets gravity slingshots & surface rebound
+    // 2b. Apply Orbiting Planets gravity slingshots before integrating position
     for (let i = 0; i < planets.length; i++) {
       const planet = planets[i];
-      const dx = planet.x - player.x;
-      const dy = planet.y - player.y;
+      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
       const distSq = dx * dx + dy * dy;
       const minSep = spec.radius + planet.radius;
-
-      if (distSq < minSep * minSep && distSq > 0.001) {
-        const dist = Math.sqrt(distSq);
-        const nx = -dx / dist;
-        const ny = -dy / dist;
-        player.x = wrapCoord(planet.x + nx * (minSep + 3), ARENA_WIDTH);
-        player.y = wrapCoord(planet.y + ny * (minSep + 3), ARENA_HEIGHT);
-
-        const relVx = player.vx - planet.vx;
-        const relVy = player.vy - planet.vy;
-        const normalVel = relVx * nx + relVy * ny;
-        if (normalVel < 0) {
-          player.vx -= 1.85 * normalVel * nx;
-          player.vy -= 1.85 * normalVel * ny;
-        }
-      } else if (distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
+      if (distSq >= minSep * minSep && distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
         const dist = Math.sqrt(distSq);
         const pullAccel = Math.min(380, planet.gravityStrength / Math.max(180000, distSq));
         player.vx += (dx / dist) * pullAccel * dt;
@@ -348,6 +389,128 @@ export class SpacewarRenderer {
     // 3. Toroidal position integration
     player.x = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
     player.y = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+
+    // 4. Check Asteroid collisions & damage
+    for (let i = 0; i < asteroids.length; i++) {
+      const ast = asteroids[i];
+      const dx = shortestToroidalDelta(ast.x, player.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(ast.y, player.y, ARENA_HEIGHT);
+      const minSep = spec.radius + ast.radius * 0.9;
+      if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
+      const distSq = dx * dx + dy * dy;
+      if (distSq < minSep * minSep && distSq > 0.0001) {
+        const dist = Math.sqrt(distSq);
+        const nx = dx / dist;
+        const ny = dy / dist;
+
+        const preSpeed = Math.hypot(player.vx, player.vy);
+        const relVx = player.vx - ast.vx;
+        const relVy = player.vy - ast.vy;
+        const relSpeed = Math.hypot(relVx, relVy);
+        const impactSpeed = Math.max(preSpeed, relSpeed);
+
+        player.x = wrapCoord(ast.x + nx * (minSep + 3), ARENA_WIDTH);
+        player.y = wrapCoord(ast.y + ny * (minSep + 3), ARENA_HEIGHT);
+
+        const normalVel = relVx * nx + relVy * ny;
+        if (normalVel < 0) {
+          player.vx -= 1.85 * normalVel * nx;
+          player.vy -= 1.85 * normalVel * ny;
+        }
+
+        this.addBurst(player.x, player.y, 0, 0, '#94A3B8', 14, 180, false);
+
+        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
+          const impactDmg = Math.min(55, Math.max(18, Math.round(impactSpeed * 0.035)));
+          player.invulnerableTimer = 0.25;
+          const fatal = player.hp - impactDmg <= 0;
+          onEnvironmentHit?.(
+            player,
+            'asteroid',
+            ast.id,
+            'ASTEROID',
+            '#94A3B8',
+            impactDmg,
+            fatal,
+            Math.round(impactSpeed)
+          );
+          if (fatal || !player.alive) return;
+        }
+      }
+    }
+
+    // 5. Check Planet collisions: slow landing (<= 500 u/s) vs high-speed surface crash & damage (> 500 u/s)
+    for (let i = 0; i < planets.length; i++) {
+      const planet = planets[i];
+      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
+      const minSep = spec.radius + planet.radius;
+      if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
+      const distSq = dx * dx + dy * dy;
+
+      if (distSq < minSep * minSep && distSq > 0.001) {
+        const dist = Math.sqrt(distSq);
+        const nx = -dx / dist;
+        const ny = -dy / dist;
+
+        const preSpeed = Math.hypot(player.vx, player.vy);
+        const relVx = player.vx - planet.vx;
+        const relVy = player.vy - planet.vy;
+        const relSpeed = Math.hypot(relVx, relVy);
+
+        // If hitting the planet at <= 500 u/s, anchor/land the ship on the planet surface with 0 damage!
+        if (!player.isDrone && !player.warping && preSpeed <= PLANET_LANDING_SPEED_THRESHOLD) {
+          const surfaceAngle = Math.atan2(ny, nx);
+          player.landedPlanetId = planet.id;
+          player.landedSurfaceAngle = surfaceAngle;
+          const anchorDist = planet.radius + spec.radius + 2;
+          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, ARENA_WIDTH);
+          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, ARENA_HEIGHT);
+          player.vx = planet.vx;
+          player.vy = planet.vy;
+          this.addBurst(
+            player.x,
+            player.y,
+            planet.vx * 0.15,
+            planet.vy * 0.15,
+            planet.accentColor,
+            14,
+            135,
+            false
+          );
+          return;
+        }
+
+        player.x = wrapCoord(planet.x + nx * (minSep + 4), ARENA_WIDTH);
+        player.y = wrapCoord(planet.y + ny * (minSep + 4), ARENA_HEIGHT);
+
+        const normalVel = relVx * nx + relVy * ny;
+        if (normalVel < 0) {
+          player.vx -= 1.85 * normalVel * nx;
+          player.vy -= 1.85 * normalVel * ny;
+        }
+
+        this.addBurst(player.x, player.y, 0, 0, planet.color, 18, 220, false);
+
+        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
+          const impactSpeed = Math.max(preSpeed, relSpeed);
+          const impactDmg = Math.min(65, Math.max(22, Math.round(impactSpeed * 0.038)));
+          player.invulnerableTimer = 0.28;
+          const fatal = player.hp - impactDmg <= 0;
+          onEnvironmentHit?.(
+            player,
+            'planet',
+            planet.id,
+            planet.name,
+            planet.color,
+            impactDmg,
+            fatal,
+            Math.round(impactSpeed)
+          );
+          if (fatal || !player.alive) return;
+        }
+      }
+    }
 
     const speed = Math.hypot(player.vx, player.vy);
     if (speed > player.peakSpeed) {
@@ -401,6 +564,33 @@ export class SpacewarRenderer {
         player.y = wrapCoord(player.y + dy * posLerp, ARENA_HEIGHT);
       }
       return;
+    }
+
+    // If remote ship is anchored/landed on a planet, lock it smoothly onto that planet's surface
+    if (player.landedPlanetId) {
+      const landedPlanet = planets.find((p) => p.id === player.landedPlanetId);
+      if (landedPlanet) {
+        const surfaceAngle =
+          typeof player.landedSurfaceAngle === 'number'
+            ? player.landedSurfaceAngle
+            : Math.atan2(player.y - landedPlanet.y, player.x - landedPlanet.x);
+        player.landedSurfaceAngle = surfaceAngle;
+        const anchorDist = landedPlanet.radius + spec.radius + 2;
+        player.x = wrapCoord(
+          landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
+          ARENA_WIDTH
+        );
+        player.y = wrapCoord(
+          landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
+          ARENA_HEIGHT
+        );
+        player.vx = landedPlanet.vx;
+        player.vy = landedPlanet.vy;
+        const tAngle = player.netTargetAngle ?? player.angle;
+        const angleDiff = normalizeAngleDiff(tAngle - player.angle);
+        player.angle = player.angle + angleDiff * (1 - Math.exp(-18 * dt));
+        return;
+      }
     }
 
     if (typeof player.netTargetX !== 'number' || typeof player.netTargetY !== 'number') {
@@ -598,13 +788,19 @@ export class SpacewarRenderer {
       }
 
       let hitPlanet = false;
+      const bOwner = players.get(b.ownerId);
+      const justFiredFromLanded = b.maxTtl - b.ttl < 0.25;
       for (let pIdx = 0; pIdx < planets.length; pIdx++) {
         const planet = planets[pIdx];
+        const effRadius =
+          justFiredFromLanded && bOwner?.landedPlanetId === planet.id
+            ? Math.max(20, planet.radius - 20)
+            : planet.radius;
         const pdx = b.x - planet.x;
-        if (Math.abs(pdx) > planet.radius) continue;
+        if (Math.abs(pdx) > effRadius) continue;
         const pdy = b.y - planet.y;
-        if (Math.abs(pdy) > planet.radius) continue;
-        if (pdx * pdx + pdy * pdy <= planet.radius * planet.radius) {
+        if (Math.abs(pdy) > effRadius) continue;
+        if (pdx * pdx + pdy * pdy <= effRadius * effRadius) {
           hitPlanet = true;
           break;
         }
@@ -1315,12 +1511,24 @@ export class SpacewarRenderer {
         onScreenSquadShips.push({ player, sx, sy });
       }
 
+      // If anchored/landed on a planet, draw a magnetic landing clamp ring around the ship
+      if (player.landedPlanetId) {
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.72)';
+        ctx.lineWidth = 1.8;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(0, 0, spec.radius + 9, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
       // Draw Ship Body
       ctx.save();
       ctx.translate(sx, sy);
       ctx.rotate(player.angle);
 
-      // Invulnerability shield ring on spawn
       // Invulnerability or Warp Field shield ring
       if (player.warping) {
         ctx.strokeStyle = `rgba(56, 189, 248, ${0.7 + 0.25 * Math.sin(nowSec * 22)})`;
@@ -1352,7 +1560,7 @@ export class SpacewarRenderer {
         ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.38);
         ctx.closePath();
         ctx.fill();
-      } else if (player.thrusting) {
+      } else if (player.thrusting && !player.landedPlanetId) {
         const flameLen = spec.radius * (1.2 + Math.random() * 0.65);
         ctx.fillStyle = '#F59E0B';
         ctx.beginPath();
@@ -1401,13 +1609,13 @@ export class SpacewarRenderer {
       ctx.restore();
 
       // Draw Callsign, Squad Tag, Speed & Hull Integrity Bar below ship
-      const spd = Math.round(Math.hypot(player.vx, player.vy));
+      const spd = player.landedPlanetId ? 0 : Math.round(Math.hypot(player.vx, player.vy));
       ctx.save();
       ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
       ctx.fillStyle = player.warping ? '#38BDF8' : isLocal ? '#F8FAFC' : '#CBD5E1';
       ctx.textAlign = 'center';
       ctx.fillText(
-        `${player.name}${player.squadId ? ` [${player.squadId}]` : ''}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
+        `${player.name}${player.squadId ? ` [${player.squadId}]` : ''}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : player.landedPlanetId ? ' [LANDED]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
         sx,
         sy + spec.radius + 18
       );

@@ -23,6 +23,7 @@ import {
   INITIAL_PLANETS,
   KillFeedEntry,
   parseChatInput,
+  PLANET_LANDING_SPEED_THRESHOLD,
   PLAYER_COLORS,
   PlanetState,
   PlayerState,
@@ -56,6 +57,7 @@ const rooms = new Map<string, RoomState>();
 const socketToRoom = new Map<WebSocket, string>();
 const socketToPlayerIds = new Map<WebSocket, Set<string>>();
 const playerLastSeen = new Map<string, number>();
+const lastEnvHitAt = new Map<string, number>();
 
 let entitySeq = 1;
 function nextId(prefix: string): string {
@@ -253,6 +255,8 @@ function recordKill(
   victim.respawnTimer = 2.8;
   victim.thrusting = false;
   victim.shooting = false;
+  victim.landedPlanetId = null;
+  victim.landedSurfaceAngle = undefined;
 
   if (killer && killer.id !== victim.id) {
     killer.kills += 1;
@@ -546,11 +550,9 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       player.music.updatedAt = nowMs;
     }
 
-    if (player.cheats?.godMode || player.warping) {
-      if (player.cheats?.godMode) {
-        player.hp = player.maxHp;
-      }
-      player.invulnerableTimer = Math.max(player.invulnerableTimer, 0.25);
+    if (player.cheats?.godMode) {
+      player.hp = player.maxHp;
+      player.invulnerableTimer = 0;
     } else if (player.invulnerableTimer > 0) {
       player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
     }
@@ -568,10 +570,54 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
 
     if (player.warping) {
+      player.landedPlanetId = null;
+      player.landedSurfaceAngle = undefined;
       const currentSpd = Math.hypot(player.vx, player.vy);
       const warpSpd = Math.max(WARP_DRIVE_SPEED, currentSpd);
       player.vx = Math.cos(player.angle) * warpSpd;
       player.vy = Math.sin(player.angle) * warpSpd;
+    } else if (player.landedPlanetId && !player.isDrone) {
+      const landedPlanet = room.planets.find((p) => p.id === player.landedPlanetId);
+      if (landedPlanet) {
+        const surfaceAngle =
+          typeof player.landedSurfaceAngle === 'number'
+            ? player.landedSurfaceAngle
+            : Math.atan2(player.y - landedPlanet.y, player.x - landedPlanet.x);
+        player.landedSurfaceAngle = surfaceAngle;
+
+        const outwardAlignment = Math.cos(player.angle - surfaceAngle);
+        if (player.thrusting && outwardAlignment > 0.2) {
+          player.landedPlanetId = null;
+          player.landedSurfaceAngle = undefined;
+          const outX = Math.cos(surfaceAngle);
+          const outY = Math.sin(surfaceAngle);
+          const launchDist = landedPlanet.radius + spec.radius + 9;
+          player.x = wrapCoord(landedPlanet.x + outX * launchDist, ARENA_WIDTH);
+          player.y = wrapCoord(landedPlanet.y + outY * launchDist, ARENA_HEIGHT);
+          const launchBoost = Math.max(195, spec.thrustAccel * 0.36);
+          player.vx = landedPlanet.vx + Math.cos(player.angle) * launchBoost + outX * 85;
+          player.vy = landedPlanet.vy + Math.sin(player.angle) * launchBoost + outY * 85;
+        } else {
+          const anchorDist = landedPlanet.radius + spec.radius + 2;
+          player.x = wrapCoord(
+            landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
+            ARENA_WIDTH
+          );
+          player.y = wrapCoord(
+            landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
+            ARENA_HEIGHT
+          );
+          player.vx = landedPlanet.vx;
+          player.vy = landedPlanet.vy;
+          if (player.shooting) {
+            spawnPlayerBullets(room, player, nowSec);
+          }
+          continue;
+        }
+      } else {
+        player.landedPlanetId = null;
+        player.landedSurfaceAngle = undefined;
+      }
     } else if (player.thrusting) {
       player.vx += Math.cos(player.angle) * spec.thrustAccel * dt;
       player.vy += Math.sin(player.angle) * spec.thrustAccel * dt;
@@ -642,16 +688,16 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
 
     for (const ast of room.asteroids.values()) {
-      const dx = player.x - ast.x;
-      const dy = player.y - ast.y;
-      const minSep = spec.radius + ast.radius * 0.85;
+      const dx = shortestToroidalDelta(ast.x, player.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(ast.y, player.y, ARENA_HEIGHT);
+      const minSep = spec.radius + ast.radius * 0.9;
       if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
       const dist = Math.hypot(dx, dy);
       if (dist < minSep && dist > 0.001) {
         const nx = dx / dist;
         const ny = dy / dist;
-        player.x = wrapCoord(ast.x + nx * (minSep + 2), ARENA_WIDTH);
-        player.y = wrapCoord(ast.y + ny * (minSep + 2), ARENA_HEIGHT);
+        player.x = wrapCoord(ast.x + nx * (minSep + 3), ARENA_WIDTH);
+        player.y = wrapCoord(ast.y + ny * (minSep + 3), ARENA_HEIGHT);
 
         const relVx = player.vx - ast.vx;
         const relVy = player.vy - ast.vy;
@@ -661,25 +707,35 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           player.vy -= 1.85 * normalVel * ny;
         }
 
-        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
-          const impactDmg = Math.min(45, Math.max(14, Math.round(currentSpeed * 0.025)));
-          player.hp -= impactDmg;
+        const recentEnvHit = nowMs - (lastEnvHitAt.get(player.id) || 0) < 260;
+        if (
+          !recentEnvHit &&
+          player.invulnerableTimer <= 0 &&
+          !player.cheats?.godMode &&
+          !player.warping
+        ) {
+          lastEnvHitAt.set(player.id, nowMs);
+          const impactSpeed = Math.max(currentSpeed, Math.hypot(relVx, relVy));
+          const impactDmg = Math.min(55, Math.max(18, Math.round(impactSpeed * 0.035)));
+          player.hp = Math.max(0, player.hp - impactDmg);
           player.invulnerableTimer = 0.25;
           const fatal = player.hp <= 0;
           broadcastRoom(room, {
             type: 'combat:hit',
             targetId: player.id,
             attackerId: ast.id,
-            x: player.x,
-            y: player.y,
-            vx: player.vx,
-            vy: player.vy,
+            x: Math.round(player.x),
+            y: Math.round(player.y),
+            vx: Math.round(player.vx),
+            vy: Math.round(player.vy),
             damage: impactDmg,
             fatal,
             color: '#94A3B8',
+            cause: 'asteroid',
+            deathSound: player.deathSound,
           });
           if (fatal) {
-            recordKill(room, null, player, 'asteroid', currentSpeed);
+            recordKill(room, null, player, 'asteroid', impactSpeed);
             break;
           }
         }
@@ -691,8 +747,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     // Planetary gravity slingshots & surface collisions
     for (let i = 0; i < room.planets.length; i++) {
       const planet = room.planets[i];
-      const dx = planet.x - player.x;
-      const dy = planet.y - player.y;
+      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
+      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
       const distSq = dx * dx + dy * dy;
       const minSep = spec.radius + planet.radius;
 
@@ -700,21 +756,45 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         const dist = Math.sqrt(distSq);
         const nx = -dx / dist; // Outward normal from planet center to ship
         const ny = -dy / dist;
-        player.x = wrapCoord(planet.x + nx * (minSep + 3), ARENA_WIDTH);
-        player.y = wrapCoord(planet.y + ny * (minSep + 3), ARENA_HEIGHT);
 
         const relVx = player.vx - planet.vx;
         const relVy = player.vy - planet.vy;
+        const relSpeed = Math.hypot(relVx, relVy);
+
+        // If hitting the planet at <= 500 u/s, anchor/land the ship on the planet surface with 0 damage!
+        if (!player.isDrone && !player.warping && currentSpeed <= PLANET_LANDING_SPEED_THRESHOLD) {
+          const surfaceAngle = Math.atan2(ny, nx);
+          player.landedPlanetId = planet.id;
+          player.landedSurfaceAngle = surfaceAngle;
+          const anchorDist = planet.radius + spec.radius + 2;
+          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, ARENA_WIDTH);
+          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, ARENA_HEIGHT);
+          player.vx = planet.vx;
+          player.vy = planet.vy;
+          break;
+        }
+
+        player.x = wrapCoord(planet.x + nx * (minSep + 4), ARENA_WIDTH);
+        player.y = wrapCoord(planet.y + ny * (minSep + 4), ARENA_HEIGHT);
+
         const normalVel = relVx * nx + relVy * ny;
         if (normalVel < 0 && !player.warping) {
           player.vx -= 1.85 * normalVel * nx;
           player.vy -= 1.85 * normalVel * ny;
         }
 
-        if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
-          const impactDmg = Math.min(55, Math.max(18, Math.round(currentSpeed * 0.03)));
-          player.hp -= impactDmg;
-          player.invulnerableTimer = 0.3;
+        const recentEnvHit = nowMs - (lastEnvHitAt.get(player.id) || 0) < 260;
+        if (
+          !recentEnvHit &&
+          player.invulnerableTimer <= 0 &&
+          !player.cheats?.godMode &&
+          !player.warping
+        ) {
+          lastEnvHitAt.set(player.id, nowMs);
+          const impactSpeed = Math.max(currentSpeed, relSpeed);
+          const impactDmg = Math.min(65, Math.max(22, Math.round(impactSpeed * 0.038)));
+          player.hp = Math.max(0, player.hp - impactDmg);
+          player.invulnerableTimer = 0.28;
           const fatal = player.hp <= 0;
           broadcastRoom(room, {
             type: 'combat:hit',
@@ -727,9 +807,11 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
             damage: impactDmg,
             fatal,
             color: planet.color,
+            cause: 'planet',
+            deathSound: player.deathSound,
           });
           if (fatal) {
-            recordKill(room, null, player, 'planet', currentSpeed);
+            recordKill(room, null, player, 'planet', impactSpeed);
             break;
           }
         }
@@ -903,15 +985,22 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       }
     }
 
+    const bulletOwner = room.players.get(bullet.ownerId) || null;
+    const justFiredFromLanded = bullet.maxTtl - bullet.ttl < 0.25;
+
     // Check collision against orbiting planets
     let hitPlanet = false;
     for (let i = 0; i < room.planets.length; i++) {
       const planet = room.planets[i];
+      const effRadius =
+        justFiredFromLanded && bulletOwner?.landedPlanetId === planet.id
+          ? Math.max(20, planet.radius - 20)
+          : planet.radius;
       const pdx = bullet.x - planet.x;
-      if (Math.abs(pdx) > planet.radius) continue;
+      if (Math.abs(pdx) > effRadius) continue;
       const pdy = bullet.y - planet.y;
-      if (Math.abs(pdy) > planet.radius) continue;
-      if (pdx * pdx + pdy * pdy <= planet.radius * planet.radius) {
+      if (Math.abs(pdy) > effRadius) continue;
+      if (pdx * pdx + pdy * pdy <= effRadius * effRadius) {
         hitPlanet = true;
         break;
       }
@@ -923,8 +1012,6 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
 
     let hitSomething = false;
-
-    const bulletOwner = room.players.get(bullet.ownerId) || null;
 
     for (let i = 0; i < alivePlayers.length; i++) {
       const entry = alivePlayers[i];
@@ -1424,11 +1511,34 @@ async function startServer() {
             player.shipPng = msg.shipPng;
           }
 
+          if (msg.cheats) {
+            const wasGodMode = Boolean(player.cheats?.godMode);
+            player.cheats = {
+              homingMissiles: Boolean(msg.cheats.homingMissiles),
+              rapidFire: Boolean(msg.cheats.rapidFire),
+              novaSpread: Boolean(msg.cheats.novaSpread),
+              godMode: Boolean(msg.cheats.godMode),
+              freeCam: Boolean(msg.cheats.freeCam),
+            };
+            if (wasGodMode && !player.cheats.godMode) {
+              player.invulnerableTimer = 0;
+            }
+          }
+
           const wasWarping = Boolean(player.warping);
           player.warping = player.spectating ? false : Boolean(msg.warping);
           player.thrusting = player.spectating ? false : Boolean(msg.thrusting);
           player.shooting = player.spectating ? false : Boolean(msg.shooting);
           player.inputSource = msg.inputSource;
+          if (msg.landedPlanetId !== undefined) {
+            player.landedPlanetId = player.warping ? null : msg.landedPlanetId;
+          }
+          if (
+            typeof msg.landedSurfaceAngle === 'number' &&
+            Number.isFinite(msg.landedSurfaceAngle)
+          ) {
+            player.landedSurfaceAngle = msg.landedSurfaceAngle;
+          }
 
           if (
             player.alive &&
@@ -1461,12 +1571,54 @@ async function startServer() {
           return;
         }
 
+        if (msg.type === 'player:env_hit') {
+          const ownedIds = socketToPlayerIds.get(ws);
+          if (!ownedIds || !ownedIds.has(msg.playerId)) return;
+          const player = room.players.get(msg.playerId);
+          if (!player || !player.alive) return;
+          if (player.cheats?.godMode || player.warping) return;
+
+          const nowMs = Date.now();
+          if (nowMs - (lastEnvHitAt.get(player.id) || 0) < 220) return;
+          lastEnvHitAt.set(player.id, nowMs);
+
+          const safeDamage = Math.max(1, Math.min(200, Math.round(Number(msg.damage) || 20)));
+          player.x = wrapCoord(Number(msg.x) || player.x, ARENA_WIDTH);
+          player.y = wrapCoord(Number(msg.y) || player.y, ARENA_HEIGHT);
+          player.vx = Number(msg.vx) || player.vx;
+          player.vy = Number(msg.vy) || player.vy;
+          player.hp = Math.max(0, player.hp - safeDamage);
+          player.invulnerableTimer = 0.25;
+
+          const isFatal = Boolean(msg.fatal) || player.hp <= 0;
+          broadcastRoom(room, {
+            type: 'combat:hit',
+            targetId: player.id,
+            attackerId: msg.sourceId || msg.cause,
+            x: Math.round(player.x),
+            y: Math.round(player.y),
+            vx: Math.round(player.vx),
+            vy: Math.round(player.vy),
+            damage: safeDamage,
+            fatal: isFatal,
+            color: msg.sourceColor || '#94A3B8',
+            cause: msg.cause,
+            deathSound: player.deathSound,
+          });
+
+          if (isFatal) {
+            recordKill(room, null, player, msg.cause, Number(msg.impactSpeed) || 0);
+          }
+          return;
+        }
+
         if (msg.type === 'player:cheats') {
           const ownedIds = socketToPlayerIds.get(ws);
           if (!ownedIds || !ownedIds.has(msg.playerId)) return;
           const player = room.players.get(msg.playerId);
           if (!player) return;
 
+          const wasGodMode = Boolean(player.cheats?.godMode);
           player.cheats = {
             homingMissiles: Boolean(msg.cheats.homingMissiles),
             rapidFire: Boolean(msg.cheats.rapidFire),
@@ -1474,6 +1626,9 @@ async function startServer() {
             godMode: Boolean(msg.cheats.godMode),
             freeCam: Boolean(msg.cheats.freeCam),
           };
+          if (wasGodMode && !player.cheats.godMode) {
+            player.invulnerableTimer = 0;
+          }
           player.spectating = Boolean(msg.cheats.freeCam);
           if (player.spectating) {
             player.warping = false;

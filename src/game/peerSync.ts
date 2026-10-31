@@ -350,9 +350,11 @@ export function mergeSmoothRemotePlayerState(
   if (dy < -ARENA_HEIGHT * 0.5) dy += ARENA_HEIGHT;
   const dist = Math.hypot(dx, dy);
 
-  // Hard-snap if the ship just respawned, died, exited Warp Speed to a zero-momentum stop, or warped > 2200u
+  // Hard-snap if the ship just respawned, died, exited Warp Speed to a zero-momentum stop, landed on a planet, or warped > 2200u
   const justStoppedWarp = Boolean(existing.warping && !incoming.warping);
-  const shouldSnap = !existing.alive || !incoming.alive || justStoppedWarp || dist > 2200;
+  const justLanded = Boolean(!existing.landedPlanetId && incoming.landedPlanetId);
+  const shouldSnap =
+    !existing.alive || !incoming.alive || justStoppedWarp || justLanded || dist > 2200;
 
   let cursorShouldSnap =
     typeof existing.cursorX !== 'number' || typeof existing.cursorY !== 'number';

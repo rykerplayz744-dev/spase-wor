@@ -157,6 +157,8 @@ export interface PlayerState {
   deathSound?: string;
   shipPng?: string | null;
   warping?: boolean;
+  landedPlanetId?: string | null;
+  landedSurfaceAngle?: number;
   // Client-side interpolation targets to hide choppy relay updates
   netTargetX?: number;
   netTargetY?: number;
@@ -169,6 +171,7 @@ export interface PlayerState {
 }
 
 export const SHIP_SMASH_SPEED_THRESHOLD = 1000;
+export const PLANET_LANDING_SPEED_THRESHOLD = 500;
 export const WARP_DRIVE_SPEED = 4800;
 
 export interface BulletState {
@@ -344,6 +347,24 @@ export type ClientToServerMessage =
       deathSound?: string;
       shipPng?: string | null;
       warping?: boolean;
+      landedPlanetId?: string | null;
+      landedSurfaceAngle?: number;
+      cheats?: PlayerCheats;
+    }
+  | {
+      type: 'player:env_hit';
+      playerId: string;
+      cause: 'asteroid' | 'planet';
+      sourceId: string;
+      sourceName: string;
+      sourceColor: string;
+      damage: number;
+      fatal: boolean;
+      impactSpeed: number;
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
     }
   | {
       type: 'player:cheats';

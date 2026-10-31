@@ -82,6 +82,7 @@ interface HudTelemetry {
   pingMs: number;
   secondPadAvailable: boolean;
   localCoopActive: boolean;
+  landedPlanetName: string | null;
 }
 
 const HULL_LIST: ShipHullType[] = ['needle', 'wedge', 'interceptor', 'disc'];
@@ -139,6 +140,7 @@ export default function App() {
     pingMs: 12,
     secondPadAvailable: false,
     localCoopActive: false,
+    landedPlanetName: null,
   });
 
   // Mutable simulation refs isolated from React render cycle for 60fps canvas loop
@@ -182,6 +184,7 @@ export default function App() {
   isMutedRef.current = isMuted;
   const lastDamagedRemoteAtRef = useRef<Map<string, number>>(new Map());
   const lastLocalSunHitAtRef = useRef<number>(0);
+  const lastLocalEnvHitAtRef = useRef<number>(0);
   const seenChatIdsRef = useRef<Set<string>>(new Set());
   const serverWideTimerRef = useRef<number | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
@@ -465,19 +468,28 @@ export default function App() {
 
               if (isLocalControlled && existing) {
                 const wasAlive = existing.alive;
+                const recentlyEnvDamaged =
+                  serverPlayer.id === selfIdRef.current &&
+                  Date.now() - lastLocalEnvHitAtRef.current < 650;
                 existing.name = serverPlayer.name;
-                existing.hp = serverPlayer.hp;
+                if (!recentlyEnvDamaged || serverPlayer.hp <= existing.hp || !serverPlayer.alive) {
+                  existing.hp = serverPlayer.hp;
+                  existing.alive = serverPlayer.alive;
+                }
                 existing.maxHp = serverPlayer.maxHp;
                 existing.score = serverPlayer.score;
                 existing.kills = serverPlayer.kills;
                 existing.deaths = serverPlayer.deaths;
                 existing.streak = serverPlayer.streak;
-                existing.alive = serverPlayer.alive;
                 existing.respawnTimer = serverPlayer.respawnTimer;
-                existing.invulnerableTimer = serverPlayer.invulnerableTimer;
+                if (!wasAlive && serverPlayer.alive) {
+                  existing.invulnerableTimer = serverPlayer.invulnerableTimer;
+                }
 
                 if (!serverPlayer.alive && serverPlayer.id === selfIdRef.current) {
                   existing.warping = false;
+                  existing.landedPlanetId = null;
+                  existing.landedSurfaceAngle = undefined;
                   if (warpSpeedActiveRef.current) {
                     warpSpeedActiveRef.current = false;
                     setWarpSpeedActive(false);
@@ -565,7 +577,11 @@ export default function App() {
               (msg.attackerId === 'star' ||
                 msg.cause === 'star' ||
                 Date.now() - lastLocalSunHitAtRef.current < 1500);
-            if (isLocalSunEcho) {
+            const isLocalEnvEcho =
+              msg.targetId === selfIdRef.current &&
+              (msg.cause === 'asteroid' || msg.cause === 'planet') &&
+              Date.now() - lastLocalEnvHitAtRef.current < 650;
+            if (isLocalSunEcho || isLocalEnvEcho) {
               return;
             }
             const renderer = rendererRef.current;
@@ -913,6 +929,8 @@ export default function App() {
             deathSound: lp.deathSound,
             shipPng: lp.shipPng,
             warping: lp.warping,
+            landedPlanetId: lp.landedPlanetId,
+            landedSurfaceAngle: lp.landedSurfaceAngle,
           });
         } else {
           peerSync.send({
@@ -1028,6 +1046,9 @@ export default function App() {
       const localPlayer = worldRef.current.players.get(selfIdRef.current);
       if (localPlayer) {
         localPlayer.cheats = nextCheats;
+        if (!nextCheats.godMode) {
+          localPlayer.invulnerableTimer = 0;
+        }
         localPlayer.spectating = Boolean(nextCheats.freeCam);
         if (nextCheats.freeCam) {
           localPlayer.warping = false;
@@ -1141,6 +1162,8 @@ export default function App() {
           });
         }
       } else if (action === 'momentum_boost' && localPlayer && localPlayer.alive) {
+        localPlayer.landedPlanetId = null;
+        localPlayer.landedSurfaceAngle = undefined;
         localPlayer.vx += Math.cos(localPlayer.angle) * 2500;
         localPlayer.vy += Math.sin(localPlayer.angle) * 2500;
         const spd = Math.hypot(localPlayer.vx, localPlayer.vy);
@@ -1226,6 +1249,8 @@ export default function App() {
     const renderer = rendererRef.current;
 
     if (nextWarp) {
+      localPlayer.landedPlanetId = null;
+      localPlayer.landedSurfaceAngle = undefined;
       // Engage Warp Speed Drive: full invincibility + warp velocity along ship heading
       localPlayer.invulnerableTimer = Math.max(localPlayer.invulnerableTimer, 0.5);
       const currentSpd = Math.hypot(localPlayer.vx, localPlayer.vy);
@@ -1287,6 +1312,8 @@ export default function App() {
       deathSound: localPlayer.deathSound,
       shipPng: localPlayer.shipPng,
       warping: localPlayer.warping,
+      landedPlanetId: localPlayer.landedPlanetId,
+      landedSurfaceAngle: localPlayer.landedSurfaceAngle,
     });
   }, [sendWs]);
 
@@ -1647,11 +1674,120 @@ export default function App() {
           localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
           localPlayer.inputSource = sampled.inputSource;
 
+          const applyEnvironmentHit = (
+            target: PlayerState,
+            cause: 'asteroid' | 'planet',
+            sourceId: string,
+            sourceName: string,
+            sourceColor: string,
+            damage: number,
+            fatal: boolean,
+            impactSpeed: number
+          ) => {
+            if (target.cheats?.godMode || target.warping) return;
+            target.hp = Math.max(0, target.hp - damage);
+            const isFatal = fatal || target.hp <= 0;
+            if (target.id === selfIdRef.current) {
+              lastLocalEnvHitAtRef.current = Date.now();
+            }
+
+            renderer.hitFlashes.set(target.id, 0.14);
+            if (target.id === selfIdRef.current) {
+              renderer.cameraShake = isFatal ? 14 : 6;
+              if (isFatal) {
+                renderer.hitstopTimer = 0.045;
+              }
+              soundEngine.playHit(isFatal);
+            }
+
+            let killEntry: KillFeedEntry | undefined;
+            if (isFatal) {
+              target.alive = false;
+              target.hp = 0;
+              target.deaths += 1;
+              target.streak = 0;
+              target.respawnTimer = 2.8;
+              target.warping = false;
+              target.landedPlanetId = null;
+              target.landedSurfaceAngle = undefined;
+              if (target.id === selfIdRef.current) {
+                warpSpeedActiveRef.current = false;
+                setWarpSpeedActive(false);
+              }
+              renderer.addBurst(
+                target.x,
+                target.y,
+                target.vx * 0.2,
+                target.vy * 0.2,
+                sourceColor,
+                34,
+                320,
+                true
+              );
+              deathSoundCtrlRef.current.playDeathSound(target.deathSound, isMutedRef.current);
+
+              if (!isWsConnected) {
+                killEntry = {
+                  id: `kill_env_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+                  killerId: sourceId,
+                  killerName: sourceName,
+                  killerColor: sourceColor,
+                  victimId: target.id,
+                  victimName: target.name,
+                  victimColor: target.color,
+                  cause,
+                  speedAtKill: impactSpeed,
+                  timestamp: Date.now(),
+                };
+                world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+              }
+            }
+
+            if (isWsConnected && (target.id === selfIdRef.current || target.id === coopIdRef.current)) {
+              sendWs({
+                type: 'player:env_hit',
+                playerId: target.id,
+                cause,
+                sourceId,
+                sourceName,
+                sourceColor,
+                damage,
+                fatal: isFatal,
+                impactSpeed,
+                x: Math.round(target.x),
+                y: Math.round(target.y),
+                vx: Math.round(target.vx),
+                vy: Math.round(target.vy),
+              });
+            } else if (!isWsConnected) {
+              peerSyncRef.current?.send({
+                type: 'peer:combat_hit',
+                senderId: selfIdRef.current,
+                hitId: `env_${Date.now().toString(36)}_${target.id}`,
+                targetId: target.id,
+                attackerId: sourceId,
+                x: Math.round(target.x),
+                y: Math.round(target.y),
+                vx: Math.round(target.vx),
+                vy: Math.round(target.vy),
+                damage,
+                fatal: isFatal,
+                color: sourceColor,
+                cause,
+                deathSound: target.deathSound,
+                killEntry,
+              });
+            }
+          };
+
+          localPlayer.cheats = cheatsRef.current;
           renderer.stepLocalPlayerPhysics(
             localPlayer,
             dt,
             world.gravityStarEnabled,
-            world.planets
+            world.planets,
+            world.asteroids,
+            applyEnvironmentHit
           );
 
           // Prevent getting stuck inside the giant Sun's gravity well:
@@ -1816,7 +1952,7 @@ export default function App() {
 
             if (p.cheats?.godMode) {
               p.hp = p.maxHp;
-              p.invulnerableTimer = 0.25;
+              p.invulnerableTimer = 0;
             } else if (p.invulnerableTimer > 0) {
               p.invulnerableTimer = Math.max(0, p.invulnerableTimer - dt);
             }
@@ -1834,7 +1970,41 @@ export default function App() {
                 p,
                 dt,
                 world.gravityStarEnabled,
-                world.planets
+                world.planets,
+                world.asteroids,
+                (target, cause, sourceId, sourceName, sourceColor, damage, fatal, impactSpeed) => {
+                  target.hp = Math.max(0, target.hp - damage);
+                  if (fatal || target.hp <= 0) {
+                    target.alive = false;
+                    target.hp = 0;
+                    target.deaths += 1;
+                    target.streak = 0;
+                    target.respawnTimer = 2.8;
+                    renderer.addBurst(
+                      target.x,
+                      target.y,
+                      target.vx * 0.2,
+                      target.vy * 0.2,
+                      sourceColor,
+                      28,
+                      260,
+                      true
+                    );
+                    const killEntry: KillFeedEntry = {
+                      id: `kill_ai_env_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+                      killerId: sourceId,
+                      killerName: sourceName,
+                      killerColor: sourceColor,
+                      victimId: target.id,
+                      victimName: target.name,
+                      victimColor: target.color,
+                      cause,
+                      speedAtKill: impactSpeed,
+                      timestamp: Date.now(),
+                    };
+                    world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+                  }
+                }
               );
 
               // Respawn AI drone at a safe orbit if pulled into the central Gravity Star
@@ -2260,7 +2430,10 @@ export default function App() {
         }
 
         const currentSpeed = Math.hypot(localPlayer.vx, localPlayer.vy);
-        soundEngine.updateThrust(localPlayer.thrusting, currentSpeed);
+        soundEngine.updateThrust(
+          localPlayer.thrusting && !localPlayer.landedPlanetId,
+          currentSpeed
+        );
 
         const hullSpec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
         const activeCheats = cheatsRef.current;
@@ -2387,6 +2560,9 @@ export default function App() {
             deathSound: localPlayer.deathSound,
             shipPng: localPlayer.shipPng,
             warping: localPlayer.warping,
+            landedPlanetId: localPlayer.landedPlanetId,
+            landedSurfaceAngle: localPlayer.landedSurfaceAngle,
+            cheats: cheatsRef.current,
           });
         }
 
@@ -2402,7 +2578,13 @@ export default function App() {
             }
             p2.thrusting = Boolean(pad2.buttons[7]?.pressed || pad2.buttons[0]?.pressed) && p2.alive;
             p2.shooting = Boolean(pad2.buttons[5]?.pressed || pad2.buttons[2]?.pressed) && p2.alive;
-            renderer.stepLocalPlayerPhysics(p2, dt, world.gravityStarEnabled);
+            renderer.stepLocalPlayerPhysics(
+              p2,
+              dt,
+              world.gravityStarEnabled,
+              world.planets,
+              world.asteroids
+            );
             if (now - lastNetSend < 18) {
               sendWs({
                 type: 'player:input',
@@ -2522,7 +2704,15 @@ export default function App() {
 
       if (now - lastHudSync > hudSyncInterval) {
         lastHudSync = now;
-        const speed = localPlayer ? Math.round(Math.hypot(localPlayer.vx, localPlayer.vy)) : 0;
+        const landedPlanetObj =
+          localPlayer && localPlayer.landedPlanetId
+            ? world.planets.find((pl) => pl.id === localPlayer.landedPlanetId) || null
+            : null;
+        const speed = localPlayer
+          ? landedPlanetObj
+            ? 0
+            : Math.round(Math.hypot(localPlayer.vx, localPlayer.vy))
+          : 0;
         const sortedPlayers = Array.from(world.players.values())
           .sort(
             (a, b) =>
@@ -2555,6 +2745,7 @@ export default function App() {
           pingMs: world.pingMs,
           secondPadAvailable: pads.length > 1,
           localCoopActive: coopActiveRef.current,
+          landedPlanetName: landedPlanetObj ? landedPlanetObj.name : null,
         });
       }
 
@@ -3026,7 +3217,11 @@ export default function App() {
 
               {/* Direct Vector Heading & Input Status */}
               <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
-                <span>{getMomentumLabel(hud.speed)}</span>
+                <span className={hud.landedPlanetName ? 'font-bold text-emerald-400' : ''}>
+                  {hud.landedPlanetName
+                    ? `ANCHORED: ${hud.landedPlanetName}`
+                    : getMomentumLabel(hud.speed)}
+                </span>
                 <span className="mx-1.5 text-slate-600">·</span>
                 <span className="text-slate-300">HDG {hud.angleDeg}°</span>
                 <span className="mx-1.5 text-slate-600">·</span>
