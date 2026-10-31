@@ -76,6 +76,7 @@ interface HudTelemetry {
   gamepadName: string;
   stickActive: boolean;
   playerCount: number;
+  droneCount: number;
   leaderboard: PlayerState[];
   killFeed: KillFeedEntry[];
   gravityStarEnabled: boolean;
@@ -134,6 +135,7 @@ export default function App() {
     gamepadName: '',
     stickActive: false,
     playerCount: 1,
+    droneCount: 0,
     leaderboard: [],
     killFeed: [],
     gravityStarEnabled: true,
@@ -1177,54 +1179,49 @@ export default function App() {
         localPlayer.warping = false;
         localPlayer.vx = 0;
         localPlayer.vy = 0;
-      } else if (
-        !isWsConnected &&
-        (action === 'spawn_drone' || action === 'spawn_drones_100')
-      ) {
+      } else if (action === 'spawn_drone' || action === 'spawn_drones_100') {
         const countToSpawn = action === 'spawn_drones_100' ? 100 : 1;
-        // Keep total drones capped at 100 so multiple +100 clicks refresh the fleet instead of piling up 1,000+ drones on Chromebooks
-        let currentDroneCount = 0;
-        for (const p of world.players.values()) {
-          if (p.isDrone) currentDroneCount++;
+        if (!isWsConnected) {
+          const spawnedDrones = createTargetDronesBatch(
+            world.players,
+            countToSpawn,
+            localPlayer
+          );
+          for (const d of spawnedDrones) {
+            world.players.set(d.id, d);
+          }
+          peerSyncRef.current?.send({
+            type: 'peer:cheat_action',
+            senderId: selfIdRef.current,
+            playerId: selfIdRef.current,
+            action,
+            spawnedDrones,
+          });
         }
-        const excess = currentDroneCount + countToSpawn - 105;
-        if (excess > 0) {
-          let removed = 0;
+        setHud((prev) => ({
+          ...prev,
+          droneCount: prev.droneCount + countToSpawn,
+          playerCount: prev.playerCount + countToSpawn,
+        }));
+      } else if (action === 'clear_drones') {
+        if (!isWsConnected) {
           for (const [pid, p] of world.players.entries()) {
             if (p.isDrone) {
               world.players.delete(pid);
-              removed++;
-              if (removed >= excess) break;
             }
           }
+          peerSyncRef.current?.send({
+            type: 'peer:cheat_action',
+            senderId: selfIdRef.current,
+            playerId: selfIdRef.current,
+            action: 'clear_drones',
+          });
         }
-        const spawnedDrones = createTargetDronesBatch(
-          world.players,
-          countToSpawn,
-          localPlayer
-        );
-        for (const d of spawnedDrones) {
-          world.players.set(d.id, d);
-        }
-        peerSyncRef.current?.send({
-          type: 'peer:cheat_action',
-          senderId: selfIdRef.current,
-          playerId: selfIdRef.current,
-          action,
-          spawnedDrones,
-        });
-      } else if (!isWsConnected && action === 'clear_drones') {
-        for (const [pid, p] of world.players.entries()) {
-          if (p.isDrone) {
-            world.players.delete(pid);
-          }
-        }
-        peerSyncRef.current?.send({
-          type: 'peer:cheat_action',
-          senderId: selfIdRef.current,
-          playerId: selfIdRef.current,
-          action: 'clear_drones',
-        });
+        setHud((prev) => ({
+          ...prev,
+          droneCount: 0,
+          playerCount: Math.max(1, prev.playerCount - prev.droneCount),
+        }));
       }
 
       sendWs({
@@ -2683,18 +2680,6 @@ export default function App() {
         );
       }
 
-      // Keep drone count bounded if a remote peer or relay sent excess drones
-      if (world.players.size > 115) {
-        let excess = world.players.size - 108;
-        for (const [pid, p] of world.players.entries()) {
-          if (p.isDrone && pid !== selfIdRef.current) {
-            world.players.delete(pid);
-            excess--;
-            if (excess <= 0) break;
-          }
-        }
-      }
-
       const anyModalOpen =
         cheatMenuOpenRef.current ||
         controllerModalOpenRef.current ||
@@ -2713,7 +2698,12 @@ export default function App() {
             ? 0
             : Math.round(Math.hypot(localPlayer.vx, localPlayer.vy))
           : 0;
-        const sortedPlayers = Array.from(world.players.values())
+        const allPlayers = Array.from(world.players.values());
+        let totalDrones = 0;
+        for (let i = 0; i < allPlayers.length; i++) {
+          if (allPlayers[i].isDrone) totalDrones++;
+        }
+        const sortedPlayers = allPlayers
           .sort(
             (a, b) =>
               Number(Boolean(a.isDrone)) - Number(Boolean(b.isDrone)) ||
@@ -2739,6 +2729,7 @@ export default function App() {
           gamepadName: sampled.gamepadName,
           stickActive: sampled.stickVector.active,
           playerCount: world.players.size,
+          droneCount: totalDrones,
           leaderboard: sortedPlayers,
           killFeed: world.killFeed,
           gravityStarEnabled: world.gravityStarEnabled,
@@ -3748,6 +3739,7 @@ export default function App() {
         onUpdateCheats={handleUpdateCheats}
         onTriggerAction={handleTriggerCheatAction}
         playerCount={hud.playerCount}
+        droneCount={hud.droneCount}
         players={hud.leaderboard}
         selfId={selfIdRef.current}
         onCheatRenameShip={handleCheatRenameShip}

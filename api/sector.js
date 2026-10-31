@@ -83,18 +83,13 @@ export default function handler(req, res) {
           activePlayers.delete(pkt.playerId);
         }
 
-        // Maintain shared target drones on the relay (capped at 100 so serverless polls stay fast on Chromebooks)
+        // Maintain shared target drones on the relay with no max ship cap
         if (pkt.type === 'peer:cheat_action') {
           if (Array.isArray(pkt.spawnedDrones)) {
             for (const d of pkt.spawnedDrones) {
               if (d && typeof d.id === 'string') {
                 sharedDrones.set(d.id, d);
               }
-            }
-            while (sharedDrones.size > 100) {
-              const oldestKey = sharedDrones.keys().next().value;
-              if (!oldestKey) break;
-              sharedDrones.delete(oldestKey);
             }
           } else if (pkt.action === 'clear_drones') {
             sharedDrones.clear();

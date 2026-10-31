@@ -35,6 +35,7 @@ interface CheatMenuModalProps {
   onUpdateCheats: (next: PlayerCheats) => void;
   onTriggerAction: (action: CheatActionType) => void;
   playerCount: number;
+  droneCount: number;
   players: PlayerState[];
   selfId: string;
   onCheatRenameShip: (targetId: string | 'ALL_OTHERS', newName: string) => void;
@@ -54,6 +55,7 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
   onUpdateCheats,
   onTriggerAction,
   playerCount,
+  droneCount,
   players,
   selfId,
   onCheatRenameShip,
@@ -427,7 +429,7 @@ export const CheatMenuModal: React.FC<CheatMenuModalProps> = ({
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-slate-800/90 bg-[#060913] px-3.5 py-3">
             <div>
               <div className="text-xs font-semibold text-slate-200">
-                Target Ship Fleet Spawner ({players.filter((p) => p.isDrone).length} spawned / {playerCount} total in sector)
+                Target Ship Fleet Spawner ({droneCount} spawned / {playerCount} total in sector)
               </div>
               <div className="text-[11px] text-slate-400">
                 Spawn single target ships, unleash 100 target ships at once, or remove all spawned ships.

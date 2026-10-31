@@ -1668,21 +1668,6 @@ async function startServer() {
             player.vy = 0;
           } else if (msg.action === 'spawn_drone' || msg.action === 'spawn_drones_100') {
             const countToSpawn = msg.action === 'spawn_drones_100' ? 100 : 1;
-            let currentDrones = 0;
-            for (const p of room.players.values()) {
-              if (p.isDrone) currentDrones++;
-            }
-            const excess = currentDrones + countToSpawn - 105;
-            if (excess > 0) {
-              let removed = 0;
-              for (const [pid, p] of room.players.entries()) {
-                if (p.isDrone) {
-                  room.players.delete(pid);
-                  removed++;
-                  if (removed >= excess) break;
-                }
-              }
-            }
             const spawnedDrones = createTargetDronesBatch(room.players, countToSpawn, player);
             for (const drone of spawnedDrones) {
               room.players.set(drone.id, drone);
