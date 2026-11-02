@@ -17,6 +17,14 @@ import {
 
 const HULL_LIST: ShipHullType[] = ['needle', 'wedge', 'interceptor', 'disc'];
 
+export interface DroneBatchSpec {
+  seed: number;
+  count: number;
+  startNum: number;
+  refX?: number;
+  refY?: number;
+}
+
 export type PeerSyncPacket =
   | {
       type: 'peer:hello';
@@ -54,6 +62,7 @@ export type PeerSyncPacket =
       senderId: string;
       playerId: string;
       action: CheatActionType;
+      droneBatch?: DroneBatchSpec;
       spawnedDrones?: PlayerState[];
     }
   | {
@@ -188,103 +197,112 @@ const SQUAD_CALLSIGNS = [
   'PHANTOM',
 ];
 
-function randomSafeSectorCoords(): { x: number; y: number } {
+function createSeededRng(seed: number): () => number {
+  let t = seed >>> 0;
+  return () => {
+    t += 0x6d2b79f5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seededSafeSectorCoords(rng: () => number): { x: number; y: number } {
   for (let attempt = 0; attempt < 20; attempt++) {
-    const x = Math.random() * ARENA_WIDTH;
-    const y = Math.random() * ARENA_HEIGHT;
+    const x = rng() * ARENA_WIDTH;
+    const y = rng() * ARENA_HEIGHT;
     if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > 1750) {
       return { x: Math.round(x), y: Math.round(y) };
     }
   }
-  return getSafeSunOrbitPoint();
+  const theta = rng() * Math.PI * 2;
+  const orbitRadius = 2200 + rng() * 1600;
+  return {
+    x: Math.round((((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH),
+    y: Math.round((((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT),
+  };
 }
 
-export function createTargetDronesBatch(
-  existingPlayers: Map<string, PlayerState>,
-  countToSpawn: number,
-  referencePlayer?: PlayerState | null
-): PlayerState[] {
+export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerState[] {
+  const rng = createSeededRng(spec.seed);
   const spawned: PlayerState[] = [];
-  let droneNum = Array.from(existingPlayers.values()).filter((p) => p.isDrone).length;
+  let droneNum = spec.startNum;
+  const hasRef = typeof spec.refX === 'number' && typeof spec.refY === 'number';
+  const refX = spec.refX ?? GRAVITY_STAR_X;
+  const refY = spec.refY ?? GRAVITY_STAR_Y;
 
   let currentSquadId: string | null = null;
   let currentSquadColor: string = PLAYER_COLORS[0];
-  let currentSquadAnchor = randomSafeSectorCoords();
-  let currentSquadHeading = Math.random() * Math.PI * 2;
+  let currentSquadAnchor = seededSafeSectorCoords(rng);
+  let currentSquadHeading = rng() * Math.PI * 2;
   let squadRemaining = 0;
-  let squadIndex = Math.floor(Math.random() * SQUAD_CALLSIGNS.length);
+  let squadIndex = Math.floor(rng() * SQUAD_CALLSIGNS.length);
 
-  for (let i = 0; i < countToSpawn; i++) {
+  for (let i = 0; i < spec.count; i++) {
     droneNum++;
-    const droneId = `drone_${Date.now().toString(36)}_${i}_${Math.random().toString(36).slice(2, 6)}`;
-    const hull = HULL_LIST[(existingPlayers.size + i) % HULL_LIST.length];
-    const spec = HULL_SPECS[hull];
+    const droneId = `drn_${spec.seed.toString(36)}_${i}`;
+    const hull = HULL_LIST[(spec.startNum + i) % HULL_LIST.length];
+    const hullSpec = HULL_SPECS[hull];
 
     let spawnX: number;
     let spawnY: number;
     let initAngle: number;
     let initSpeed: number;
     let squadId: string | null = null;
-    let color = PLAYER_COLORS[(existingPlayers.size + i) % PLAYER_COLORS.length];
+    let color = PLAYER_COLORS[(spec.startNum + i) % PLAYER_COLORS.length];
 
-    if (countToSpawn === 1 && referencePlayer) {
-      // Spawn single AI ship near the player at a random approach angle
-      const theta = Math.random() * Math.PI * 2;
-      const dist = 360 + Math.random() * 320;
-      spawnX = (((referencePlayer.x + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-      spawnY = (((referencePlayer.y + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-      initAngle = Math.atan2(referencePlayer.y - spawnY, referencePlayer.x - spawnX);
-      initSpeed = 240 + Math.random() * 140;
+    if (spec.count === 1 && hasRef) {
+      const theta = rng() * Math.PI * 2;
+      const dist = 360 + rng() * 320;
+      spawnX = (((refX + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+      spawnY = (((refY + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+      initAngle = Math.atan2(refY - spawnY, refX - spawnX);
+      initSpeed = 240 + rng() * 140;
+    } else if (squadRemaining > 0 && currentSquadId) {
+      squadId = currentSquadId;
+      color = currentSquadColor;
+      const wingAngle = rng() * Math.PI * 2;
+      const wingDist = 150 + rng() * 190;
+      spawnX = (((currentSquadAnchor.x + Math.cos(wingAngle) * wingAngleDist(wingDist)) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
+      spawnY = (((currentSquadAnchor.y + Math.sin(wingAngle) * wingAngleDist(wingDist)) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+      initAngle = currentSquadHeading + (rng() - 0.5) * 0.35;
+      initSpeed = 250 + rng() * 130;
+      squadRemaining--;
+    } else if (rng() < 0.52 && spec.count - i >= 2) {
+      const callsign = SQUAD_CALLSIGNS[squadIndex % SQUAD_CALLSIGNS.length];
+      squadIndex++;
+      currentSquadId = `${callsign}-${Math.floor(10 + rng() * 89)}`;
+      currentSquadColor = PLAYER_COLORS[squadIndex % PLAYER_COLORS.length];
+      currentSquadAnchor =
+        i < 6 && hasRef
+          ? {
+              x: (((refX + (rng() - 0.5) * 2600) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
+              y: (((refY + (rng() - 0.5) * 2200) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+            }
+          : seededSafeSectorCoords(rng);
+      currentSquadHeading = rng() * Math.PI * 2;
+      squadRemaining = rng() < 0.45 ? 2 : 1;
+      squadId = currentSquadId;
+      color = currentSquadColor;
+      spawnX = currentSquadAnchor.x;
+      spawnY = currentSquadAnchor.y;
+      initAngle = currentSquadHeading;
+      initSpeed = 260 + rng() * 130;
     } else {
-      // Mix of teamed tactical squads (~50% in 2-3 ship teams) and independent lone-wolf hunters (~50%)
-      if (squadRemaining > 0 && currentSquadId) {
-        squadId = currentSquadId;
-        color = currentSquadColor;
-        const wingAngle = Math.random() * Math.PI * 2;
-        const wingDist = 150 + Math.random() * 190;
-        spawnX = (((currentSquadAnchor.x + Math.cos(wingAngle) * wingAngleDist(wingDist)) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-        spawnY = (((currentSquadAnchor.y + Math.sin(wingAngle) * wingAngleDist(wingDist)) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-        initAngle = currentSquadHeading + (Math.random() - 0.5) * 0.35;
-        initSpeed = 250 + Math.random() * 130;
-        squadRemaining--;
-      } else if (Math.random() < 0.52 && countToSpawn - i >= 2) {
-        // Start a new 2-3 ship AI squad
-        const callsign = SQUAD_CALLSIGNS[squadIndex % SQUAD_CALLSIGNS.length];
-        squadIndex++;
-        currentSquadId = `${callsign}-${Math.floor(10 + Math.random() * 89)}`;
-        currentSquadColor = PLAYER_COLORS[squadIndex % PLAYER_COLORS.length];
-        currentSquadAnchor =
-          i < 6 && referencePlayer
-            ? {
-                x: (((referencePlayer.x + (Math.random() - 0.5) * 2600) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
-                y: (((referencePlayer.y + (Math.random() - 0.5) * 2200) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
-              }
-            : randomSafeSectorCoords();
-        currentSquadHeading = Math.random() * Math.PI * 2;
-        squadRemaining = Math.random() < 0.45 ? 2 : 1; // total 2 or 3 ships in this team
-        squadId = currentSquadId;
-        color = currentSquadColor;
-        spawnX = currentSquadAnchor.x;
-        spawnY = currentSquadAnchor.y;
-        initAngle = currentSquadHeading;
-        initSpeed = 260 + Math.random() * 130;
-      } else {
-        // Independent lone-wolf hunter at random sector coordinates
-        const pt =
-          i < 8 && referencePlayer
-            ? {
-                x: (((referencePlayer.x + (Math.random() - 0.5) * 3200) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
-                y: (((referencePlayer.y + (Math.random() - 0.5) * 2600) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
-              }
-            : randomSafeSectorCoords();
-        spawnX = pt.x;
-        spawnY = pt.y;
-        initAngle = Math.random() * Math.PI * 2;
-        initSpeed = 240 + Math.random() * 180;
-      }
+      const pt =
+        i < 8 && hasRef
+          ? {
+              x: (((refX + (rng() - 0.5) * 3200) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
+              y: (((refY + (rng() - 0.5) * 2600) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+            }
+          : seededSafeSectorCoords(rng);
+      spawnX = pt.x;
+      spawnY = pt.y;
+      initAngle = rng() * Math.PI * 2;
+      initSpeed = 240 + rng() * 180;
     }
 
-    const drone: PlayerState = {
+    spawned.push({
       id: droneId,
       name: `TARGET-${droneNum}`,
       color,
@@ -296,8 +314,8 @@ export function createTargetDronesBatch(
       angle: Number(initAngle.toFixed(3)),
       thrusting: true,
       shooting: false,
-      hp: spec.maxHp,
-      maxHp: spec.maxHp,
+      hp: hullSpec.maxHp,
+      maxHp: hullSpec.maxHp,
       score: 0,
       kills: 0,
       deaths: 0,
@@ -310,11 +328,38 @@ export function createTargetDronesBatch(
       inputSource: 'keyboard',
       isDrone: true,
       squadId,
-    };
-    spawned.push(drone);
+    });
   }
 
   return spawned;
+}
+
+export function createDroneBatchSpec(
+  existingPlayers: Map<string, PlayerState>,
+  countToSpawn: number,
+  referencePlayer?: PlayerState | null
+): DroneBatchSpec {
+  let startNum = 0;
+  for (const p of existingPlayers.values()) {
+    if (p.isDrone) startNum++;
+  }
+  const seed = ((Date.now() & 0x7fffffff) ^ Math.floor(Math.random() * 0x7fffffff)) >>> 0;
+  return {
+    seed,
+    count: countToSpawn,
+    startNum,
+    refX: referencePlayer ? Math.round(referencePlayer.x) : undefined,
+    refY: referencePlayer ? Math.round(referencePlayer.y) : undefined,
+  };
+}
+
+export function createTargetDronesBatch(
+  existingPlayers: Map<string, PlayerState>,
+  countToSpawn: number,
+  referencePlayer?: PlayerState | null
+): PlayerState[] {
+  const spec = createDroneBatchSpec(existingPlayers, countToSpawn, referencePlayer);
+  return createTargetDronesFromBatchSpec(spec);
 }
 
 function wingAngleDist(d: number): number {
@@ -401,6 +446,141 @@ export function mergeSmoothRemotePlayerState(
   };
 }
 
+function compactPlayerForWire(p: PlayerState): Partial<PlayerState> {
+  const hasActiveCheats =
+    p.cheats &&
+    (p.cheats.homingMissiles ||
+      p.cheats.rapidFire ||
+      p.cheats.novaSpread ||
+      p.cheats.godMode ||
+      p.cheats.freeCam);
+
+  const out: Partial<PlayerState> = {
+    id: p.id,
+    name: p.name,
+    color: p.color,
+    hull: p.hull,
+    x: Math.round(p.x),
+    y: Math.round(p.y),
+    vx: Math.round(p.vx),
+    vy: Math.round(p.vy),
+    angle: Number(p.angle.toFixed(2)),
+    thrusting: p.thrusting,
+    shooting: p.shooting,
+    hp: Math.round(p.hp),
+    maxHp: p.maxHp,
+    score: p.score,
+    kills: p.kills,
+    deaths: p.deaths,
+    streak: p.streak,
+    peakSpeed: Math.round(p.peakSpeed),
+    alive: p.alive,
+  };
+
+  if (hasActiveCheats) out.cheats = p.cheats;
+  if (p.spectating) {
+    out.spectating = true;
+    if (p.spectateTargetId) out.spectateTargetId = p.spectateTargetId;
+    if (typeof p.cursorX === 'number') out.cursorX = Math.round(p.cursorX);
+    if (typeof p.cursorY === 'number') out.cursorY = Math.round(p.cursorY);
+  }
+  if (p.music && p.music.isPlaying) {
+    out.music = {
+      filename: p.music.filename,
+      title: p.music.title,
+      isPlaying: true,
+      trackTime: Number(p.music.trackTime.toFixed(2)),
+      updatedAt: p.music.updatedAt,
+      volume: Number(p.music.volume.toFixed(2)),
+      loopTrack: p.music.loopTrack,
+    };
+  }
+  if (p.deathSound) out.deathSound = p.deathSound;
+  if (p.shipPng) out.shipPng = p.shipPng;
+  if (p.warping) out.warping = true;
+  if (p.landedPlanetId) {
+    out.landedPlanetId = p.landedPlanetId;
+    if (typeof p.landedSurfaceAngle === 'number') {
+      out.landedSurfaceAngle = Number(p.landedSurfaceAngle.toFixed(3));
+    }
+  }
+  return out;
+}
+
+function hydratePlayerFromWire(raw: Partial<PlayerState>): PlayerState {
+  const hull = raw.hull && HULL_SPECS[raw.hull] ? raw.hull : 'needle';
+  const maxHp = raw.maxHp ?? HULL_SPECS[hull].maxHp;
+  return {
+    id: raw.id || 'plr_unknown',
+    name: raw.name || 'PILOT',
+    color: raw.color || PLAYER_COLORS[0],
+    hull,
+    x: Number(raw.x) || GRAVITY_STAR_X,
+    y: Number(raw.y) || GRAVITY_STAR_Y,
+    vx: Number(raw.vx) || 0,
+    vy: Number(raw.vy) || 0,
+    angle: Number(raw.angle) || 0,
+    thrusting: Boolean(raw.thrusting),
+    shooting: Boolean(raw.shooting),
+    hp: typeof raw.hp === 'number' ? raw.hp : maxHp,
+    maxHp,
+    score: raw.score || 0,
+    kills: raw.kills || 0,
+    deaths: raw.deaths || 0,
+    streak: raw.streak || 0,
+    peakSpeed: raw.peakSpeed || 0,
+    alive: raw.alive !== false,
+    respawnTimer: raw.respawnTimer || 0,
+    invulnerableTimer: raw.invulnerableTimer || 0,
+    lastFireTime: 0,
+    inputSource: raw.inputSource || 'keyboard',
+    cheats: raw.cheats,
+    isDrone: Boolean(raw.isDrone),
+    squadId: raw.squadId ?? null,
+    spectating: Boolean(raw.spectating),
+    spectateTargetId: raw.spectateTargetId ?? null,
+    cursorX: raw.cursorX,
+    cursorY: raw.cursorY,
+    music: raw.music ?? null,
+    deathSound: raw.deathSound,
+    shipPng: raw.shipPng ?? null,
+    warping: Boolean(raw.warping),
+    landedPlanetId: raw.landedPlanetId ?? null,
+    landedSurfaceAngle: raw.landedSurfaceAngle,
+  };
+}
+
+function compactEventForWire(packet: PeerSyncPacket): PeerSyncPacket {
+  if (packet.type === 'peer:salvo') {
+    const s = packet.salvo;
+    return {
+      type: 'peer:salvo',
+      senderId: packet.senderId,
+      salvo: {
+        ...s,
+        x: Math.round(s.x),
+        y: Math.round(s.y),
+        vx: Math.round(s.vx),
+        vy: Math.round(s.vy),
+        angle: Number(s.angle.toFixed(3)),
+        spreadAngle: Number(s.spreadAngle.toFixed(3)),
+        targetIds: s.targetIds.length > 10 ? s.targetIds.slice(0, 10) : s.targetIds,
+      },
+    };
+  }
+  if (packet.type === 'peer:cheat_action' && packet.droneBatch) {
+    // Strip the 100-item spawnedDrones array from cloud HTTP packets; only send the 60-byte deterministic droneBatch seed!
+    return {
+      type: 'peer:cheat_action',
+      senderId: packet.senderId,
+      playerId: packet.playerId,
+      action: packet.action,
+      droneBatch: packet.droneBatch,
+    };
+  }
+  return packet;
+}
+
 /**
  * Provides automatic multi-window & serverless multiplayer synchronization when deployed
  * to static/serverless hosts like Vercel where the persistent `/ws` server is not running.
@@ -416,7 +596,10 @@ export class PeerSectorSync {
   private seenSalvos = new Set<string>();
   private seenHits = new Set<string>();
   private seenChats = new Set<string>();
+  private seenBatches = new Set<number>();
   private isPolling = false;
+  private lastPollTime = 0;
+  private lastCloudSalvoSentAt = 0;
   private focusedPeerId: string | null = null;
   private focusListenersCleanup: (() => void) | null = null;
 
@@ -521,6 +704,15 @@ export class PeerSectorSync {
         const first = this.seenChats.values().next().value;
         if (first) this.seenChats.delete(first);
       }
+    } else if (pkt.type === 'peer:cheat_action' && pkt.droneBatch) {
+      if (this.seenBatches.has(pkt.droneBatch.seed)) return;
+      this.seenBatches.add(pkt.droneBatch.seed);
+      if (!pkt.spawnedDrones) {
+        pkt = {
+          ...pkt,
+          spawnedDrones: createTargetDronesFromBatchSpec(pkt.droneBatch),
+        };
+      }
     }
 
     this.onPacket(pkt);
@@ -553,6 +745,8 @@ export class PeerSectorSync {
       this.seenHits.add(packet.hitId);
     } else if (packet.type === 'peer:chat' && packet.message?.id) {
       this.seenChats.add(packet.message.id);
+    } else if (packet.type === 'peer:cheat_action' && packet.droneBatch) {
+      this.seenBatches.add(packet.droneBatch.seed);
     }
 
     if (this.channel) {
@@ -563,7 +757,7 @@ export class PeerSectorSync {
       }
     }
 
-    // Queue discrete gameplay events (salvos, hits, drones, renames, leaves, chats) for the /api/sector cloud relay
+    // Queue discrete gameplay events for the /api/sector cloud relay (with compact wire representation)
     if (
       packet.type === 'peer:salvo' ||
       packet.type === 'peer:combat_hit' ||
@@ -573,8 +767,25 @@ export class PeerSectorSync {
       packet.type === 'peer:player_leave' ||
       packet.type === 'peer:chat'
     ) {
-      this.pendingCloudEvents.push(packet);
-      if (this.pendingCloudEvents.length > 80) {
+      // Avoid flooding Vercel with redundant rapid-fire salvo packets; remote clients already synthesize continuous fire while p.shooting is true
+      if (packet.type === 'peer:salvo') {
+        const now = Date.now();
+        if (now - this.lastCloudSalvoSentAt < 140) {
+          return;
+        }
+        this.lastCloudSalvoSentAt = now;
+      }
+      // Do not send AI-vs-AI or player-vs-AI drone hits over Vercel relay if no other human peers exist
+      if (
+        packet.type === 'peer:combat_hit' &&
+        this.peerLastSeen.size === 0 &&
+        packet.targetId.startsWith('drn_')
+      ) {
+        return;
+      }
+
+      this.pendingCloudEvents.push(compactEventForWire(packet));
+      if (this.pendingCloudEvents.length > 40) {
         this.pendingCloudEvents.shift();
       }
     }
@@ -623,37 +834,75 @@ export class PeerSectorSync {
     if (this.pollTimer) window.clearInterval(this.pollTimer);
     this.pollTimer = window.setInterval(async () => {
       if (isWsConnected() || this.isPolling) return;
+
+      const now = Date.now();
+      const hasOtherHumans = this.peerLastSeen.size > 0;
+      const hasPendingEvents = this.pendingCloudEvents.length > 0;
+      const isHidden = typeof document !== 'undefined' && document.hidden;
+
+      // Adaptive poll interval to drastically reduce Vercel Hobby Plan bandwidth & function invocations:
+      // - 135ms when other human players are in the sector or discrete events are queued
+      // - 600ms when flying solo (waiting to discover if another human joins)
+      // - 1400ms when the browser tab is in the background
+      const minInterval = hasPendingEvents
+        ? 90
+        : isHidden
+        ? 1400
+        : hasOtherHumans
+        ? 135
+        : 600;
+
+      if (now - this.lastPollTime < minInterval) return;
+
       const localPlayer = getLocalPlayer();
       const eventsToSend = this.pendingCloudEvents.splice(0, this.pendingCloudEvents.length);
       if (!localPlayer && eventsToSend.length === 0) return;
 
       this.isPolling = true;
+      this.lastPollTime = now;
       try {
+        const payload: Record<string, unknown> = {
+          id: this.selfId,
+          q: this.lastCloudSeq,
+        };
+        if (localPlayer) {
+          payload.p = compactPlayerForWire(localPlayer);
+        }
+        if (eventsToSend.length > 0) {
+          payload.e = eventsToSend;
+        }
+
         const res = await fetch('/api/sector', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            player: localPlayer,
-            sinceSeq: this.lastCloudSeq,
-            events: eventsToSend,
-          }),
+          body: JSON.stringify(payload),
         });
         if (res.ok) {
           const data = (await res.json()) as {
+            q?: number;
             latestSeq?: number;
+            s?: number;
             serverTime?: number;
-            players?: PlayerState[];
+            p?: Partial<PlayerState>[];
+            players?: Partial<PlayerState>[];
+            b?: DroneBatchSpec[];
+            d?: string[];
+            e?: PeerSyncPacket[];
             events?: PeerSyncPacket[];
           };
-          if (typeof data.serverTime === 'number' && onServerTime) {
-            onServerTime(data.serverTime);
+          const srvTime = data.s ?? data.serverTime;
+          if (typeof srvTime === 'number' && onServerTime) {
+            onServerTime(srvTime);
           }
-          if (typeof data.latestSeq === 'number' && data.latestSeq > this.lastCloudSeq) {
-            this.lastCloudSeq = data.latestSeq;
+          const latestSeq = data.q ?? data.latestSeq;
+          if (typeof latestSeq === 'number' && latestSeq > this.lastCloudSeq) {
+            this.lastCloudSeq = latestSeq;
           }
-          if (Array.isArray(data.players)) {
-            for (const remote of data.players) {
-              if (remote.id !== this.selfId) {
+          const remotePlayers = data.p ?? data.players;
+          if (Array.isArray(remotePlayers)) {
+            for (const rawRemote of remotePlayers) {
+              if (rawRemote && rawRemote.id && rawRemote.id !== this.selfId) {
+                const remote = hydratePlayerFromWire(rawRemote);
                 this.peerLastSeen.set(remote.id, Date.now());
                 this.onPacket({
                   type: 'peer:player_state',
@@ -663,8 +912,30 @@ export class PeerSectorSync {
               }
             }
           }
-          if (Array.isArray(data.events)) {
-            for (const pkt of data.events) {
+          if (Array.isArray(data.b) && data.b.length > 0) {
+            const deadSet = new Set(Array.isArray(data.d) ? data.d : []);
+            for (const batch of data.b) {
+              if (batch && typeof batch.seed === 'number' && !this.seenBatches.has(batch.seed)) {
+                this.seenBatches.add(batch.seed);
+                const drones = createTargetDronesFromBatchSpec(batch).filter(
+                  (dr) => !deadSet.has(dr.id)
+                );
+                if (drones.length > 0) {
+                  this.onPacket({
+                    type: 'peer:cheat_action',
+                    senderId: 'relay',
+                    playerId: 'relay',
+                    action: batch.count > 1 ? 'spawn_drones_100' : 'spawn_drone',
+                    droneBatch: batch,
+                    spawnedDrones: drones,
+                  });
+                }
+              }
+            }
+          }
+          const incomingEvents = data.e ?? data.events;
+          if (Array.isArray(incomingEvents)) {
+            for (const pkt of incomingEvents) {
               this.handleIncomingPacket(pkt);
             }
           }
@@ -674,7 +945,7 @@ export class PeerSectorSync {
       } finally {
         this.isPolling = false;
       }
-    }, 85);
+    }, 65);
   }
 
   public destroy(localPlayerId: string) {

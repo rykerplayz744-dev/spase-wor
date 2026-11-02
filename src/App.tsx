@@ -15,8 +15,9 @@ import {
   loadControllerMapping,
 } from './game/input.ts';
 import {
+  createDroneBatchSpec,
   createInitialClientAsteroids,
-  createTargetDronesBatch,
+  createTargetDronesFromBatchSpec,
   getColocatedSpawnPoint,
   getSafeSunOrbitPoint,
   mergeSmoothRemotePlayerState,
@@ -1131,7 +1132,10 @@ export default function App() {
           const spec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
           const targetIds: string[] = [];
           for (const p of world.players.values()) {
-            if (p.alive && p.id !== localPlayer.id) targetIds.push(p.id);
+            if (p.alive && p.id !== localPlayer.id) {
+              targetIds.push(p.id);
+              if (targetIds.length >= 16) break;
+            }
           }
           const salvo = {
             idPrefix: `swm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
@@ -1182,11 +1186,12 @@ export default function App() {
       } else if (action === 'spawn_drone' || action === 'spawn_drones_100') {
         const countToSpawn = action === 'spawn_drones_100' ? 100 : 1;
         if (!isWsConnected) {
-          const spawnedDrones = createTargetDronesBatch(
+          const droneBatch = createDroneBatchSpec(
             world.players,
             countToSpawn,
             localPlayer
           );
+          const spawnedDrones = createTargetDronesFromBatchSpec(droneBatch);
           for (const d of spawnedDrones) {
             world.players.set(d.id, d);
           }
@@ -1195,6 +1200,7 @@ export default function App() {
             senderId: selfIdRef.current,
             playerId: selfIdRef.current,
             action,
+            droneBatch,
             spawnedDrones,
           });
         }
@@ -2446,7 +2452,10 @@ export default function App() {
             const targetIds: string[] = [];
             if (activeCheats.homingMissiles) {
               for (const p of world.players.values()) {
-                if (p.alive && p.id !== localPlayer.id) targetIds.push(p.id);
+                if (p.alive && p.id !== localPlayer.id) {
+                  targetIds.push(p.id);
+                  if (targetIds.length >= 16) break;
+                }
               }
             }
             const salvoAngle = activeCheats.novaSpread

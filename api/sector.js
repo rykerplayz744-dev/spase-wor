@@ -1,6 +1,8 @@
 // Vercel Serverless Function for cross-browser / cross-device Sector-01 state & combat event relay
+// Optimized for minimal bandwidth on Vercel Hobby Plan (no self-echo, deterministic drone batch seeds, compact keys)
 const activePlayers = new Map();
-const sharedDrones = new Map();
+const droneBatches = [];
+const deadDroneIds = new Set();
 const recentEvents = [];
 let eventSeq = 1;
 
@@ -14,35 +16,45 @@ export default function handler(req, res) {
     }
   }
 
-  // Evict old events (> 8 seconds old)
-  while (recentEvents.length > 0 && now - recentEvents[0].timestamp > 8000) {
+  // Evict old events (> 7 seconds old)
+  while (recentEvents.length > 0 && now - recentEvents[0].timestamp > 7000) {
     recentEvents.shift();
   }
 
   let sinceSeq = 0;
+  let requesterId = '';
 
   if (req.method === 'POST' && req.body) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
-    if (typeof body.sinceSeq === 'number') {
+    if (typeof body.q === 'number') {
+      sinceSeq = body.q;
+    } else if (typeof body.sinceSeq === 'number') {
       sinceSeq = body.sinceSeq;
     }
 
-    if (body.player && typeof body.player.id === 'string') {
-      // If another stale entry (> 1.5s without heartbeat) has the exact same name (from a page reload), remove the ghost copy
+    const incomingPlayer = body.p || body.player;
+    if (typeof body.id === 'string') {
+      requesterId = body.id;
+    } else if (incomingPlayer && typeof incomingPlayer.id === 'string') {
+      requesterId = incomingPlayer.id;
+    }
+
+    if (incomingPlayer && typeof incomingPlayer.id === 'string') {
+      // Remove stale ghost duplicate with the same name (> 1.5s without heartbeat) from a page reload
       for (const [existingId, entry] of activePlayers.entries()) {
         if (
-          existingId !== body.player.id &&
+          existingId !== incomingPlayer.id &&
           entry.player &&
-          entry.player.name === body.player.name &&
+          entry.player.name === incomingPlayer.name &&
           now - entry.updatedAt > 1500
         ) {
           activePlayers.delete(existingId);
         }
       }
 
-      const prevEntry = activePlayers.get(body.player.id);
-      const incomingMusic = body.player.music;
+      const prevEntry = activePlayers.get(incomingPlayer.id);
+      const incomingMusic = incomingPlayer.music;
       if (incomingMusic && incomingMusic.isPlaying) {
         const prevMusic = prevEntry?.player?.music;
         const reportedTrackTime = Math.max(0, Number(incomingMusic.trackTime) || 0);
@@ -58,49 +70,46 @@ export default function handler(req, res) {
           Math.abs(computedStartMs - prevStartMs) > 650;
 
         const authoritativeStartMs = didSeekOrRestart ? computedStartMs : prevStartMs;
-        body.player.music = {
+        incomingPlayer.music = {
           ...incomingMusic,
           startedAtServerMs: authoritativeStartMs,
-          trackTime: Math.max(0, Number(((now - authoritativeStartMs) / 1000).toFixed(3))),
+          trackTime: Math.max(0, Number(((now - authoritativeStartMs) / 1000).toFixed(2))),
           updatedAt: now,
         };
       } else {
-        body.player.music = null;
+        delete incomingPlayer.music;
       }
 
-      activePlayers.set(body.player.id, {
-        player: body.player,
+      activePlayers.set(incomingPlayer.id, {
+        player: incomingPlayer,
         updatedAt: now,
       });
     }
 
-    // Relay outgoing combat / salvo / cheat / rename events to all other players in SECTOR-01
-    if (Array.isArray(body.events)) {
-      for (const pkt of body.events) {
+    const incomingEvents = body.e || body.events;
+    if (Array.isArray(incomingEvents)) {
+      for (const pkt of incomingEvents) {
         if (!pkt || typeof pkt.type !== 'string') continue;
 
         if (pkt.type === 'peer:player_leave' && typeof pkt.playerId === 'string') {
           activePlayers.delete(pkt.playerId);
         }
 
-        // Maintain shared target drones on the relay with no max ship cap
+        // Store compact 60-byte deterministic droneBatch seeds instead of 100s of full PlayerState objects
         if (pkt.type === 'peer:cheat_action') {
-          if (Array.isArray(pkt.spawnedDrones)) {
-            for (const d of pkt.spawnedDrones) {
-              if (d && typeof d.id === 'string') {
-                sharedDrones.set(d.id, d);
-              }
+          if (pkt.droneBatch && typeof pkt.droneBatch.seed === 'number') {
+            if (!droneBatches.some((b) => b.seed === pkt.droneBatch.seed)) {
+              droneBatches.push(pkt.droneBatch);
             }
+            // Strip any heavy spawnedDrones array before storing in recentEvents
+            delete pkt.spawnedDrones;
           } else if (pkt.action === 'clear_drones') {
-            sharedDrones.clear();
+            droneBatches.length = 0;
+            deadDroneIds.clear();
           }
-        } else if (pkt.type === 'peer:combat_hit' && pkt.targetId && sharedDrones.has(pkt.targetId)) {
-          const drone = sharedDrones.get(pkt.targetId);
-          if (drone) {
-            drone.hp = Math.max(0, (drone.hp || 100) - (pkt.damage || 0));
-            if (pkt.fatal || drone.hp <= 0) {
-              sharedDrones.delete(pkt.targetId);
-            }
+        } else if (pkt.type === 'peer:combat_hit' && pkt.fatal && typeof pkt.targetId === 'string') {
+          if (pkt.targetId.startsWith('drn_') || pkt.targetId.startsWith('drone_')) {
+            deadDroneIds.add(pkt.targetId);
           }
         }
 
@@ -109,47 +118,60 @@ export default function handler(req, res) {
           timestamp: now,
           packet: pkt,
         });
-        if (recentEvents.length > 300) {
+        if (recentEvents.length > 160) {
           recentEvents.shift();
         }
       }
     }
   }
 
-  // If no human players are active in the sector, clear leftover drones so fresh sessions start clean
-  if (activePlayers.size === 0 && sharedDrones.size > 0) {
-    sharedDrones.clear();
+  // If no human players are active in the sector, clear leftover drone batches so fresh sessions start clean
+  if (activePlayers.size === 0 && droneBatches.length > 0) {
+    droneBatches.length = 0;
+    deadDroneIds.clear();
   }
 
-  const players = [];
-  for (const entry of activePlayers.values()) {
+  // Never echo the requester's own player state back to them!
+  const remotePlayers = [];
+  for (const [id, entry] of activePlayers.entries()) {
+    if (id === requesterId) continue;
     const p = entry.player;
     if (p && p.music && p.music.isPlaying && typeof p.music.startedAtServerMs === 'number') {
       p.music = {
         ...p.music,
-        trackTime: Math.max(0, Number(((now - p.music.startedAtServerMs) / 1000).toFixed(3))),
+        trackTime: Math.max(0, Number(((now - p.music.startedAtServerMs) / 1000).toFixed(2))),
         updatedAt: now,
       };
     }
-    players.push(p);
+    remotePlayers.push(p);
   }
-  // Only send the full sharedDrones list on initial join (sinceSeq === 0); subsequent polls receive drone spawns/clears via newEvents
-  if (sinceSeq === 0) {
-    for (const drone of sharedDrones.values()) {
-      players.push(drone);
+
+  // Never echo the requester's own events back to them!
+  const newEvents =
+    sinceSeq > 0
+      ? recentEvents
+          .filter((e) => e.seq > sinceSeq && e.packet.senderId !== requesterId)
+          .map((e) => e.packet)
+      : [];
+
+  const responsePayload = {
+    s: now,
+    q: eventSeq - 1,
+  };
+
+  if (remotePlayers.length > 0) {
+    responsePayload.p = remotePlayers;
+  }
+  if (newEvents.length > 0) {
+    responsePayload.e = newEvents;
+  }
+  if (sinceSeq === 0 && droneBatches.length > 0) {
+    responsePayload.b = droneBatches;
+    if (deadDroneIds.size > 0) {
+      responsePayload.d = Array.from(deadDroneIds);
     }
   }
 
-  const newEvents =
-    sinceSeq > 0
-      ? recentEvents.filter((e) => e.seq > sinceSeq).map((e) => e.packet)
-      : [];
-
-  res.status(200).json({
-    roomId: 'SECTOR-01',
-    serverTime: now,
-    latestSeq: eventSeq - 1,
-    players,
-    events: newEvents,
-  });
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).json(responsePayload);
 }
