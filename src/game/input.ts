@@ -6,6 +6,8 @@ export interface ControllerMapping {
   warpButtons: number[]; // Default: Y/Triangle (3), LB (4)
   pauseButtons: number[]; // Default: Start/Options (9)
   keyboardAimMode: 'direct_wasd' | 'mouse_aim' | 'classic_turn';
+  p1ControllerIndex: number; // 0 = Controller 1, 1 = Controller 2, 2 = Controller 3, 3 = Controller 4, -1 = Keyboard/Mouse Only
+  p2ControllerIndex: number; // 1 = Controller 2, 0 = Controller 1, 2 = Controller 3, 3 = Controller 4, -1 = Keyboard Arrows Only
 }
 
 export const DEFAULT_CONTROLLER_MAPPING: ControllerMapping = {
@@ -16,6 +18,8 @@ export const DEFAULT_CONTROLLER_MAPPING: ControllerMapping = {
   warpButtons: [3, 4], // North (Y/Triangle), LB
   pauseButtons: [9], // Start / Options
   keyboardAimMode: 'mouse_aim',
+  p1ControllerIndex: 0,
+  p2ControllerIndex: 1,
 };
 
 export const GAMEPAD_BUTTON_LABELS: Record<number, string> = {
@@ -65,7 +69,18 @@ export function loadControllerMapping(): ControllerMapping {
     const raw = localStorage.getItem('spacewar_controller_mapping_v1');
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...DEFAULT_CONTROLLER_MAPPING, ...parsed };
+      return {
+        ...DEFAULT_CONTROLLER_MAPPING,
+        ...parsed,
+        p1ControllerIndex:
+          typeof parsed.p1ControllerIndex === 'number'
+            ? parsed.p1ControllerIndex
+            : DEFAULT_CONTROLLER_MAPPING.p1ControllerIndex,
+        p2ControllerIndex:
+          typeof parsed.p2ControllerIndex === 'number'
+            ? parsed.p2ControllerIndex
+            : DEFAULT_CONTROLLER_MAPPING.p2ControllerIndex,
+      };
     }
   } catch {
     // ignore storage errors
@@ -154,6 +169,7 @@ export class InputManager {
     this.justPressedKeys.clear();
     this.mouseLeftDown = false;
     this.mouseRightDown = false;
+    this.mouseMovedRecently = false;
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
@@ -186,6 +202,14 @@ export class InputManager {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
+    // Prevent Space or Enter (used for P1/P2 firing) from activating a previously clicked HUD <button> (such as Remove P2 or Switch Room)
+    if (tag === 'BUTTON' || (typeof document !== 'undefined' && document.activeElement?.tagName === 'BUTTON')) {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      if (code === 'Space' || code === 'Enter' || code === 'NumpadEnter') {
+        e.preventDefault();
+      }
+    }
+
     // One-shot toggle keys should always register on non-repeat keydown even if ChromeOS swallowed a prior keyup
     const isOneShotKey =
       code === 'KeyK' ||
@@ -201,7 +225,19 @@ export class InputManager {
       this.justPressedKeys.add(code);
     }
     this.heldKeys.add(code);
-    this.lastInputSource = 'keyboard';
+    // Only mark P1 input source as keyboard if it's not a P2-only arrow key
+    if (
+      code !== 'ArrowUp' &&
+      code !== 'ArrowDown' &&
+      code !== 'ArrowLeft' &&
+      code !== 'ArrowRight' &&
+      code !== 'ShiftRight' &&
+      code !== 'Slash' &&
+      code !== 'Period'
+    ) {
+      this.lastInputSource = 'keyboard';
+      this.mouseMovedRecently = false;
+    }
   };
 
   private onKeyUp = (e: KeyboardEvent) => {
@@ -216,10 +252,7 @@ export class InputManager {
   private onFocusIn = (e: FocusEvent) => {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-      this.heldKeys.clear();
-      this.justPressedKeys.clear();
-      this.mouseLeftDown = false;
-      this.mouseRightDown = false;
+      this.clearHeldInputs();
     }
   };
 
@@ -234,9 +267,13 @@ export class InputManager {
   };
 
   private onMouseMove = (e: MouseEvent) => {
+    const moveDist = Math.hypot(e.clientX - this.mousePos.x, e.clientY - this.mousePos.y);
     this.mousePos.x = e.clientX;
     this.mousePos.y = e.clientY;
-    this.mouseMovedRecently = true;
+    const target = e.target as HTMLElement | null;
+    if (target && target.tagName === 'CANVAS' && moveDist >= 4) {
+      this.mouseMovedRecently = true;
+    }
     // Chromebook touchpad safeguard: if no mouse buttons are physically held during move, clear any stuck button state
     if (typeof e.buttons === 'number') {
       if ((e.buttons & 1) === 0 && this.mouseLeftDown) {
@@ -303,7 +340,7 @@ export class InputManager {
   public getConnectedGamepads(): Gamepad[] {
     if (typeof navigator === 'undefined' || !navigator.getGamepads) return [];
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    if (now - this.lastGamepadPollAt < 24) {
+    if (now - this.lastGamepadPollAt < 16) {
       return this.cachedGamepads;
     }
     this.lastGamepadPollAt = now;
@@ -323,17 +360,78 @@ export class InputManager {
   }
 
   /**
-   * Samples both Gamepad and Keyboard/Mouse inputs for the current frame.
-   * For a controller: points the ship in the EXACT direction of the joystick vector (Math.atan2(y, x)).
+   * Resolves a controller by slot index (0..3), or returns null if slotIndex < 0 (Keyboard Only).
+   */
+  public getGamepadBySlot(slotIndex: number): Gamepad | null {
+    if (slotIndex < 0) return null;
+    const connected = this.getConnectedGamepads();
+    if (connected.length === 0) return null;
+    const byHardwareIdx = connected.find((g) => g.index === slotIndex);
+    if (byHardwareIdx) return byHardwareIdx;
+    return connected[slotIndex] || null;
+  }
+
+  private p2Angle = -Math.PI / 2;
+  private p2WarpWasHeld = false;
+  private p2LastInputSource: 'gamepad' | 'keyboard' = 'keyboard';
+  private prevGamepadStick = new Map<number, { x: number; y: number }>();
+
+  /**
+   * Samples both Gamepad and Keyboard/Mouse inputs for Player 1 (Pad 1) on the current frame.
+   * - Keyboard (WASD + Space/Mouse) ALWAYS controls Player 1 even when a controller is set to Pad 1.
+   * - A connected controller on Pad 1 never locks out or snaps back keyboard turning (A/D or WASD).
    */
   public sample(
     dt: number,
     shipScreenX: number,
     shipScreenY: number,
-    gamepadIndex: number = 0
+    gamepadIndexOverride?: number,
+    splitKeyboardForP2: boolean = false,
+    isFixedCameraArena: boolean = false
   ): SampledInput {
-    const gamepads = this.getConnectedGamepads();
-    const gp = gamepads[gamepadIndex] || gamepads[0] || null;
+    // 1. Check Player 1 Keyboard & Mouse state first so keyboard always works even when a controller is set to Pad 1
+    const kbUp =
+      this.heldKeys.has('KeyW') || (!splitKeyboardForP2 && this.heldKeys.has('ArrowUp'));
+    const kbDown =
+      this.heldKeys.has('KeyS') || (!splitKeyboardForP2 && this.heldKeys.has('ArrowDown'));
+    const kbLeft =
+      this.heldKeys.has('KeyA') || (!splitKeyboardForP2 && this.heldKeys.has('ArrowLeft'));
+    const kbRight =
+      this.heldKeys.has('KeyD') || (!splitKeyboardForP2 && this.heldKeys.has('ArrowRight'));
+
+    const kbThrust =
+      this.mapping.keyboardAimMode === 'direct_wasd'
+        ? this.heldKeys.has('ShiftLeft') ||
+          (!splitKeyboardForP2 && this.heldKeys.has('ShiftRight')) ||
+          this.mouseRightDown
+        : kbUp || this.heldKeys.has('ShiftLeft') || this.mouseRightDown;
+
+    const kbShoot =
+      this.heldKeys.has('Space') ||
+      this.heldKeys.has('KeyJ') ||
+      this.mouseLeftDown;
+
+    const anyP1KeyboardHeld =
+      kbUp ||
+      kbDown ||
+      kbLeft ||
+      kbRight ||
+      kbThrust ||
+      kbShoot ||
+      this.mouseLeftDown ||
+      this.mouseRightDown ||
+      this.mouseMovedRecently;
+
+    if (anyP1KeyboardHeld) {
+      this.lastInputSource = 'keyboard';
+    }
+
+    // 2. Sample Gamepad mapped to Player 1 (default Pad 1 / slot 0)
+    const p1Slot =
+      typeof gamepadIndexOverride === 'number'
+        ? gamepadIndexOverride
+        : this.mapping.p1ControllerIndex;
+    const gp = this.getGamepadBySlot(p1Slot);
 
     let stickVector = { x: 0, y: 0, magnitude: 0, active: false };
     const pressedButtonIndices: number[] = [];
@@ -354,7 +452,9 @@ export class InputManager {
         currBtns[i] = isPressed;
         if (isPressed) {
           pressedButtonIndices.push(i);
-          this.lastInputSource = 'gamepad';
+          if (!anyP1KeyboardHeld) {
+            this.lastInputSource = 'gamepad';
+          }
         }
       }
 
@@ -363,8 +463,11 @@ export class InputManager {
       // Sample joystick axes for direct directional pointing
       const lx = gp.axes[0] ?? 0;
       const ly = gp.axes[1] ?? 0;
-      const rx = gp.axes[2] ?? 0;
-      const ry = gp.axes[3] ?? 0;
+      const rawRx = gp.axes[2] ?? 0;
+      const rawRy = gp.axes[3] ?? 0;
+      // Guard against unpressed analog triggers resting at -1.0 on axes[2]/axes[3] on Linux/ChromeOS
+      const rx = Math.abs(rawRx + 1) < 0.02 ? 0 : rawRx;
+      const ry = Math.abs(rawRy + 1) < 0.02 ? 0 : rawRy;
 
       const lMag = Math.hypot(lx, ly);
       const rMag = Math.hypot(rx, ry);
@@ -382,7 +485,6 @@ export class InputManager {
         chosenY = ry;
         chosenMag = rMag;
       } else {
-        // 'both': use whichever stick has greater deflection
         if (rMag > lMag) {
           chosenX = rx;
           chosenY = ry;
@@ -395,6 +497,7 @@ export class InputManager {
       }
 
       // Also support D-Pad direct 8-way pointing if stick is neutral
+      let dpadActive = false;
       if (chosenMag <= this.mapping.deadzone) {
         const dUp = currBtns[12] ? -1 : 0;
         const dDown = currBtns[13] ? 1 : 0;
@@ -406,24 +509,36 @@ export class InputManager {
           chosenX = dx;
           chosenY = dy;
           chosenMag = 1;
+          dpadActive = true;
         }
       }
 
-      if (chosenMag > this.mapping.deadzone) {
-        // EXACT DIRECTION OF THE JOYSTICK:
-        // Left (-1, 0) -> Math.PI (Left)
-        // Right (1, 0) -> 0 (Right)
-        // Up (0, -1) -> -Math.PI/2 (Up)
-        // Down (0, 1) -> Math.PI/2 (Down)
-        this.currentAngle = Math.atan2(chosenY, chosenX);
-        this.lastInputSource = 'gamepad';
-        this.mouseMovedRecently = false;
-        stickVector = {
-          x: chosenX / Math.max(1, chosenMag),
-          y: chosenY / Math.max(1, chosenMag),
-          magnitude: Math.min(1, chosenMag),
-          active: true,
-        };
+      const prevStick = this.prevGamepadStick.get(gp.index) || { x: chosenX, y: chosenY };
+      const stickMovedDelta = Math.hypot(chosenX - prevStick.x, chosenY - prevStick.y);
+      this.prevGamepadStick.set(gp.index, { x: chosenX, y: chosenY });
+
+      const activeDeadzone =
+        this.lastInputSource === 'keyboard'
+          ? Math.max(this.mapping.deadzone, 0.25)
+          : this.mapping.deadzone;
+
+      if (chosenMag > activeDeadzone) {
+        if (!anyP1KeyboardHeld && (stickMovedDelta > 0.12 || dpadActive)) {
+          this.lastInputSource = 'gamepad';
+        }
+        // Only let the controller steer when keyboard keys are not held and gamepad is the active input source
+        if (!anyP1KeyboardHeld && this.lastInputSource === 'gamepad') {
+          this.currentAngle = Math.atan2(chosenY, chosenX);
+          this.mouseMovedRecently = false;
+          stickVector = {
+            x: chosenX / Math.max(1, chosenMag),
+            y: chosenY / Math.max(1, chosenMag),
+            magnitude: Math.min(1, chosenMag),
+            active: true,
+          };
+        } else {
+          stickVector = { x: chosenX, y: chosenY, magnitude: chosenMag, active: false };
+        }
       } else {
         stickVector = { x: chosenX, y: chosenY, magnitude: chosenMag, active: false };
       }
@@ -438,55 +553,42 @@ export class InputManager {
       this.prevGamepadButtons.set(gp.index, currBtns);
     }
 
-    // Keyboard & Mouse sampling
-    const kbUp = this.heldKeys.has('KeyW') || this.heldKeys.has('ArrowUp');
-    const kbDown = this.heldKeys.has('KeyS') || this.heldKeys.has('ArrowDown');
-    const kbLeft = this.heldKeys.has('KeyA') || this.heldKeys.has('ArrowLeft');
-    const kbRight = this.heldKeys.has('KeyD') || this.heldKeys.has('ArrowRight');
-
-    let kbThrust = false;
-    let kbShoot = false;
-
-    if (this.lastInputSource === 'keyboard') {
-      if (this.mapping.keyboardAimMode === 'direct_wasd') {
-        // WASD / Arrows directly point the ship in that direction (just like the joystick!)
-        const kx = (kbRight ? 1 : 0) - (kbLeft ? 1 : 0);
-        const ky = (kbDown ? 1 : 0) - (kbUp ? 1 : 0);
-        if (kx !== 0 || ky !== 0) {
-          this.currentAngle = Math.atan2(ky, kx);
-        }
-        kbThrust =
-          this.heldKeys.has('ShiftLeft') ||
-          this.heldKeys.has('ShiftRight') ||
-          this.mouseRightDown;
-        kbShoot =
-          this.heldKeys.has('Space') ||
-          this.heldKeys.has('KeyJ') ||
-          this.mouseLeftDown;
-      } else if (this.mapping.keyboardAimMode === 'classic_turn') {
-        const turnSpeed = 4.2;
+    // 3. Always apply Player 1 Keyboard & Mouse steering (even when a controller is set to Pad 1!)
+    if (this.mapping.keyboardAimMode === 'direct_wasd') {
+      const kx = (kbRight ? 1 : 0) - (kbLeft ? 1 : 0);
+      const ky = (kbDown ? 1 : 0) - (kbUp ? 1 : 0);
+      if (kx !== 0 || ky !== 0) {
+        this.currentAngle = Math.atan2(ky, kx);
+      }
+    } else if (this.mapping.keyboardAimMode === 'classic_turn') {
+      const turnSpeed = 4.2;
+      if (kbLeft) this.currentAngle -= turnSpeed * dt;
+      if (kbRight) this.currentAngle += turnSpeed * dt;
+    } else {
+      // 'mouse_aim' (default):
+      // - Pressing A / D ALWAYS turns the ship immediately.
+      // - In fixed-camera Couch Co-Op, only aim toward the mouse cursor when a mouse button is held or the mouse is actively moved while not pressing WASD.
+      const turnSpeed = 4.2;
+      if (kbLeft || kbRight) {
         if (kbLeft) this.currentAngle -= turnSpeed * dt;
         if (kbRight) this.currentAngle += turnSpeed * dt;
-        kbThrust = kbUp || this.heldKeys.has('ShiftLeft') || this.mouseRightDown;
-        kbShoot = this.heldKeys.has('Space') || this.mouseLeftDown;
       } else {
-        // 'mouse_aim' (default when using mouse/keyboard):
-        // If mouse moved or clicked, point toward cursor; A/D can also fine-tune rotation
-        if (this.mouseMovedRecently || this.mouseLeftDown || this.mouseRightDown) {
+        const allowMouseSteer =
+          this.mouseLeftDown ||
+          this.mouseRightDown ||
+          (this.mouseMovedRecently && (!isFixedCameraArena || !kbUp));
+        if (allowMouseSteer) {
           const dx = this.mousePos.x - shipScreenX;
           const dy = this.mousePos.y - shipScreenY;
           if (Math.hypot(dx, dy) > 8) {
             this.currentAngle = Math.atan2(dy, dx);
           }
-        } else {
-          const turnSpeed = 4.2;
-          if (kbLeft) this.currentAngle -= turnSpeed * dt;
-          if (kbRight) this.currentAngle += turnSpeed * dt;
         }
-        kbThrust = kbUp || this.heldKeys.has('ShiftLeft') || this.mouseRightDown;
-        kbShoot = this.heldKeys.has('Space') || this.mouseLeftDown;
       }
     }
+
+    // Reset single-frame mouse movement flag so a stationary mouse cursor never continually steers the ship
+    this.mouseMovedRecently = false;
 
     const kbWarpJustPressed = this.justPressedKeys.has('KeyE') || this.justPressedKeys.has('KeyQ');
     const kbPauseJustPressed = this.justPressedKeys.has('Escape') || this.justPressedKeys.has('KeyP');
@@ -497,7 +599,7 @@ export class InputManager {
     const spectatePrevJustPressed = this.justPressedKeys.has('BracketLeft');
     const spectateNextJustPressed = this.justPressedKeys.has('BracketRight');
 
-    // Compute camera pan vector for Free-Cam / Spectator mode (WASD, Arrows, or Gamepad Stick)
+    // Compute camera pan vector for Free-Cam / Spectator mode
     let panX = (kbRight ? 1 : 0) - (kbLeft ? 1 : 0);
     let panY = (kbDown ? 1 : 0) - (kbUp ? 1 : 0);
     if (panX !== 0 && panY !== 0) {
@@ -511,7 +613,7 @@ export class InputManager {
 
     const boostHeld =
       this.heldKeys.has('ShiftLeft') ||
-      this.heldKeys.has('ShiftRight') ||
+      (!splitKeyboardForP2 && this.heldKeys.has('ShiftRight')) ||
       gpThrust;
 
     this.justPressedKeys.clear();
@@ -537,6 +639,138 @@ export class InputManager {
       boostHeld,
       spectatePrevJustPressed,
       spectateNextJustPressed,
+    };
+  }
+
+  /**
+   * Samples Local Player 2 (up to 2 players max on the same screen):
+   * - Controlled by the controller mapped to `p2ControllerIndex` (default Controller 2, slot 1)
+   * - Also ALWAYS supports Keyboard controls:
+   *   - Arrow Keys (ArrowLeft / ArrowRight to rotate, ArrowUp to thrust, Enter / RightShift / Slash / ArrowDown to fire, Period '.' for Warp)
+   *   - Plus WASD + Space if P2 is mapped to Pad 1 (slot 0) and P1 is mapped elsewhere!
+   */
+  public samplePlayer2(dt: number): {
+    angle: number;
+    thrusting: boolean;
+    shooting: boolean;
+    warpJustPressed: boolean;
+    inputSource: 'gamepad' | 'keyboard';
+    gamepadConnected: boolean;
+    gamepadName: string;
+  } {
+    const turnSpeed = 4.3;
+    const kbLeft = this.heldKeys.has('ArrowLeft');
+    const kbRight = this.heldKeys.has('ArrowRight');
+    const kbThrust = this.heldKeys.has('ArrowUp') || this.heldKeys.has('KeyI');
+    const kbShoot =
+      this.heldKeys.has('Enter') ||
+      this.heldKeys.has('NumpadEnter') ||
+      this.heldKeys.has('ShiftRight') ||
+      this.heldKeys.has('Slash') ||
+      this.heldKeys.has('ArrowDown');
+
+    const warpHeldNow = this.heldKeys.has('Period') || this.heldKeys.has('NumpadDecimal');
+    const kbWarpJustPressed = warpHeldNow && !this.p2WarpWasHeld;
+    this.p2WarpWasHeld = warpHeldNow;
+
+    const anyP2KeyboardHeld = kbLeft || kbRight || kbThrust || kbShoot || kbWarpJustPressed;
+    if (anyP2KeyboardHeld) {
+      this.p2LastInputSource = 'keyboard';
+    }
+
+    const gp = this.getGamepadBySlot(this.mapping.p2ControllerIndex);
+
+    let gpThrust = false;
+    let gpShoot = false;
+    let gpWarpJustPressed = false;
+
+    if (gp) {
+      const prevBtns = this.prevGamepadButtons.get(gp.index + 100) || [];
+      const currBtns: boolean[] = [];
+      for (let i = 0; i < gp.buttons.length; i++) {
+        const b = gp.buttons[i];
+        currBtns[i] = Boolean(b && (b.pressed || b.value > 0.35));
+      }
+      const wasJustPressed = (btnIdx: number) => Boolean(currBtns[btnIdx] && !prevBtns[btnIdx]);
+
+      const lx = gp.axes[0] ?? 0;
+      const ly = gp.axes[1] ?? 0;
+      const rawRx = gp.axes[2] ?? 0;
+      const rawRy = gp.axes[3] ?? 0;
+      const rx = Math.abs(rawRx + 1) < 0.02 ? 0 : rawRx;
+      const ry = Math.abs(rawRy + 1) < 0.02 ? 0 : rawRy;
+      const lMag = Math.hypot(lx, ly);
+      const rMag = Math.hypot(rx, ry);
+
+      let chosenX = 0;
+      let chosenY = 0;
+      let chosenMag = 0;
+      if (this.mapping.aimStick === 'left') {
+        chosenX = lx;
+        chosenY = ly;
+        chosenMag = lMag;
+      } else if (this.mapping.aimStick === 'right') {
+        chosenX = rx;
+        chosenY = ry;
+        chosenMag = rMag;
+      } else {
+        chosenX = rMag > lMag ? rx : lx;
+        chosenY = rMag > lMag ? ry : ly;
+        chosenMag = Math.max(lMag, rMag);
+      }
+
+      let dpadActive = false;
+      if (chosenMag <= this.mapping.deadzone) {
+        const dUp = currBtns[12] ? -1 : 0;
+        const dDown = currBtns[13] ? 1 : 0;
+        const dLeft = currBtns[14] ? -1 : 0;
+        const dRight = currBtns[15] ? 1 : 0;
+        if (dLeft + dRight !== 0 || dUp + dDown !== 0) {
+          chosenX = dLeft + dRight;
+          chosenY = dUp + dDown;
+          chosenMag = 1;
+          dpadActive = true;
+        }
+      }
+
+      const prevStick = this.prevGamepadStick.get(gp.index + 100) || { x: chosenX, y: chosenY };
+      const stickMovedDelta = Math.hypot(chosenX - prevStick.x, chosenY - prevStick.y);
+      this.prevGamepadStick.set(gp.index + 100, { x: chosenX, y: chosenY });
+
+      if (chosenMag > this.mapping.deadzone) {
+        if (!anyP2KeyboardHeld && (stickMovedDelta > 0.045 || dpadActive)) {
+          this.p2LastInputSource = 'gamepad';
+        }
+        if (!anyP2KeyboardHeld && this.p2LastInputSource === 'gamepad') {
+          this.p2Angle = Math.atan2(chosenY, chosenX);
+        }
+      }
+
+      gpThrust = this.mapping.thrustButtons.some((idx) => currBtns[idx]);
+      gpShoot = this.mapping.fireButtons.some((idx) => currBtns[idx]);
+      gpWarpJustPressed = this.mapping.warpButtons.some((idx) => wasJustPressed(idx));
+      if (!anyP2KeyboardHeld && (gpThrust || gpShoot || gpWarpJustPressed)) {
+        this.p2LastInputSource = 'gamepad';
+      }
+      this.prevGamepadButtons.set(gp.index + 100, currBtns);
+    }
+
+    // Always allow Keyboard Arrow Keys to rotate Player 2 even when a controller is mapped to P2
+    if (kbLeft) {
+      this.p2Angle -= turnSpeed * dt;
+    }
+    if (kbRight) {
+      this.p2Angle += turnSpeed * dt;
+    }
+
+    return {
+      angle: this.p2Angle,
+      thrusting: gpThrust || kbThrust,
+      shooting: gpShoot || kbShoot,
+      warpJustPressed: gpWarpJustPressed || kbWarpJustPressed,
+      inputSource: this.p2LastInputSource,
+      gamepadConnected: Boolean(gp),
+      gamepadName: gp ? gp.id : '',
     };
   }
 }

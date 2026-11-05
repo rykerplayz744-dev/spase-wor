@@ -4,6 +4,7 @@ import {
   AsteroidState,
   ChatMessage,
   CheatActionType,
+  getRoomArenaConfig,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
   HULL_SPECS,
@@ -23,17 +24,21 @@ export interface DroneBatchSpec {
   startNum: number;
   refX?: number;
   refY?: number;
+  roomId?: string;
 }
 
 export type PeerSyncPacket =
   | {
       type: 'peer:hello';
       senderId: string;
+      roomId?: string;
       player?: PlayerState;
+      player2?: PlayerState;
     }
   | {
       type: 'peer:welcome';
       senderId: string;
+      roomId?: string;
       players: PlayerState[];
       asteroids: AsteroidState[];
       planets: PlanetState[];
@@ -43,23 +48,28 @@ export type PeerSyncPacket =
   | {
       type: 'peer:player_state';
       senderId: string;
+      roomId?: string;
       player: PlayerState;
+      player2?: PlayerState;
       drones?: PlayerState[];
       asteroids?: AsteroidState[];
     }
   | {
       type: 'peer:player_leave';
       senderId: string;
+      roomId?: string;
       playerId: string;
     }
   | {
       type: 'peer:salvo';
       senderId: string;
+      roomId?: string;
       salvo: SalvoSpawnPayload;
     }
   | {
       type: 'peer:cheat_action';
       senderId: string;
+      roomId?: string;
       playerId: string;
       action: CheatActionType;
       droneBatch?: DroneBatchSpec;
@@ -68,12 +78,14 @@ export type PeerSyncPacket =
   | {
       type: 'peer:rename';
       senderId: string;
+      roomId?: string;
       playerId: string;
       newName: string;
     }
   | {
       type: 'peer:cheat_rename';
       senderId: string;
+      roomId?: string;
       requesterId: string;
       targetId: string | 'ALL_OTHERS';
       newName: string;
@@ -81,6 +93,7 @@ export type PeerSyncPacket =
   | {
       type: 'peer:combat_hit';
       senderId: string;
+      roomId?: string;
       hitId?: string;
       targetId: string;
       attackerId: string;
@@ -98,64 +111,90 @@ export type PeerSyncPacket =
   | {
       type: 'peer:chat';
       senderId: string;
+      roomId?: string;
       message: ChatMessage;
     }
   | {
       type: 'peer:focus';
       senderId: string;
+      roomId?: string;
       focused: boolean;
     };
 
-export function getSafeSunOrbitPoint(): { x: number; y: number } {
+export function getSafeSunOrbitPoint(roomId: string = 'SECTOR-01'): { x: number; y: number } {
+  const arena = getRoomArenaConfig(roomId);
   const theta = Math.random() * Math.PI * 2;
-  const orbitRadius = 2200 + Math.random() * 1600; // Well outside the 440-radius Sun
-  const x = (((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-  const y = (((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+  const orbitRadius = arena.fixedCamera
+    ? 230 + Math.random() * 210
+    : 2200 + Math.random() * 1600;
+  const x =
+    (((arena.starX + Math.cos(theta) * orbitRadius) % arena.width) + arena.width) % arena.width;
+  const y =
+    (((arena.starY + Math.sin(theta) * orbitRadius) % arena.height) + arena.height) % arena.height;
   return { x: Math.round(x), y: Math.round(y) };
 }
 
 /**
- * Computes a co-located spawn point in SECTOR-01 so players opening multiple windows
- * spawn near existing human players (if that player is safely outside the Sun),
- * or in a safe orbit around the Sun.
+ * Computes a co-located spawn point in SECTOR-01 or COUCH-COOP so players
+ * spawn safely near existing human players or in a safe orbit around the Sun.
  */
 export function getColocatedSpawnPoint(
   players: Iterable<PlayerState>,
-  excludeId?: string
+  excludeId?: string,
+  roomId: string = 'SECTOR-01'
 ): { x: number; y: number } {
+  const arena = getRoomArenaConfig(roomId);
+  if (arena.fixedCamera) {
+    return getSafeSunOrbitPoint(roomId);
+  }
+
   for (const p of players) {
     if (p.alive && !p.isDrone && p.id !== excludeId) {
-      const distFromSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
+      const distFromSun = Math.hypot(p.x - arena.starX, p.y - arena.starY);
       if (distFromSun > 1950) {
         const angleOffset = Math.random() * Math.PI * 2;
         const dist = 160 + Math.random() * 140;
-        const x = (((p.x + Math.cos(angleOffset) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-        const y = (((p.y + Math.sin(angleOffset) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-        if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > 1800) {
+        const x =
+          (((p.x + Math.cos(angleOffset) * dist) % arena.width) + arena.width) % arena.width;
+        const y =
+          (((p.y + Math.sin(angleOffset) * dist) % arena.height) + arena.height) % arena.height;
+        if (Math.hypot(x - arena.starX, y - arena.starY) > 1800) {
           return { x: Math.round(x), y: Math.round(y) };
         }
       }
     }
   }
 
-  return getSafeSunOrbitPoint();
+  return getSafeSunOrbitPoint(roomId);
 }
 
 export function createInitialClientAsteroids(
-  count: number = 192,
-  randomize: boolean = false
+  count?: number,
+  randomize: boolean = false,
+  roomId: string = 'SECTOR-01'
 ): AsteroidState[] {
+  const arena = getRoomArenaConfig(roomId);
+  const targetCount = count ?? (arena.fixedCamera ? arena.maxAsteroids : 192);
   const list: AsteroidState[] = [];
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < targetCount; i++) {
     const theta = randomize
       ? Math.random() * Math.PI * 2
-      : (i / count) * Math.PI * 2 + (i % 5) * 0.37;
-    const dist = randomize
+      : (i / Math.max(1, targetCount)) * Math.PI * 2 + (i % 5) * 0.37;
+    const dist = arena.fixedCamera
+      ? randomize
+        ? 180 + Math.random() * 520
+        : 180 + ((i * 97) % 520)
+      : randomize
       ? 1800 + Math.random() * 6400
       : 1800 + ((i * 571) % 6400);
-    const x = (((GRAVITY_STAR_X + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-    const y = (((GRAVITY_STAR_Y + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
-    const radius = randomize
+    const x = (((arena.starX + Math.cos(theta) * dist) % arena.width) + arena.width) % arena.width;
+    const y =
+      (((arena.starY + Math.sin(theta) * dist) % arena.height) + arena.height) % arena.height;
+    const radius = arena.fixedCamera
+      ? randomize
+        ? Math.round(18 + Math.random() * 18)
+        : 18 + ((i * 7) % 18)
+      : randomize
       ? Math.round(24 + Math.random() * 34)
       : 24 + ((i * 19) % 34);
     const speed = randomize ? 35 + Math.random() * 75 : 40 + ((i * 23) % 65);
@@ -207,33 +246,40 @@ function createSeededRng(seed: number): () => number {
   };
 }
 
-function seededSafeSectorCoords(rng: () => number): { x: number; y: number } {
+function seededSafeSectorCoords(rng: () => number, roomId: string = 'SECTOR-01'): { x: number; y: number } {
+  const arena = getRoomArenaConfig(roomId);
+  const minSunClearance = arena.fixedCamera ? arena.starRadius + 130 : 1750;
   for (let attempt = 0; attempt < 20; attempt++) {
-    const x = rng() * ARENA_WIDTH;
-    const y = rng() * ARENA_HEIGHT;
-    if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > 1750) {
+    const x = rng() * arena.width;
+    const y = rng() * arena.height;
+    if (Math.hypot(x - arena.starX, y - arena.starY) > minSunClearance) {
       return { x: Math.round(x), y: Math.round(y) };
     }
   }
   const theta = rng() * Math.PI * 2;
-  const orbitRadius = 2200 + rng() * 1600;
+  const orbitRadius = arena.fixedCamera ? 220 + rng() * 220 : 2200 + rng() * 1600;
   return {
-    x: Math.round((((GRAVITY_STAR_X + Math.cos(theta) * orbitRadius) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH),
-    y: Math.round((((GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT),
+    x: Math.round((((arena.starX + Math.cos(theta) * orbitRadius) % arena.width) + arena.width) % arena.width),
+    y: Math.round((((arena.starY + Math.sin(theta) * orbitRadius) % arena.height) + arena.height) % arena.height),
   };
 }
 
-export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerState[] {
+export function createTargetDronesFromBatchSpec(
+  spec: DroneBatchSpec,
+  roomIdOverride?: string
+): PlayerState[] {
+  const roomId = roomIdOverride || spec.roomId || 'SECTOR-01';
+  const arena = getRoomArenaConfig(roomId);
   const rng = createSeededRng(spec.seed);
   const spawned: PlayerState[] = [];
   let droneNum = spec.startNum;
   const hasRef = typeof spec.refX === 'number' && typeof spec.refY === 'number';
-  const refX = spec.refX ?? GRAVITY_STAR_X;
-  const refY = spec.refY ?? GRAVITY_STAR_Y;
+  const refX = spec.refX ?? arena.starX;
+  const refY = spec.refY ?? arena.starY;
 
   let currentSquadId: string | null = null;
   let currentSquadColor: string = PLAYER_COLORS[0];
-  let currentSquadAnchor = seededSafeSectorCoords(rng);
+  let currentSquadAnchor = seededSafeSectorCoords(rng, roomId);
   let currentSquadHeading = rng() * Math.PI * 2;
   let squadRemaining = 0;
   let squadIndex = Math.floor(rng() * SQUAD_CALLSIGNS.length);
@@ -251,11 +297,17 @@ export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerSta
     let squadId: string | null = null;
     let color = PLAYER_COLORS[(spec.startNum + i) % PLAYER_COLORS.length];
 
-    if (spec.count === 1 && hasRef) {
+    if (arena.fixedCamera) {
+      const pt = seededSafeSectorCoords(rng, roomId);
+      spawnX = pt.x;
+      spawnY = pt.y;
+      initAngle = rng() * Math.PI * 2;
+      initSpeed = 190 + rng() * 140;
+    } else if (spec.count === 1 && hasRef) {
       const theta = rng() * Math.PI * 2;
       const dist = 360 + rng() * 320;
-      spawnX = (((refX + Math.cos(theta) * dist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-      spawnY = (((refY + Math.sin(theta) * dist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+      spawnX = (((refX + Math.cos(theta) * dist) % arena.width) + arena.width) % arena.width;
+      spawnY = (((refY + Math.sin(theta) * dist) % arena.height) + arena.height) % arena.height;
       initAngle = Math.atan2(refY - spawnY, refX - spawnX);
       initSpeed = 240 + rng() * 140;
     } else if (squadRemaining > 0 && currentSquadId) {
@@ -263,8 +315,8 @@ export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerSta
       color = currentSquadColor;
       const wingAngle = rng() * Math.PI * 2;
       const wingDist = 150 + rng() * 190;
-      spawnX = (((currentSquadAnchor.x + Math.cos(wingAngle) * wingAngleDist(wingDist)) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-      spawnY = (((currentSquadAnchor.y + Math.sin(wingAngle) * wingAngleDist(wingDist)) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+      spawnX = (((currentSquadAnchor.x + Math.cos(wingAngle) * wingAngleDist(wingDist)) % arena.width) + arena.width) % arena.width;
+      spawnY = (((currentSquadAnchor.y + Math.sin(wingAngle) * wingAngleDist(wingDist)) % arena.height) + arena.height) % arena.height;
       initAngle = currentSquadHeading + (rng() - 0.5) * 0.35;
       initSpeed = 250 + rng() * 130;
       squadRemaining--;
@@ -276,10 +328,10 @@ export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerSta
       currentSquadAnchor =
         i < 6 && hasRef
           ? {
-              x: (((refX + (rng() - 0.5) * 2600) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
-              y: (((refY + (rng() - 0.5) * 2200) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+              x: (((refX + (rng() - 0.5) * 2600) % arena.width) + arena.width) % arena.width,
+              y: (((refY + (rng() - 0.5) * 2200) % arena.height) + arena.height) % arena.height,
             }
-          : seededSafeSectorCoords(rng);
+          : seededSafeSectorCoords(rng, roomId);
       currentSquadHeading = rng() * Math.PI * 2;
       squadRemaining = rng() < 0.45 ? 2 : 1;
       squadId = currentSquadId;
@@ -292,10 +344,10 @@ export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerSta
       const pt =
         i < 8 && hasRef
           ? {
-              x: (((refX + (rng() - 0.5) * 3200) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH,
-              y: (((refY + (rng() - 0.5) * 2600) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT,
+              x: (((refX + (rng() - 0.5) * 3200) % arena.width) + arena.width) % arena.width,
+              y: (((refY + (rng() - 0.5) * 2600) % arena.height) + arena.height) % arena.height,
             }
-          : seededSafeSectorCoords(rng);
+          : seededSafeSectorCoords(rng, roomId);
       spawnX = pt.x;
       spawnY = pt.y;
       initAngle = rng() * Math.PI * 2;
@@ -337,7 +389,8 @@ export function createTargetDronesFromBatchSpec(spec: DroneBatchSpec): PlayerSta
 export function createDroneBatchSpec(
   existingPlayers: Map<string, PlayerState>,
   countToSpawn: number,
-  referencePlayer?: PlayerState | null
+  referencePlayer?: PlayerState | null,
+  roomId: string = 'SECTOR-01'
 ): DroneBatchSpec {
   let startNum = 0;
   for (const p of existingPlayers.values()) {
@@ -350,16 +403,18 @@ export function createDroneBatchSpec(
     startNum,
     refX: referencePlayer ? Math.round(referencePlayer.x) : undefined,
     refY: referencePlayer ? Math.round(referencePlayer.y) : undefined,
+    roomId,
   };
 }
 
 export function createTargetDronesBatch(
   existingPlayers: Map<string, PlayerState>,
   countToSpawn: number,
-  referencePlayer?: PlayerState | null
+  referencePlayer?: PlayerState | null,
+  roomId: string = 'SECTOR-01'
 ): PlayerState[] {
-  const spec = createDroneBatchSpec(existingPlayers, countToSpawn, referencePlayer);
-  return createTargetDronesFromBatchSpec(spec);
+  const spec = createDroneBatchSpec(existingPlayers, countToSpawn, referencePlayer, roomId);
+  return createTargetDronesFromBatchSpec(spec, roomId);
 }
 
 function wingAngleDist(d: number): number {
@@ -369,8 +424,10 @@ function wingAngleDist(d: number): number {
 export function mergeSmoothRemotePlayerState(
   existing: PlayerState | undefined,
   incoming: PlayerState,
-  preserveLocalDamage: boolean = false
+  preserveLocalDamage: boolean = false,
+  roomId: string = 'SECTOR-01'
 ): PlayerState {
+  const arena = getRoomArenaConfig(roomId);
   const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
   if (!existing) {
@@ -388,18 +445,19 @@ export function mergeSmoothRemotePlayerState(
   }
 
   let dx = incoming.x - existing.x;
-  if (dx > ARENA_WIDTH * 0.5) dx -= ARENA_WIDTH;
-  if (dx < -ARENA_WIDTH * 0.5) dx += ARENA_WIDTH;
+  if (dx > arena.width * 0.5) dx -= arena.width;
+  if (dx < -arena.width * 0.5) dx += arena.width;
   let dy = incoming.y - existing.y;
-  if (dy > ARENA_HEIGHT * 0.5) dy -= ARENA_HEIGHT;
-  if (dy < -ARENA_HEIGHT * 0.5) dy += ARENA_HEIGHT;
+  if (dy > arena.height * 0.5) dy -= arena.height;
+  if (dy < -arena.height * 0.5) dy += arena.height;
   const dist = Math.hypot(dx, dy);
 
-  // Hard-snap if the ship just respawned, died, exited Warp Speed to a zero-momentum stop, landed on a planet, or warped > 2200u
+  // Hard-snap if the ship just respawned, died, exited Warp Speed to a zero-momentum stop, landed on a planet, or warped across the arena
   const justStoppedWarp = Boolean(existing.warping && !incoming.warping);
   const justLanded = Boolean(!existing.landedPlanetId && incoming.landedPlanetId);
+  const snapThreshold = arena.fixedCamera ? 720 : 2200;
   const shouldSnap =
-    !existing.alive || !incoming.alive || justStoppedWarp || justLanded || dist > 2200;
+    !existing.alive || !incoming.alive || justStoppedWarp || justLanded || dist > snapThreshold;
 
   let cursorShouldSnap =
     typeof existing.cursorX !== 'number' || typeof existing.cursorY !== 'number';
@@ -409,12 +467,12 @@ export function mergeSmoothRemotePlayerState(
     typeof incoming.cursorY === 'number'
   ) {
     let cdx = incoming.cursorX - existing.cursorX!;
-    if (cdx > ARENA_WIDTH * 0.5) cdx -= ARENA_WIDTH;
-    if (cdx < -ARENA_WIDTH * 0.5) cdx += ARENA_WIDTH;
+    if (cdx > arena.width * 0.5) cdx -= arena.width;
+    if (cdx < -arena.width * 0.5) cdx += arena.width;
     let cdy = incoming.cursorY - existing.cursorY!;
-    if (cdy > ARENA_HEIGHT * 0.5) cdy -= ARENA_HEIGHT;
-    if (cdy < -ARENA_HEIGHT * 0.5) cdy += ARENA_HEIGHT;
-    if (Math.hypot(cdx, cdy) > 2600) {
+    if (cdy > arena.height * 0.5) cdy -= arena.height;
+    if (cdy < -arena.height * 0.5) cdy += arena.height;
+    if (Math.hypot(cdx, cdy) > (arena.fixedCamera ? 800 : 2600)) {
       cursorShouldSnap = true;
     }
   }
@@ -507,7 +565,8 @@ function compactPlayerForWire(p: PlayerState): Partial<PlayerState> {
   return out;
 }
 
-function hydratePlayerFromWire(raw: Partial<PlayerState>): PlayerState {
+function hydratePlayerFromWire(raw: Partial<PlayerState>, roomId: string = 'SECTOR-01'): PlayerState {
+  const arena = getRoomArenaConfig(roomId);
   const hull = raw.hull && HULL_SPECS[raw.hull] ? raw.hull : 'needle';
   const maxHp = raw.maxHp ?? HULL_SPECS[hull].maxHp;
   return {
@@ -515,8 +574,8 @@ function hydratePlayerFromWire(raw: Partial<PlayerState>): PlayerState {
     name: raw.name || 'PILOT',
     color: raw.color || PLAYER_COLORS[0],
     hull,
-    x: Number(raw.x) || GRAVITY_STAR_X,
-    y: Number(raw.y) || GRAVITY_STAR_Y,
+    x: Number(raw.x) || arena.starX,
+    y: Number(raw.y) || arena.starY,
     vx: Number(raw.vx) || 0,
     vy: Number(raw.vy) || 0,
     angle: Number(raw.angle) || 0,
@@ -556,6 +615,7 @@ function compactEventForWire(packet: PeerSyncPacket): PeerSyncPacket {
     return {
       type: 'peer:salvo',
       senderId: packet.senderId,
+      roomId: packet.roomId,
       salvo: {
         ...s,
         x: Math.round(s.x),
@@ -573,6 +633,7 @@ function compactEventForWire(packet: PeerSyncPacket): PeerSyncPacket {
     return {
       type: 'peer:cheat_action',
       senderId: packet.senderId,
+      roomId: packet.roomId,
       playerId: packet.playerId,
       action: packet.action,
       droneBatch: packet.droneBatch,
@@ -588,6 +649,7 @@ function compactEventForWire(packet: PeerSyncPacket): PeerSyncPacket {
 export class PeerSectorSync {
   private channel: BroadcastChannel | null = null;
   private selfId: string;
+  private roomId: string = 'SECTOR-01';
   private peerLastSeen = new Map<string, number>();
   private onPacket: (packet: PeerSyncPacket) => void;
   private pollTimer: number | null = null;
@@ -603,8 +665,9 @@ export class PeerSectorSync {
   private focusedPeerId: string | null = null;
   private focusListenersCleanup: (() => void) | null = null;
 
-  constructor(selfId: string, onPacket: (packet: PeerSyncPacket) => void) {
+  constructor(selfId: string, onPacket: (packet: PeerSyncPacket) => void, initialRoomId: string = 'SECTOR-01') {
     this.selfId = selfId;
+    this.roomId = initialRoomId;
     this.onPacket = onPacket;
 
     if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -649,12 +712,28 @@ export class PeerSectorSync {
     }
   }
 
+  public setRoomId(roomId: string) {
+    const clean = roomId === 'COUCH-COOP' ? 'COUCH-COOP' : 'SECTOR-01';
+    if (this.roomId !== clean) {
+      this.roomId = clean;
+      this.peerLastSeen.clear();
+      this.pendingCloudEvents = [];
+      this.lastCloudSeq = 0;
+      this.seenBatches.clear();
+    }
+  }
+
+  public getRoomId(): string {
+    return this.roomId;
+  }
+
   private broadcastFocus(focused: boolean) {
     if (!this.channel) return;
     try {
       this.channel.postMessage({
         type: 'peer:focus',
         senderId: this.selfId,
+        roomId: this.roomId,
         focused,
       } satisfies PeerSyncPacket);
     } catch {
@@ -672,7 +751,6 @@ export class PeerSectorSync {
 
   private handleIncomingPacket(pkt: PeerSyncPacket) {
     if (!pkt || pkt.senderId === this.selfId) return;
-    this.peerLastSeen.set(pkt.senderId, Date.now());
 
     if (pkt.type === 'peer:focus') {
       if (pkt.focused) {
@@ -681,6 +759,14 @@ export class PeerSectorSync {
         this.focusedPeerId = typeof document !== 'undefined' && document.hasFocus() ? this.selfId : null;
       }
       return;
+    }
+
+    const pktRoom = pkt.roomId || 'SECTOR-01';
+    if (pktRoom !== this.roomId) return;
+
+    this.peerLastSeen.set(pkt.senderId, Date.now());
+    if (pkt.type === 'peer:player_state' && pkt.player2?.id) {
+      this.peerLastSeen.set(pkt.player2.id, Date.now());
     }
 
     if (pkt.type === 'peer:salvo') {
@@ -710,7 +796,7 @@ export class PeerSectorSync {
       if (!pkt.spawnedDrones) {
         pkt = {
           ...pkt,
-          spawnedDrones: createTargetDronesFromBatchSpec(pkt.droneBatch),
+          spawnedDrones: createTargetDronesFromBatchSpec(pkt.droneBatch, this.roomId),
         };
       }
     }
@@ -730,28 +816,35 @@ export class PeerSectorSync {
     }
   }
 
-  public announceJoin(localPlayer?: PlayerState) {
+  public announceJoin(localPlayer?: PlayerState, localPlayer2?: PlayerState) {
     this.send({
       type: 'peer:hello',
       senderId: this.selfId,
+      roomId: this.roomId,
       player: localPlayer,
+      player2: localPlayer2,
     });
   }
 
   public send(packet: PeerSyncPacket) {
-    if (packet.type === 'peer:salvo') {
-      this.seenSalvos.add(packet.salvo.idPrefix);
-    } else if (packet.type === 'peer:combat_hit' && packet.hitId) {
-      this.seenHits.add(packet.hitId);
-    } else if (packet.type === 'peer:chat' && packet.message?.id) {
-      this.seenChats.add(packet.message.id);
-    } else if (packet.type === 'peer:cheat_action' && packet.droneBatch) {
-      this.seenBatches.add(packet.droneBatch.seed);
+    const taggedPacket: PeerSyncPacket = {
+      ...packet,
+      roomId: packet.roomId || this.roomId,
+    };
+
+    if (taggedPacket.type === 'peer:salvo') {
+      this.seenSalvos.add(taggedPacket.salvo.idPrefix);
+    } else if (taggedPacket.type === 'peer:combat_hit' && taggedPacket.hitId) {
+      this.seenHits.add(taggedPacket.hitId);
+    } else if (taggedPacket.type === 'peer:chat' && taggedPacket.message?.id) {
+      this.seenChats.add(taggedPacket.message.id);
+    } else if (taggedPacket.type === 'peer:cheat_action' && taggedPacket.droneBatch) {
+      this.seenBatches.add(taggedPacket.droneBatch.seed);
     }
 
     if (this.channel) {
       try {
-        this.channel.postMessage(packet);
+        this.channel.postMessage(taggedPacket);
       } catch {
         // Ignore channel errors
       }
@@ -759,16 +852,16 @@ export class PeerSectorSync {
 
     // Queue discrete gameplay events for the /api/sector cloud relay (with compact wire representation)
     if (
-      packet.type === 'peer:salvo' ||
-      packet.type === 'peer:combat_hit' ||
-      packet.type === 'peer:cheat_action' ||
-      packet.type === 'peer:rename' ||
-      packet.type === 'peer:cheat_rename' ||
-      packet.type === 'peer:player_leave' ||
-      packet.type === 'peer:chat'
+      taggedPacket.type === 'peer:salvo' ||
+      taggedPacket.type === 'peer:combat_hit' ||
+      taggedPacket.type === 'peer:cheat_action' ||
+      taggedPacket.type === 'peer:rename' ||
+      taggedPacket.type === 'peer:cheat_rename' ||
+      taggedPacket.type === 'peer:player_leave' ||
+      taggedPacket.type === 'peer:chat'
     ) {
       // Avoid flooding Vercel with redundant rapid-fire salvo packets; remote clients already synthesize continuous fire while p.shooting is true
-      if (packet.type === 'peer:salvo') {
+      if (taggedPacket.type === 'peer:salvo') {
         const now = Date.now();
         if (now - this.lastCloudSalvoSentAt < 140) {
           return;
@@ -777,33 +870,33 @@ export class PeerSectorSync {
       }
       // Do not send AI-vs-AI or player-vs-AI drone hits over Vercel relay if no other human peers exist
       if (
-        packet.type === 'peer:combat_hit' &&
+        taggedPacket.type === 'peer:combat_hit' &&
         this.peerLastSeen.size === 0 &&
-        packet.targetId.startsWith('drn_')
+        taggedPacket.targetId.startsWith('drn_')
       ) {
         return;
       }
 
-      this.pendingCloudEvents.push(compactEventForWire(packet));
+      this.pendingCloudEvents.push(compactEventForWire(taggedPacket));
       if (this.pendingCloudEvents.length > 40) {
         this.pendingCloudEvents.shift();
       }
     }
   }
 
-  public pruneStalePeers(players: Map<string, PlayerState>) {
+  public pruneStalePeers(players: Map<string, PlayerState>, localPlayer2Id?: string) {
     const now = Date.now();
     for (const [peerId, lastTime] of this.peerLastSeen.entries()) {
       if (now - lastTime > 5000) {
         this.peerLastSeen.delete(peerId);
         const stale = players.get(peerId);
-        if (stale && !stale.isDrone && peerId !== this.selfId) {
+        if (stale && !stale.isDrone && peerId !== this.selfId && peerId !== localPlayer2Id) {
           players.delete(peerId);
         }
       }
     }
     for (const [pid, p] of players.entries()) {
-      if (pid !== this.selfId && !p.isDrone && !this.peerLastSeen.has(pid)) {
+      if (pid !== this.selfId && pid !== localPlayer2Id && !p.isDrone && !this.peerLastSeen.has(pid)) {
         this.peerLastSeen.set(pid, now);
       }
     }
@@ -813,12 +906,12 @@ export class PeerSectorSync {
    * Deterministic leader election among open browser windows:
    * The lowest lexicographical ID among active human peers steps shared drones.
    */
-  public isLeader(players: Map<string, PlayerState>): boolean {
-    this.pruneStalePeers(players);
+  public isLeader(players: Map<string, PlayerState>, localPlayer2Id?: string): boolean {
+    this.pruneStalePeers(players, localPlayer2Id);
 
     const humanIds: string[] = [this.selfId];
     for (const p of players.values()) {
-      if (!p.isDrone && p.id !== this.selfId) {
+      if (!p.isDrone && p.id !== this.selfId && p.id !== localPlayer2Id) {
         humanIds.push(p.id);
       }
     }
@@ -829,7 +922,8 @@ export class PeerSectorSync {
   public startCloudRelayPoll(
     isWsConnected: () => boolean,
     getLocalPlayer: () => PlayerState | undefined,
-    onServerTime?: (serverTime: number) => void
+    onServerTime?: (serverTime: number) => void,
+    getLocalPlayer2?: () => PlayerState | undefined
   ) {
     if (this.pollTimer) window.clearInterval(this.pollTimer);
     this.pollTimer = window.setInterval(async () => {
@@ -855,18 +949,24 @@ export class PeerSectorSync {
       if (now - this.lastPollTime < minInterval) return;
 
       const localPlayer = getLocalPlayer();
+      const localPlayer2 = getLocalPlayer2 ? getLocalPlayer2() : undefined;
       const eventsToSend = this.pendingCloudEvents.splice(0, this.pendingCloudEvents.length);
-      if (!localPlayer && eventsToSend.length === 0) return;
+      if (!localPlayer && !localPlayer2 && eventsToSend.length === 0) return;
 
       this.isPolling = true;
       this.lastPollTime = now;
+      const activeRoomId = this.roomId;
       try {
         const payload: Record<string, unknown> = {
           id: this.selfId,
+          r: activeRoomId,
           q: this.lastCloudSeq,
         };
         if (localPlayer) {
           payload.p = compactPlayerForWire(localPlayer);
+        }
+        if (localPlayer2) {
+          payload.p2 = compactPlayerForWire(localPlayer2);
         }
         if (eventsToSend.length > 0) {
           payload.e = eventsToSend;
@@ -877,7 +977,7 @@ export class PeerSectorSync {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        if (res.ok) {
+        if (res.ok && activeRoomId === this.roomId) {
           const data = (await res.json()) as {
             q?: number;
             latestSeq?: number;
@@ -899,14 +999,21 @@ export class PeerSectorSync {
             this.lastCloudSeq = latestSeq;
           }
           const remotePlayers = data.p ?? data.players;
+          const localP2Id = localPlayer2?.id;
           if (Array.isArray(remotePlayers)) {
             for (const rawRemote of remotePlayers) {
-              if (rawRemote && rawRemote.id && rawRemote.id !== this.selfId) {
-                const remote = hydratePlayerFromWire(rawRemote);
+              if (
+                rawRemote &&
+                rawRemote.id &&
+                rawRemote.id !== this.selfId &&
+                rawRemote.id !== localP2Id
+              ) {
+                const remote = hydratePlayerFromWire(rawRemote, activeRoomId);
                 this.peerLastSeen.set(remote.id, Date.now());
                 this.onPacket({
                   type: 'peer:player_state',
                   senderId: remote.id,
+                  roomId: activeRoomId,
                   player: remote,
                 });
               }
@@ -917,13 +1024,14 @@ export class PeerSectorSync {
             for (const batch of data.b) {
               if (batch && typeof batch.seed === 'number' && !this.seenBatches.has(batch.seed)) {
                 this.seenBatches.add(batch.seed);
-                const drones = createTargetDronesFromBatchSpec(batch).filter(
+                const drones = createTargetDronesFromBatchSpec(batch, activeRoomId).filter(
                   (dr) => !deadSet.has(dr.id)
                 );
                 if (drones.length > 0) {
                   this.onPacket({
                     type: 'peer:cheat_action',
                     senderId: 'relay',
+                    roomId: activeRoomId,
                     playerId: 'relay',
                     action: batch.count > 1 ? 'spawn_drones_100' : 'spawn_drone',
                     droneBatch: batch,
@@ -936,7 +1044,7 @@ export class PeerSectorSync {
           const incomingEvents = data.e ?? data.events;
           if (Array.isArray(incomingEvents)) {
             for (const pkt of incomingEvents) {
-              this.handleIncomingPacket(pkt);
+              this.handleIncomingPacket({ ...pkt, roomId: pkt.roomId || activeRoomId });
             }
           }
         }
@@ -948,7 +1056,7 @@ export class PeerSectorSync {
     }, 65);
   }
 
-  public destroy(localPlayerId: string) {
+  public destroy(localPlayerId: string, localPlayer2Id?: string) {
     if (this.focusListenersCleanup) {
       this.focusListenersCleanup();
       this.focusListenersCleanup = null;
@@ -960,11 +1068,21 @@ export class PeerSectorSync {
     this.send({
       type: 'peer:player_leave',
       senderId: this.selfId,
+      roomId: this.roomId,
       playerId: localPlayerId,
     });
+    if (localPlayer2Id) {
+      this.send({
+        type: 'peer:player_leave',
+        senderId: this.selfId,
+        roomId: this.roomId,
+        playerId: localPlayer2Id,
+      });
+    }
     if (this.channel) {
       this.channel.close();
       this.channel = null;
     }
   }
 }
+

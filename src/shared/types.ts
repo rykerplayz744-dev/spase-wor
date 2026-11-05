@@ -74,12 +74,55 @@ export const HULL_SPECS: Record<ShipHullType, HullSpec> = {
   },
 };
 
+export type RoomModeId = 'SECTOR-01' | 'COUCH-COOP';
+
 export const ARENA_WIDTH = 28000;
 export const ARENA_HEIGHT = 18000;
 export const GRAVITY_STAR_X = ARENA_WIDTH / 2;
 export const GRAVITY_STAR_Y = ARENA_HEIGHT / 2;
 export const GRAVITY_STAR_RADIUS = 440;
 export const GRAVITY_STRENGTH = 420000000; // GM constant scaled for 10x central star gravitational slingshots
+
+// Fixed-screen Couch Co-Op Server Arena (1920x1080 single-screen playfield with instant screen-edge loop)
+export const COUCH_ARENA_WIDTH = 1920;
+export const COUCH_ARENA_HEIGHT = 1080;
+export const COUCH_STAR_X = COUCH_ARENA_WIDTH / 2;
+export const COUCH_STAR_Y = COUCH_ARENA_HEIGHT / 2;
+export const COUCH_STAR_RADIUS = 52;
+export const COUCH_GRAVITY_STRENGTH = 38000000;
+
+export interface RoomArenaConfig {
+  roomId: RoomModeId;
+  isCouch: boolean;
+  fixedCamera: boolean;
+  hasPlanets: boolean;
+  width: number;
+  height: number;
+  starX: number;
+  starY: number;
+  starRadius: number;
+  gravityStrength: number;
+  maxAsteroids: number;
+}
+
+export function getRoomArenaConfig(roomId?: string): RoomArenaConfig {
+  const isCouch = roomId === 'COUCH-COOP';
+  const width = isCouch ? COUCH_ARENA_WIDTH : ARENA_WIDTH;
+  const height = isCouch ? COUCH_ARENA_HEIGHT : ARENA_HEIGHT;
+  return {
+    roomId: isCouch ? 'COUCH-COOP' : 'SECTOR-01',
+    isCouch,
+    fixedCamera: isCouch,
+    hasPlanets: !isCouch,
+    width,
+    height,
+    starX: width * 0.5,
+    starY: height * 0.5,
+    starRadius: isCouch ? COUCH_STAR_RADIUS : GRAVITY_STAR_RADIUS,
+    gravityStrength: isCouch ? COUCH_GRAVITY_STRENGTH : GRAVITY_STRENGTH,
+    maxAsteroids: isCouch ? 10 : 224,
+  };
+}
 
 export const PLAYER_COLORS = [
   '#38BDF8', // Sky Cyan
@@ -327,6 +370,7 @@ export type ClientToServerMessage =
     }
   | {
       type: 'player:input';
+      roomId?: string;
       playerId: string;
       angle: number;
       thrusting: boolean;
@@ -435,7 +479,11 @@ export interface SalvoSpawnPayload {
   targetIds: string[];
 }
 
-export function expandSalvoToBullets(salvo: SalvoSpawnPayload): BulletState[] {
+export function expandSalvoToBullets(
+  salvo: SalvoSpawnPayload,
+  roomId: string = 'SECTOR-01'
+): BulletState[] {
+  const arena = getRoomArenaConfig(roomId);
   const result: BulletState[] = [];
   const {
     idPrefix,
@@ -473,8 +521,8 @@ export function expandSalvoToBullets(salvo: SalvoSpawnPayload): BulletState[] {
     const bvx = dirX * effectiveMuzzle;
     const bvy = dirY * effectiveMuzzle;
 
-    const bx = (((x + dirX * noseDist) % ARENA_WIDTH) + ARENA_WIDTH) % ARENA_WIDTH;
-    const by = (((y + dirY * noseDist) % ARENA_HEIGHT) + ARENA_HEIGHT) % ARENA_HEIGHT;
+    const bx = (((x + dirX * noseDist) % arena.width) + arena.width) % arena.width;
+    const by = (((y + dirY * noseDist) % arena.height) + arena.height) % arena.height;
 
     result.push({
       id: `${idPrefix}_${i}`,
@@ -534,6 +582,7 @@ export type ServerToClientMessage =
     }
   | {
       type: 'state:snapshot';
+      roomId?: string;
       serverTime: number;
       gravityStarEnabled: boolean;
       players: PlayerState[];
@@ -634,10 +683,12 @@ export function stepAiDroneAutopilot(
   planets: PlanetState[],
   gravityStarEnabled: boolean,
   dt: number,
-  nowSec: number
+  nowSec: number,
+  roomId: string = 'SECTOR-01'
 ): void {
   if (!drone.alive || !drone.isDrone) return;
 
+  const arena = getRoomArenaConfig(roomId);
   const seed = hashIdToNumber(drone.id);
   const canTeamUp = seed % 10 < 6; // ~60% of AI ships are open to forming/joining tactical squads
   const strafeSign = seed % 2 === 0 ? 1 : -1;
@@ -688,14 +739,15 @@ export function stepAiDroneAutopilot(
       continue;
     }
 
-    const dx = shortestDelta(drone.x, other.x, ARENA_WIDTH);
-    const dy = shortestDelta(drone.y, other.y, ARENA_HEIGHT);
+    const dx = shortestDelta(drone.x, other.x, arena.width);
+    const dy = shortestDelta(drone.y, other.y, arena.height);
     const distSq = dx * dx + dy * dy;
 
     // Anti-clumping separation within 260 units so ships never stack in lines or spirals
-    if (distSq < 260 * 260 && distSq > 1) {
+    const sepRadius = arena.isCouch ? 130 : 260;
+    if (distSq < sepRadius * sepRadius && distSq > 1) {
       const dist = Math.sqrt(distSq);
-      const push = (260 - dist) / 260;
+      const push = (sepRadius - dist) / sepRadius;
       sepX -= (dx / dist) * push * 2.2;
       sepY -= (dy / dist) * push * 2.2;
     }
@@ -767,8 +819,8 @@ export function stepAiDroneAutopilot(
       !mateTarget.spectating &&
       !arePlayersTeammates(drone, mateTarget)
     ) {
-      const mdx = shortestDelta(drone.x, mateTarget.x, ARENA_WIDTH);
-      const mdy = shortestDelta(drone.y, mateTarget.y, ARENA_HEIGHT);
+      const mdx = shortestDelta(drone.x, mateTarget.x, arena.width);
+      const mdy = shortestDelta(drone.y, mateTarget.y, arena.height);
       const mDist = Math.hypot(mdx, mdy);
       if (!bestEnemy || (bestEnemy.isDrone && mDist < 3200)) {
         bestEnemy = mateTarget;
@@ -790,8 +842,8 @@ export function stepAiDroneAutopilot(
   let wantsShoot = false;
 
   if (bestEnemy) {
-    const dx = shortestDelta(drone.x, bestEnemy.x, ARENA_WIDTH);
-    const dy = shortestDelta(drone.y, bestEnemy.y, ARENA_HEIGHT);
+    const dx = shortestDelta(drone.x, bestEnemy.x, arena.width);
+    const dy = shortestDelta(drone.y, bestEnemy.y, arena.height);
     const dist = Math.max(1, Math.hypot(dx, dy));
 
     // Predictive lead intercept calculation using target velocity & relative motion
@@ -800,7 +852,7 @@ export function stepAiDroneAutopilot(
     const leadDy = dy + (bestEnemy.vy - drone.vy * 0.35) * leadTime;
     const leadAngle = Math.atan2(leadDy, leadDx);
 
-    if (dist < 310) {
+    if (dist < (arena.isCouch ? 210 : 310)) {
       // Close-quarters dogfight weave/strafe so AI circles and blasts the target instead of parking on top of it
       const strafeAngle = leadAngle + strafeSign * (Math.PI * 0.38);
       steerX += Math.cos(strafeAngle) * 1.6;
@@ -810,13 +862,13 @@ export function stepAiDroneAutopilot(
       // Direct intercept pursuit
       steerX += Math.cos(leadAngle) * 1.9;
       steerY += Math.sin(leadAngle) * 1.9;
-      wantsThrust = dist > 380 || Math.hypot(drone.vx, drone.vy) < 380;
+      wantsThrust = dist > (arena.isCouch ? 240 : 380) || Math.hypot(drone.vx, drone.vy) < 380;
     }
 
     // Wingman Flanking Cohesion when teamed up
     if (nearestMate && nearestMateDistSq < 1800 * 1800 && nearestMateDistSq > 220 * 220) {
-      const mdx = shortestDelta(drone.x, nearestMate.x, ARENA_WIDTH);
-      const mdy = shortestDelta(drone.y, nearestMate.y, ARENA_HEIGHT);
+      const mdx = shortestDelta(drone.x, nearestMate.x, arena.width);
+      const mdy = shortestDelta(drone.y, nearestMate.y, arena.height);
       const mDist = Math.sqrt(nearestMateDistSq);
       steerX += (mdx / mDist) * 0.48;
       steerY += (mdy / mDist) * 0.48;
@@ -824,14 +876,14 @@ export function stepAiDroneAutopilot(
 
     // Fire weapons when enemy is within 1,850 units and nose is lined up within ~24 degrees
     const aimError = Math.abs(normAngle(leadAngle - drone.angle));
-    if (dist < 1850 && aimError < 0.42) {
+    if (dist < (arena.isCouch ? 900 : 1850) && aimError < 0.42) {
       wantsShoot = true;
     }
   } else {
     // Roaming / Squad Patrol when no enemy is in range (never a circular galaxy spiral!)
     if (nearestMate && nearestMateDistSq > 240 * 240 && nearestMateDistSq < 2200 * 2200) {
-      const mdx = shortestDelta(drone.x, nearestMate.x, ARENA_WIDTH);
-      const mdy = shortestDelta(drone.y, nearestMate.y, ARENA_HEIGHT);
+      const mdx = shortestDelta(drone.x, nearestMate.x, arena.width);
+      const mdy = shortestDelta(drone.y, nearestMate.y, arena.height);
       const mDist = Math.sqrt(nearestMateDistSq);
       steerX += (mdx / mDist) * 1.2 + Math.cos(nearestMate.angle) * 0.7;
       steerY += (mdy / mDist) * 1.2 + Math.sin(nearestMate.angle) * 0.7;
@@ -849,11 +901,12 @@ export function stepAiDroneAutopilot(
 
   // 3. Hazard Avoidance (Central Gravity Star & Orbiting Planets)
   if (gravityStarEnabled) {
-    const dxStar = shortestDelta(GRAVITY_STAR_X, drone.x, ARENA_WIDTH); // vector from Star to drone
-    const dyStar = shortestDelta(GRAVITY_STAR_Y, drone.y, ARENA_HEIGHT);
+    const dxStar = shortestDelta(arena.starX, drone.x, arena.width); // vector from Star to drone
+    const dyStar = shortestDelta(arena.starY, drone.y, arena.height);
     const distStar = Math.hypot(dxStar, dyStar);
-    if (distStar < GRAVITY_STAR_RADIUS + 950 && distStar > 1) {
-      const urgency = Math.min(4.0, (GRAVITY_STAR_RADIUS + 950 - distStar) / 220);
+    const safeStarDist = arena.isCouch ? arena.starRadius + 150 : arena.starRadius + 950;
+    if (distStar < safeStarDist && distStar > 1) {
+      const urgency = Math.min(4.0, (safeStarDist - distStar) / (arena.isCouch ? 60 : 220));
       steerX += (dxStar / distStar) * urgency * 2.8;
       steerY += (dyStar / distStar) * urgency * 2.8;
       wantsThrust = true;
@@ -862,8 +915,8 @@ export function stepAiDroneAutopilot(
 
   for (let i = 0; i < planets.length; i++) {
     const planet = planets[i];
-    const dxP = shortestDelta(planet.x, drone.x, ARENA_WIDTH);
-    const dyP = shortestDelta(planet.y, drone.y, ARENA_HEIGHT);
+    const dxP = shortestDelta(planet.x, drone.x, arena.width);
+    const dyP = shortestDelta(planet.y, drone.y, arena.height);
     const distP = Math.hypot(dxP, dyP);
     const safeRadius = planet.radius + 320;
     if (distP < safeRadius && distP > 1) {

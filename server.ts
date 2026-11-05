@@ -15,6 +15,7 @@ import {
   ClientToServerMessage,
   DEFAULT_PLAYER_CHEATS,
   expandSalvoToBullets,
+  getRoomArenaConfig,
   GRAVITY_STAR_RADIUS,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
@@ -81,16 +82,21 @@ function normalizeAngleDiff(diff: number): number {
   return diff;
 }
 
-function createAsteroid(_room: RoomState): AsteroidState {
-  let x = Math.random() * ARENA_WIDTH;
-  let y = Math.random() * ARENA_HEIGHT;
-  const distToStar = Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y);
-  if (distToStar < 1400) {
+function createAsteroid(room: RoomState): AsteroidState {
+  const arena = getRoomArenaConfig(room.id);
+  let x = Math.random() * arena.width;
+  let y = Math.random() * arena.height;
+  const distToStar = Math.hypot(x - arena.starX, y - arena.starY);
+  const minStarClearance = arena.fixedCamera ? arena.starRadius + 140 : 1400;
+  if (distToStar < minStarClearance) {
     const pushAngle = Math.random() * Math.PI * 2;
-    x = GRAVITY_STAR_X + Math.cos(pushAngle) * (1800 + Math.random() * 6000);
-    y = GRAVITY_STAR_Y + Math.sin(pushAngle) * (1800 + Math.random() * 4500);
+    const minOrbit = arena.fixedCamera ? 190 : 1800;
+    const maxOrbitX = arena.fixedCamera ? 520 : 6000;
+    const maxOrbitY = arena.fixedCamera ? 340 : 4500;
+    x = arena.starX + Math.cos(pushAngle) * (minOrbit + Math.random() * maxOrbitX);
+    y = arena.starY + Math.sin(pushAngle) * (minOrbit + Math.random() * maxOrbitY);
   }
-  const radius = 24 + Math.random() * 34;
+  const radius = arena.fixedCamera ? 18 + Math.random() * 18 : 24 + Math.random() * 34;
   const speed = 35 + Math.random() * 75;
   const moveAngle = Math.random() * Math.PI * 2;
   const vertCount = 10;
@@ -101,8 +107,8 @@ function createAsteroid(_room: RoomState): AsteroidState {
   const maxHp = Math.round(radius * 2.2);
   return {
     id: nextId('ast'),
-    x: wrapCoord(x, ARENA_WIDTH),
-    y: wrapCoord(y, ARENA_HEIGHT),
+    x: wrapCoord(x, arena.width),
+    y: wrapCoord(y, arena.height),
     vx: Math.cos(moveAngle) * speed,
     vy: Math.sin(moveAngle) * speed,
     radius,
@@ -114,17 +120,20 @@ function createAsteroid(_room: RoomState): AsteroidState {
   };
 }
 
-function getOrCreateRoom(_roomId?: string): RoomState {
-  const cleanId = 'SECTOR-01';
+function getOrCreateRoom(roomId?: string): RoomState {
+  const cleanId = roomId === 'COUCH-COOP' ? 'COUCH-COOP' : 'SECTOR-01';
   let room = rooms.get(cleanId);
   if (!room) {
-    const planets: PlanetState[] = INITIAL_PLANETS.map((p) => ({
-      ...p,
-      x: GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius,
-      y: GRAVITY_STAR_Y + Math.sin(p.orbitAngle) * p.orbitRadius,
-      vx: -Math.sin(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
-      vy: Math.cos(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
-    }));
+    const arena = getRoomArenaConfig(cleanId);
+    const planets: PlanetState[] = arena.hasPlanets
+      ? INITIAL_PLANETS.map((p) => ({
+          ...p,
+          x: arena.starX + Math.cos(p.orbitAngle) * p.orbitRadius,
+          y: arena.starY + Math.sin(p.orbitAngle) * p.orbitRadius,
+          vx: -Math.sin(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
+          vy: Math.cos(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
+        }))
+      : [];
     room = {
       id: cleanId,
       gravityStarEnabled: true,
@@ -137,7 +146,7 @@ function getOrCreateRoom(_roomId?: string): RoomState {
       clients: new Set(),
       colorIndex: 0,
     };
-    for (let i = 0; i < 224; i++) {
+    for (let i = 0; i < arena.maxAsteroids; i++) {
       const ast = createAsteroid(room);
       room.asteroids.set(ast.id, ast);
     }
@@ -147,17 +156,40 @@ function getOrCreateRoom(_roomId?: string): RoomState {
 }
 
 function getSafeSpawnPoint(room: RoomState, excludeId?: string): { x: number; y: number } {
+  const arena = getRoomArenaConfig(room.id);
+
+  if (arena.fixedCamera) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const theta = Math.random() * Math.PI * 2;
+      const orbitRadius = 220 + Math.random() * 220;
+      const x = wrapCoord(arena.starX + Math.cos(theta) * orbitRadius, arena.width);
+      const y = wrapCoord(arena.starY + Math.sin(theta) * orbitRadius, arena.height);
+      let safe = true;
+      for (const p of room.players.values()) {
+        if (p.alive && p.id !== excludeId && Math.hypot(p.x - x, p.y - y) < 110) {
+          safe = false;
+          break;
+        }
+      }
+      if (safe) return { x: Math.round(x), y: Math.round(y) };
+    }
+    return {
+      x: Math.round(wrapCoord(arena.starX + 320, arena.width)),
+      y: Math.round(wrapCoord(arena.starY, arena.height)),
+    };
+  }
+
   // 1. If another human player is alive and safely outside the Sun's deep gravity well, spawn near them!
   for (const p of room.players.values()) {
     if (p.alive && !p.isDrone && p.id !== excludeId) {
-      const distFromSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
-      if (distFromSun > GRAVITY_STAR_RADIUS + 1500) {
+      const distFromSun = Math.hypot(p.x - arena.starX, p.y - arena.starY);
+      if (distFromSun > arena.starRadius + 1500) {
         for (let attempt = 0; attempt < 12; attempt++) {
           const angle = Math.random() * Math.PI * 2;
           const dist = 160 + Math.random() * 140;
-          const x = wrapCoord(p.x + Math.cos(angle) * dist, ARENA_WIDTH);
-          const y = wrapCoord(p.y + Math.sin(angle) * dist, ARENA_HEIGHT);
-          if (Math.hypot(x - GRAVITY_STAR_X, y - GRAVITY_STAR_Y) > GRAVITY_STAR_RADIUS + 1400) {
+          const x = wrapCoord(p.x + Math.cos(angle) * dist, arena.width);
+          const y = wrapCoord(p.y + Math.sin(angle) * dist, arena.height);
+          if (Math.hypot(x - arena.starX, y - arena.starY) > arena.starRadius + 1400) {
             return { x: Math.round(x), y: Math.round(y) };
           }
         }
@@ -168,9 +200,9 @@ function getSafeSpawnPoint(room: RoomState, excludeId?: string): { x: number; y:
   // 2. Otherwise teleport to a safe orbit around the Sun (2,200 - 3,800 units out, never inside the Sun!)
   for (let attempt = 0; attempt < 24; attempt++) {
     const theta = Math.random() * Math.PI * 2;
-    const orbitRadius = GRAVITY_STAR_RADIUS + 1800 + Math.random() * 1600;
-    const x = wrapCoord(GRAVITY_STAR_X + Math.cos(theta) * orbitRadius, ARENA_WIDTH);
-    const y = wrapCoord(GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius, ARENA_HEIGHT);
+    const orbitRadius = arena.starRadius + 1800 + Math.random() * 1600;
+    const x = wrapCoord(arena.starX + Math.cos(theta) * orbitRadius, arena.width);
+    const y = wrapCoord(arena.starY + Math.sin(theta) * orbitRadius, arena.height);
     let safe = true;
     for (const planet of room.planets) {
       if (Math.hypot(planet.x - x, planet.y - y) < planet.radius + 160) {
@@ -182,17 +214,20 @@ function getSafeSpawnPoint(room: RoomState, excludeId?: string): { x: number; y:
   }
 
   return {
-    x: Math.round(wrapCoord(GRAVITY_STAR_X + 2900, ARENA_WIDTH)),
-    y: Math.round(wrapCoord(GRAVITY_STAR_Y, ARENA_HEIGHT)),
+    x: Math.round(wrapCoord(arena.starX + 2900, arena.width)),
+    y: Math.round(wrapCoord(arena.starY, arena.height)),
   };
 }
 
 function getRandomWarpPoint(room: RoomState): { x: number; y: number } {
+  const arena = getRoomArenaConfig(room.id);
   for (let attempt = 0; attempt < 24; attempt++) {
-    const orbitRadius = 1500 + Math.random() * 6500;
+    const orbitRadius = arena.fixedCamera
+      ? 200 + Math.random() * 280
+      : 1500 + Math.random() * 6500;
     const theta = Math.random() * Math.PI * 2;
-    const x = wrapCoord(GRAVITY_STAR_X + Math.cos(theta) * orbitRadius, ARENA_WIDTH);
-    const y = wrapCoord(GRAVITY_STAR_Y + Math.sin(theta) * orbitRadius, ARENA_HEIGHT);
+    const x = wrapCoord(arena.starX + Math.cos(theta) * orbitRadius, arena.width);
+    const y = wrapCoord(arena.starY + Math.sin(theta) * orbitRadius, arena.height);
 
     let safe = true;
     for (const planet of room.planets) {
@@ -204,15 +239,15 @@ function getRandomWarpPoint(room: RoomState): { x: number; y: number } {
     if (safe) return { x, y };
   }
   return {
-    x: wrapCoord(GRAVITY_STAR_X + 3200, ARENA_WIDTH),
-    y: wrapCoord(GRAVITY_STAR_Y, ARENA_HEIGHT),
+    x: wrapCoord(arena.starX + (arena.fixedCamera ? 320 : 3200), arena.width),
+    y: wrapCoord(arena.starY, arena.height),
   };
 }
 
 function getRoomSummaries(): RoomSummary[] {
   const list: RoomSummary[] = [];
   for (const room of rooms.values()) {
-    if (room.players.size > 0 || room.id === 'SECTOR-01') {
+    if (room.players.size > 0 || room.id === 'SECTOR-01' || room.id === 'COUCH-COOP') {
       list.push({
         roomId: room.id,
         playerCount: room.players.size,
@@ -222,6 +257,9 @@ function getRoomSummaries(): RoomSummary[] {
   }
   if (!list.some((r) => r.roomId === 'SECTOR-01')) {
     list.unshift({ roomId: 'SECTOR-01', playerCount: 0, gravityStarEnabled: true });
+  }
+  if (!list.some((r) => r.roomId === 'COUCH-COOP')) {
+    list.push({ roomId: 'COUCH-COOP', playerCount: 0, gravityStarEnabled: true });
   }
   return list;
 }
@@ -299,14 +337,15 @@ function findNearestTargetForMissile(
   mx: number,
   my: number
 ): { id: string; x: number; y: number; vx: number; vy: number } | null {
+  const arena = getRoomArenaConfig(room.id);
   let bestTarget: { id: string; x: number; y: number; vx: number; vy: number } | null = null;
   let bestDistSq = Infinity;
 
   // Priority 1: Other alive player ships in the room (using squared distance, zero sqrt)
   for (const p of room.players.values()) {
     if (!p.alive || p.id === ownerId) continue;
-    const dx = shortestToroidalDelta(mx, p.x, ARENA_WIDTH);
-    const dy = shortestToroidalDelta(my, p.y, ARENA_HEIGHT);
+    const dx = shortestToroidalDelta(mx, p.x, arena.width);
+    const dy = shortestToroidalDelta(my, p.y, arena.height);
     const dSq = dx * dx + dy * dy;
     if (dSq < bestDistSq) {
       bestDistSq = dSq;
@@ -318,8 +357,8 @@ function findNearestTargetForMissile(
 
   // Priority 2: Fallback to nearest asteroid if no other ship is currently alive
   for (const ast of room.asteroids.values()) {
-    const dx = shortestToroidalDelta(mx, ast.x, ARENA_WIDTH);
-    const dy = shortestToroidalDelta(my, ast.y, ARENA_HEIGHT);
+    const dx = shortestToroidalDelta(mx, ast.x, arena.width);
+    const dy = shortestToroidalDelta(my, ast.y, arena.height);
     const dSq = dx * dx + dy * dy;
     if (dSq < bestDistSq) {
       bestDistSq = dSq;
@@ -396,7 +435,7 @@ function spawnMissileSwarm(room: RoomState, player: PlayerState, count: number =
     targetIds: availableTargets,
   };
 
-  const spawned = expandSalvoToBullets(salvo);
+  const spawned = expandSalvoToBullets(salvo, room.id);
   for (let i = 0; i < spawned.length; i++) {
     room.bullets.set(spawned[i].id, spawned[i]);
   }
@@ -467,7 +506,7 @@ function spawnPlayerBullets(room: RoomState, player: PlayerState, nowSec: number
     targetIds: availableTargetIds,
   };
 
-  const spawned = expandSalvoToBullets(salvo);
+  const spawned = expandSalvoToBullets(salvo, room.id);
   for (let i = 0; i < spawned.length; i++) {
     room.bullets.set(spawned[i].id, spawned[i]);
   }
@@ -476,26 +515,28 @@ function spawnPlayerBullets(room: RoomState, player: PlayerState, nowSec: number
 }
 
 function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
+  const arena = getRoomArenaConfig(room.id);
+
   // Step orbiting planets around the central Sun
   for (let i = 0; i < room.planets.length; i++) {
     const planet = room.planets[i];
     planet.orbitAngle = (planet.orbitAngle + planet.orbitSpeed * dt) % (Math.PI * 2);
-    planet.x = GRAVITY_STAR_X + Math.cos(planet.orbitAngle) * planet.orbitRadius;
-    planet.y = GRAVITY_STAR_Y + Math.sin(planet.orbitAngle) * planet.orbitRadius;
+    planet.x = arena.starX + Math.cos(planet.orbitAngle) * planet.orbitRadius;
+    planet.y = arena.starY + Math.sin(planet.orbitAngle) * planet.orbitRadius;
     planet.vx = -Math.sin(planet.orbitAngle) * planet.orbitSpeed * planet.orbitRadius;
     planet.vy = Math.cos(planet.orbitAngle) * planet.orbitSpeed * planet.orbitRadius;
   }
 
-  if (room.asteroids.size < 224) {
-    for (let s = 0; s < 8 && room.asteroids.size < 224; s++) {
+  if (room.asteroids.size < arena.maxAsteroids) {
+    for (let s = 0; s < 8 && room.asteroids.size < arena.maxAsteroids; s++) {
       const ast = createAsteroid(room);
       room.asteroids.set(ast.id, ast);
     }
   }
 
   for (const ast of room.asteroids.values()) {
-    ast.x = wrapCoord(ast.x + ast.vx * dt, ARENA_WIDTH);
-    ast.y = wrapCoord(ast.y + ast.vy * dt, ARENA_HEIGHT);
+    ast.x = wrapCoord(ast.x + ast.vx * dt, arena.width);
+    ast.y = wrapCoord(ast.y + ast.vy * dt, arena.height);
     ast.angle += ast.vAngle * dt;
   }
 
@@ -503,10 +544,17 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
 
   // Update players (including any spawned target drones)
   for (const player of room.players.values()) {
-    // Evict stale ghost human connections (> 6 seconds without any message/ping)
+    // Evict stale ghost human connections only if no open WebSocket owns them and > 15s without ping
     if (!player.isDrone) {
+      let hasOpenOwnerSocket = false;
+      for (const [sock, set] of socketToPlayerIds.entries()) {
+        if (set.has(player.id) && sock.readyState === WebSocket.OPEN) {
+          hasOpenOwnerSocket = true;
+          break;
+        }
+      }
       const lastSeen = playerLastSeen.get(player.id) ?? nowMs;
-      if (nowMs - lastSeen > 6000) {
+      if (!hasOpenOwnerSocket && nowMs - lastSeen > 15000) {
         room.players.delete(player.id);
         playerLastSeen.delete(player.id);
         broadcastRoom(room, { type: 'player:left', playerId: player.id });
@@ -538,7 +586,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         room.planets,
         room.gravityStarEnabled,
         dt,
-        nowSec
+        nowSec,
+        room.id
       );
     }
 
@@ -592,8 +641,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           const outX = Math.cos(surfaceAngle);
           const outY = Math.sin(surfaceAngle);
           const launchDist = landedPlanet.radius + spec.radius + 9;
-          player.x = wrapCoord(landedPlanet.x + outX * launchDist, ARENA_WIDTH);
-          player.y = wrapCoord(landedPlanet.y + outY * launchDist, ARENA_HEIGHT);
+          player.x = wrapCoord(landedPlanet.x + outX * launchDist, arena.width);
+          player.y = wrapCoord(landedPlanet.y + outY * launchDist, arena.height);
           const launchBoost = Math.max(195, spec.thrustAccel * 0.36);
           player.vx = landedPlanet.vx + Math.cos(player.angle) * launchBoost + outX * 85;
           player.vy = landedPlanet.vy + Math.sin(player.angle) * launchBoost + outY * 85;
@@ -601,11 +650,11 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           const anchorDist = landedPlanet.radius + spec.radius + 2;
           player.x = wrapCoord(
             landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
-            ARENA_WIDTH
+            arena.width
           );
           player.y = wrapCoord(
             landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
-            ARENA_HEIGHT
+            arena.height
           );
           player.vx = landedPlanet.vx;
           player.vy = landedPlanet.vy;
@@ -624,12 +673,12 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
 
     if (room.gravityStarEnabled) {
-      const dx = GRAVITY_STAR_X - player.x;
-      const dy = GRAVITY_STAR_Y - player.y;
+      const dx = arena.starX - player.x;
+      const dy = arena.starY - player.y;
       const distSq = dx * dx + dy * dy;
       const dist = Math.sqrt(distSq);
 
-      if (dist < GRAVITY_STAR_RADIUS + spec.radius - 4) {
+      if (dist < arena.starRadius + spec.radius - 4) {
         const safePt = getSafeSpawnPoint(room, player.id);
         if (player.invulnerableTimer <= 0 && !player.cheats?.godMode && !player.warping) {
           const speed = Math.hypot(player.vx, player.vy);
@@ -668,15 +717,17 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           }
           player.invulnerableTimer = 2.0;
         }
-      } else if (!player.warping && dist < 9500 && dist > 100) {
-        const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
+      } else if (!player.warping && dist < (arena.fixedCamera ? 900 : 9500) && dist > (arena.fixedCamera ? 36 : 100)) {
+        const minDistSq = arena.fixedCamera ? 18000 : 280000;
+        const maxPull = arena.fixedCamera ? 320 : 620;
+        const pullAccel = Math.min(maxPull, arena.gravityStrength / Math.max(minDistSq, distSq));
         player.vx += (dx / dist) * pullAccel * dt;
         player.vy += (dy / dist) * pullAccel * dt;
       }
     }
 
-    player.x = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
-    player.y = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+    player.x = wrapCoord(player.x + player.vx * dt, arena.width);
+    player.y = wrapCoord(player.y + player.vy * dt, arena.height);
 
     const currentSpeed = Math.hypot(player.vx, player.vy);
     if (currentSpeed > player.peakSpeed) {
@@ -688,16 +739,16 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
 
     for (const ast of room.asteroids.values()) {
-      const dx = shortestToroidalDelta(ast.x, player.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(ast.y, player.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(ast.x, player.x, arena.width);
+      const dy = shortestToroidalDelta(ast.y, player.y, arena.height);
       const minSep = spec.radius + ast.radius * 0.9;
       if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
       const dist = Math.hypot(dx, dy);
       if (dist < minSep && dist > 0.001) {
         const nx = dx / dist;
         const ny = dy / dist;
-        player.x = wrapCoord(ast.x + nx * (minSep + 3), ARENA_WIDTH);
-        player.y = wrapCoord(ast.y + ny * (minSep + 3), ARENA_HEIGHT);
+        player.x = wrapCoord(ast.x + nx * (minSep + 3), arena.width);
+        player.y = wrapCoord(ast.y + ny * (minSep + 3), arena.height);
 
         const relVx = player.vx - ast.vx;
         const relVy = player.vy - ast.vy;
@@ -747,8 +798,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     // Planetary gravity slingshots & surface collisions
     for (let i = 0; i < room.planets.length; i++) {
       const planet = room.planets[i];
-      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(player.x, planet.x, arena.width);
+      const dy = shortestToroidalDelta(player.y, planet.y, arena.height);
       const distSq = dx * dx + dy * dy;
       const minSep = spec.radius + planet.radius;
 
@@ -767,15 +818,15 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
           player.landedPlanetId = planet.id;
           player.landedSurfaceAngle = surfaceAngle;
           const anchorDist = planet.radius + spec.radius + 2;
-          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, ARENA_WIDTH);
-          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, ARENA_HEIGHT);
+          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, arena.width);
+          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, arena.height);
           player.vx = planet.vx;
           player.vy = planet.vy;
           break;
         }
 
-        player.x = wrapCoord(planet.x + nx * (minSep + 4), ARENA_WIDTH);
-        player.y = wrapCoord(planet.y + ny * (minSep + 4), ARENA_HEIGHT);
+        player.x = wrapCoord(planet.x + nx * (minSep + 4), arena.width);
+        player.y = wrapCoord(planet.y + ny * (minSep + 4), arena.height);
 
         const normalVel = relVx * nx + relVy * ny;
         if (normalVel < 0 && !player.warping) {
@@ -839,9 +890,9 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       const spec2 = HULL_SPECS[p2.hull] || HULL_SPECS.needle;
 
       const minSep = spec1.radius + spec2.radius;
-      const dx = shortestToroidalDelta(p2.x, p1.x, ARENA_WIDTH);
+      const dx = shortestToroidalDelta(p2.x, p1.x, arena.width);
       if (Math.abs(dx) > minSep) continue;
-      const dy = shortestToroidalDelta(p2.y, p1.y, ARENA_HEIGHT);
+      const dy = shortestToroidalDelta(p2.y, p1.y, arena.height);
       if (Math.abs(dy) > minSep) continue;
 
       const distSq = dx * dx + dy * dy;
@@ -901,10 +952,10 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         } else {
           // Sub-1000 u/s bump: separate ships and exchange elastic normal impulse
           const overlap = (minSep - dist) * 0.5 + 1.5;
-          p1.x = wrapCoord(p1.x + nx * overlap, ARENA_WIDTH);
-          p1.y = wrapCoord(p1.y + ny * overlap, ARENA_HEIGHT);
-          p2.x = wrapCoord(p2.x - nx * overlap, ARENA_WIDTH);
-          p2.y = wrapCoord(p2.y - ny * overlap, ARENA_HEIGHT);
+          p1.x = wrapCoord(p1.x + nx * overlap, arena.width);
+          p1.y = wrapCoord(p1.y + ny * overlap, arena.height);
+          p2.x = wrapCoord(p2.x - nx * overlap, arena.width);
+          p2.y = wrapCoord(p2.y - ny * overlap, arena.height);
 
           const normalVel = relVx * nx + relVy * ny;
           if (normalVel < 0) {
@@ -935,7 +986,7 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
     }
   }
   const asteroidsList = Array.from(room.asteroids.values());
-  const starHitRadius = GRAVITY_STAR_RADIUS * 0.85;
+  const starHitRadius = arena.starRadius * 0.85;
   const starHitRadiusSq = starHitRadius * starHitRadius;
   const removedBulletIds: string[] = [];
 
@@ -952,8 +1003,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       const target = resolveMissileTargetO1(room, bullet);
       if (target) {
         bullet.targetId = target.id;
-        const dx = shortestToroidalDelta(bullet.x, target.x + target.vx * 0.12, ARENA_WIDTH);
-        const dy = shortestToroidalDelta(bullet.y, target.y + target.vy * 0.12, ARENA_HEIGHT);
+        const dx = shortestToroidalDelta(bullet.x, target.x + target.vx * 0.12, arena.width);
+        const dy = shortestToroidalDelta(bullet.y, target.y + target.vy * 0.12, arena.height);
         const desiredAngle = Math.atan2(dy, dx);
         const diff = normalizeAngleDiff(desiredAngle - bullet.angle);
         const maxTurn = (bullet.turnRate || 6.4) * dt;
@@ -968,12 +1019,12 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       }
     }
 
-    bullet.x = wrapCoord(bullet.x + bullet.vx * dt, ARENA_WIDTH);
-    bullet.y = wrapCoord(bullet.y + bullet.vy * dt, ARENA_HEIGHT);
+    bullet.x = wrapCoord(bullet.x + bullet.vx * dt, arena.width);
+    bullet.y = wrapCoord(bullet.y + bullet.vy * dt, arena.height);
 
     if (room.gravityStarEnabled) {
-      const sdx = bullet.x - GRAVITY_STAR_X;
-      const sdy = bullet.y - GRAVITY_STAR_Y;
+      const sdx = bullet.x - arena.starX;
+      const sdy = bullet.y - arena.starY;
       if (
         Math.abs(sdx) <= starHitRadius &&
         Math.abs(sdy) <= starHitRadius &&
@@ -1026,8 +1077,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
 
       const r = bullet.isMissile ? entry.missileRadius : entry.hitRadius;
       const rSq = bullet.isMissile ? entry.missileRadiusSq : entry.hitRadiusSq;
-      const dx = shortestToroidalDelta(bullet.x, target.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(bullet.y, target.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(bullet.x, target.x, arena.width);
+      const dy = shortestToroidalDelta(bullet.y, target.y, arena.height);
       const hitShip =
         Math.abs(dx) <= r && Math.abs(dy) <= r && dx * dx + dy * dy <= rSq;
 
@@ -1039,8 +1090,8 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
         typeof target.cursorY === 'number'
       ) {
         const cursorR = bullet.isMissile ? 40 : 34;
-        const cdx = shortestToroidalDelta(bullet.x, target.cursorX, ARENA_WIDTH);
-        const cdy = shortestToroidalDelta(bullet.y, target.cursorY, ARENA_HEIGHT);
+        const cdx = shortestToroidalDelta(bullet.x, target.cursorX, arena.width);
+        const cdy = shortestToroidalDelta(bullet.y, target.cursorY, arena.height);
         hitCursor =
           Math.abs(cdx) <= cursorR &&
           Math.abs(cdy) <= cursorR &&
@@ -1102,9 +1153,9 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       const ast = asteroidsList[i];
       if (ast.hp <= 0) continue;
       const r = ast.radius + (bullet.isMissile ? 6 : 0);
-      const dx = shortestToroidalDelta(bullet.x, ast.x, ARENA_WIDTH);
+      const dx = shortestToroidalDelta(bullet.x, ast.x, arena.width);
       if (Math.abs(dx) > r) continue;
-      const dy = shortestToroidalDelta(bullet.y, ast.y, ARENA_HEIGHT);
+      const dy = shortestToroidalDelta(bullet.y, ast.y, arena.height);
       if (Math.abs(dy) > r) continue;
 
       if (dx * dx + dy * dy <= r * r) {
@@ -1159,6 +1210,7 @@ async function startServer() {
   app.use('/ship-pngs', express.static(shipsDir));
 
   getOrCreateRoom('SECTOR-01');
+  getOrCreateRoom('COUCH-COOP');
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -1323,7 +1375,8 @@ async function startServer() {
             }
           }
 
-          if (prevRoomId && prevRoomId !== msg.roomId) {
+          const targetRoom = getOrCreateRoom(msg.roomId);
+          if (prevRoomId && prevRoomId !== targetRoom.id) {
             const oldRoom = rooms.get(prevRoomId);
             if (oldRoom) {
               oldRoom.clients.delete(ws);
@@ -1335,29 +1388,10 @@ async function startServer() {
             }
           }
 
-          const room = getOrCreateRoom(msg.roomId);
+          const room = targetRoom;
           socketToRoom.set(ws, room.id);
           room.clients.add(ws);
           ownedIds.add(playerId);
-
-          // Clean up any stale ghost duplicate with the same name from a recent page reload
-          for (const [existingId, existingPlayer] of room.players.entries()) {
-            if (
-              existingId !== playerId &&
-              !existingPlayer.isDrone &&
-              existingPlayer.name === cleanJoinName
-            ) {
-              const lastSeen = playerLastSeen.get(existingId) ?? 0;
-              if (nowMs - lastSeen > 1200) {
-                room.players.delete(existingId);
-                playerLastSeen.delete(existingId);
-                for (const set of socketToPlayerIds.values()) {
-                  set.delete(existingId);
-                }
-                broadcastRoom(room, { type: 'player:left', playerId: existingId });
-              }
-            }
-          }
 
           let player = room.players.get(playerId);
           const hull: ShipHullType = HULL_SPECS[msg.hull] ? msg.hull : 'needle';
@@ -1428,6 +1462,19 @@ async function startServer() {
           return;
         }
 
+        if (msg.type === 'player:input' && msg.roomId) {
+          const requestedRoom = getOrCreateRoom(msg.roomId);
+          const currentRoomId = socketToRoom.get(ws);
+          if (currentRoomId !== requestedRoom.id) {
+            if (currentRoomId) {
+              const oldR = rooms.get(currentRoomId);
+              oldR?.clients.delete(ws);
+            }
+            socketToRoom.set(ws, requestedRoom.id);
+            requestedRoom.clients.add(ws);
+          }
+        }
+
         let roomId = socketToRoom.get(ws);
         if (!roomId) {
           roomId = 'SECTOR-01';
@@ -1436,6 +1483,7 @@ async function startServer() {
           defaultRoom.clients.add(ws);
         }
         const room = getOrCreateRoom(roomId);
+        const arena = getRoomArenaConfig(room.id);
 
         if (msg.type === 'player:input') {
           let ownedIds = socketToPlayerIds.get(ws);
@@ -1443,8 +1491,42 @@ async function startServer() {
             ownedIds = new Set();
             socketToPlayerIds.set(ws, ownedIds);
           }
-          const player = room.players.get(msg.playerId);
-          if (!player) return;
+          let player = room.players.get(msg.playerId);
+          if (!player) {
+            const fallbackSpawn = getSafeSpawnPoint(room, msg.playerId);
+            const defaultHull: ShipHullType = 'needle';
+            const spec = HULL_SPECS[defaultHull];
+            player = {
+              id: msg.playerId,
+              name: 'PILOT',
+              color: PLAYER_COLORS[room.colorIndex++ % PLAYER_COLORS.length],
+              hull: defaultHull,
+              x: typeof msg.x === 'number' && Number.isFinite(msg.x) ? wrapCoord(msg.x, arena.width) : fallbackSpawn.x,
+              y: typeof msg.y === 'number' && Number.isFinite(msg.y) ? wrapCoord(msg.y, arena.height) : fallbackSpawn.y,
+              vx: typeof msg.vx === 'number' && Number.isFinite(msg.vx) ? msg.vx : 0,
+              vy: typeof msg.vy === 'number' && Number.isFinite(msg.vy) ? msg.vy : 0,
+              angle: Number.isFinite(msg.angle) ? msg.angle : -Math.PI / 2,
+              thrusting: Boolean(msg.thrusting),
+              shooting: Boolean(msg.shooting),
+              hp: spec.maxHp,
+              maxHp: spec.maxHp,
+              score: 0,
+              kills: 0,
+              deaths: 0,
+              streak: 0,
+              peakSpeed: 0,
+              alive: true,
+              respawnTimer: 0,
+              invulnerableTimer: 0.5,
+              lastFireTime: 0,
+              inputSource: msg.inputSource || 'keyboard',
+              cheats: msg.cheats ? { ...msg.cheats } : { ...DEFAULT_PLAYER_CHEATS },
+              deathSound: msg.deathSound,
+              shipPng: msg.shipPng ?? null,
+            };
+            room.players.set(msg.playerId, player);
+            broadcastRoom(room, { type: 'player:joined', player }, ws);
+          }
 
           // Ensure ownership is attached to the active socket sending input for this playerId
           if (!ownedIds.has(msg.playerId)) {
@@ -1468,8 +1550,8 @@ async function startServer() {
             Number.isFinite(msg.cursorX) &&
             Number.isFinite(msg.cursorY)
           ) {
-            player.cursorX = wrapCoord(msg.cursorX, ARENA_WIDTH);
-            player.cursorY = wrapCoord(msg.cursorY, ARENA_HEIGHT);
+            player.cursorX = wrapCoord(msg.cursorX, arena.width);
+            player.cursorY = wrapCoord(msg.cursorY, arena.height);
           }
 
           if (msg.music !== undefined) {
@@ -1551,10 +1633,10 @@ async function startServer() {
             Number.isFinite(msg.vx) &&
             Number.isFinite(msg.vy)
           ) {
-            const clientDistToSun = Math.hypot(msg.x - GRAVITY_STAR_X, msg.y - GRAVITY_STAR_Y);
-            if (!room.gravityStarEnabled || clientDistToSun >= GRAVITY_STAR_RADIUS) {
-              player.x = wrapCoord(msg.x, ARENA_WIDTH);
-              player.y = wrapCoord(msg.y, ARENA_HEIGHT);
+            const clientDistToSun = Math.hypot(msg.x - arena.starX, msg.y - arena.starY);
+            if (!room.gravityStarEnabled || clientDistToSun >= arena.starRadius) {
+              player.x = wrapCoord(msg.x, arena.width);
+              player.y = wrapCoord(msg.y, arena.height);
               player.vx = msg.vx;
               player.vy = msg.vy;
               const spd = Math.hypot(player.vx, player.vy);
@@ -1567,6 +1649,11 @@ async function startServer() {
           if (wasWarping && !player.warping) {
             player.vx = 0;
             player.vy = 0;
+          }
+
+          // Immediately spawn bullets on shooting input so tap-firing never misses between 60Hz ticks
+          if (player.shooting && player.alive && !player.spectating) {
+            spawnPlayerBullets(room, player, performance.now() / 1000);
           }
           return;
         }
@@ -1583,8 +1670,8 @@ async function startServer() {
           lastEnvHitAt.set(player.id, nowMs);
 
           const safeDamage = Math.max(1, Math.min(200, Math.round(Number(msg.damage) || 20)));
-          player.x = wrapCoord(Number(msg.x) || player.x, ARENA_WIDTH);
-          player.y = wrapCoord(Number(msg.y) || player.y, ARENA_HEIGHT);
+          player.x = wrapCoord(Number(msg.x) || player.x, arena.width);
+          player.y = wrapCoord(Number(msg.y) || player.y, arena.height);
           player.vx = Number(msg.vx) || player.vx;
           player.vy = Number(msg.vy) || player.vy;
           player.hp = Math.max(0, player.hp - safeDamage);
@@ -1668,7 +1755,7 @@ async function startServer() {
             player.vy = 0;
           } else if (msg.action === 'spawn_drone' || msg.action === 'spawn_drones_100') {
             const countToSpawn = msg.action === 'spawn_drones_100' ? 100 : 1;
-            const spawnedDrones = createTargetDronesBatch(room.players, countToSpawn, player);
+            const spawnedDrones = createTargetDronesBatch(room.players, countToSpawn, player, room.id);
             for (const drone of spawnedDrones) {
               room.players.set(drone.id, drone);
               if (countToSpawn === 1) {
@@ -1843,6 +1930,7 @@ async function startServer() {
         const includeFullBullets = room.bullets.size <= 40;
         broadcastRoom(room, {
           type: 'state:snapshot',
+          roomId: room.id,
           serverTime: Date.now(),
           gravityStarEnabled: room.gravityStarEnabled,
           players: Array.from(room.players.values()),

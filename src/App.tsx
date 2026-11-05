@@ -40,6 +40,7 @@ import {
   ClientToServerMessage,
   DEFAULT_PLAYER_CHEATS,
   expandSalvoToBullets,
+  getRoomArenaConfig,
   GRAVITY_STAR_RADIUS,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
@@ -51,6 +52,7 @@ import {
   PlanetState,
   PlayerCheats,
   PlayerState,
+  RoomModeId,
   RoomSummary,
   ServerToClientMessage,
   SHIP_SMASH_SPEED_THRESHOLD,
@@ -98,7 +100,15 @@ export default function App() {
   });
   const [selectedHull, setSelectedHull] = useState<ShipHullType>('needle');
   const [selectedColor, setSelectedColor] = useState<string>(PLAYER_COLORS[0]);
-  const roomId = 'SECTOR-01';
+  const [roomId, setRoomId] = useState<RoomModeId>('SECTOR-01');
+  const [localPlayersCount, setLocalPlayersCount] = useState<1 | 2>(1);
+  const [p2Name, setP2Name] = useState<string>(() => {
+    const saved = localStorage.getItem('spacewar_p2_name');
+    if (saved) return saved;
+    return 'PILOT-P2';
+  });
+  const [p2Hull, setP2Hull] = useState<ShipHullType>('interceptor');
+  const [p2Color, setP2Color] = useState<string>(PLAYER_COLORS[2] || '#10B981');
   const [isMuted, setIsMuted] = useState<boolean>(() => soundEngine.isMuted());
   const [controllerModalOpen, setControllerModalOpen] = useState<boolean>(false);
   const [deathSoundModalOpen, setDeathSoundModalOpen] = useState<boolean>(false);
@@ -154,12 +164,20 @@ export default function App() {
   const rendererRef = useRef<SpacewarRenderer | null>(null);
   const shellStateRef = useRef<GameShellState>(shellState);
   shellStateRef.current = shellState;
+  const roomIdRef = useRef<RoomModeId>(roomId);
+  roomIdRef.current = roomId;
   const pilotNameRef = useRef<string>(pilotName);
   pilotNameRef.current = pilotName;
   const selectedHullRef = useRef<ShipHullType>(selectedHull);
   selectedHullRef.current = selectedHull;
   const selectedColorRef = useRef<string>(selectedColor);
   selectedColorRef.current = selectedColor;
+  const p2NameRef = useRef<string>(p2Name);
+  p2NameRef.current = p2Name;
+  const p2HullRef = useRef<ShipHullType>(p2Hull);
+  p2HullRef.current = p2Hull;
+  const p2ColorRef = useRef<string>(p2Color);
+  p2ColorRef.current = p2Color;
   const cheatsRef = useRef<PlayerCheats>(cheats);
   cheatsRef.current = cheats;
   const cheatMenuOpenRef = useRef<boolean>(cheatMenuOpen);
@@ -179,6 +197,7 @@ export default function App() {
   autoFireRef.current = autoFire;
   const warpSpeedActiveRef = useRef<boolean>(warpSpeedActive);
   warpSpeedActiveRef.current = warpSpeedActive;
+  const p2WarpActiveRef = useRef<boolean>(false);
   const musicBoxRef = useRef(musicBox);
   musicBoxRef.current = musicBox;
   const deathSoundCtrlRef = useRef(deathSoundCtrl);
@@ -188,6 +207,8 @@ export default function App() {
   const lastDamagedRemoteAtRef = useRef<Map<string, number>>(new Map());
   const lastLocalSunHitAtRef = useRef<number>(0);
   const lastLocalEnvHitAtRef = useRef<number>(0);
+  const lastP2SunHitAtRef = useRef<number>(0);
+  const lastP2EnvHitAtRef = useRef<number>(0);
   const seenChatIdsRef = useRef<Set<string>>(new Set());
   const serverWideTimerRef = useRef<number | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
@@ -208,7 +229,19 @@ export default function App() {
       }
     })()
   );
-  const coopIdRef = useRef<string>(`plr2_${Math.random().toString(36).slice(2, 9)}`);
+  const coopIdRef = useRef<string>(
+    (() => {
+      try {
+        const saved = sessionStorage.getItem('spacewar_coop_id');
+        if (saved && saved.startsWith('plr2_')) return saved;
+        const fresh = `plr2_${Math.random().toString(36).slice(2, 9)}`;
+        sessionStorage.setItem('spacewar_coop_id', fresh);
+        return fresh;
+      } catch {
+        return `plr2_${Math.random().toString(36).slice(2, 9)}`;
+      }
+    })()
+  );
   const coopActiveRef = useRef<boolean>(false);
 
   const worldRef = useRef<{
@@ -222,7 +255,7 @@ export default function App() {
   }>({
     players: new Map(),
     bullets: [],
-    asteroids: createInitialClientAsteroids(192),
+    asteroids: createInitialClientAsteroids(192, false, 'SECTOR-01'),
     planets: INITIAL_PLANETS.map((p) => ({
       ...p,
       x: GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius,
@@ -355,7 +388,7 @@ export default function App() {
       ) {
         return;
       }
-      if (e.key === 't' || e.key === 'T' || e.key === 'Enter') {
+      if (e.key === 't' || e.key === 'T' || (e.key === 'Enter' && !coopActiveRef.current)) {
         e.preventDefault();
         chatInputRef.current?.focus();
       } else if (e.key === '/') {
@@ -391,7 +424,7 @@ export default function App() {
           ws.send(
             JSON.stringify({
               type: 'player:join',
-              roomId,
+              roomId: roomIdRef.current,
               playerId: selfIdRef.current,
               name: pilotNameRef.current.trim().slice(0, 16) || 'PILOT',
               hull: selectedHullRef.current,
@@ -408,6 +441,20 @@ export default function App() {
               cheats: cheatsRef.current,
             } satisfies ClientToServerMessage)
           );
+          if (coopActiveRef.current) {
+            ws.send(
+              JSON.stringify({
+                type: 'player:join',
+                roomId: roomIdRef.current,
+                playerId: coopIdRef.current,
+                name: p2NameRef.current.trim().slice(0, 16) || 'PILOT-P2',
+                hull: p2HullRef.current,
+                color: p2ColorRef.current,
+                inputSource: 'keyboard',
+                deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+              } satisfies ClientToServerMessage)
+            );
+          }
         }
       };
 
@@ -415,6 +462,7 @@ export default function App() {
         try {
           const msg = JSON.parse(event.data) as ServerToClientMessage;
           const world = worldRef.current;
+          const arena = getRoomArenaConfig(roomIdRef.current);
 
           if (msg.type === 'pong') {
             world.pingMs = Math.max(1, Date.now() - msg.clientTime);
@@ -425,6 +473,9 @@ export default function App() {
           }
 
           if (msg.type === 'room:init') {
+            if (msg.roomId && msg.roomId !== roomIdRef.current) {
+              return;
+            }
             world.gravityStarEnabled = msg.gravityStarEnabled;
             world.bullets = msg.bullets;
             world.asteroids = msg.asteroids;
@@ -433,9 +484,21 @@ export default function App() {
             }
             world.killFeed = msg.killFeed;
 
+            const existingSelf = world.players.get(selfIdRef.current);
+            const existingCoop = coopActiveRef.current
+              ? world.players.get(coopIdRef.current)
+              : undefined;
             const nextPlayers = new Map<string, PlayerState>();
             for (const p of msg.players) {
               nextPlayers.set(p.id, p);
+            }
+            if (shellStateRef.current !== 'TITLE_MENU') {
+              if (existingSelf && !nextPlayers.has(selfIdRef.current)) {
+                nextPlayers.set(selfIdRef.current, existingSelf);
+              }
+              if (coopActiveRef.current && existingCoop && !nextPlayers.has(coopIdRef.current)) {
+                nextPlayers.set(coopIdRef.current, existingCoop);
+              }
             }
             world.players = nextPlayers;
             if (Array.isArray(msg.chatMessages)) {
@@ -447,12 +510,29 @@ export default function App() {
           }
 
           if (msg.type === 'state:snapshot') {
+            if (msg.roomId && msg.roomId !== roomIdRef.current) {
+              return;
+            }
             if (typeof msg.serverTime === 'number') {
               musicBoxRef.current.updateServerClock(msg.serverTime);
             }
             world.gravityStarEnabled = msg.gravityStarEnabled;
             if (Array.isArray(msg.bullets)) {
-              world.bullets = msg.bullets;
+              const serverHasRecentP1 = msg.bullets.some(
+                (b) => b.ownerId === selfIdRef.current && b.maxTtl - b.ttl < 0.35
+              );
+              const serverHasRecentP2 =
+                coopActiveRef.current &&
+                msg.bullets.some(
+                  (b) => b.ownerId === coopIdRef.current && b.maxTtl - b.ttl < 0.35
+                );
+              const pendingLocal = world.bullets.filter((b) => {
+                if (b.maxTtl - b.ttl >= 0.28) return false;
+                if (b.id.startsWith('loc_') && !serverHasRecentP1) return true;
+                if (b.id.startsWith('p2_') && !serverHasRecentP2) return true;
+                return false;
+              });
+              world.bullets = pendingLocal.length > 0 ? [...msg.bullets, ...pendingLocal] : msg.bullets;
             }
             world.asteroids = msg.asteroids;
             if (Array.isArray(msg.planets)) {
@@ -471,9 +551,11 @@ export default function App() {
 
               if (isLocalControlled && existing) {
                 const wasAlive = existing.alive;
-                const recentlyEnvDamaged =
-                  serverPlayer.id === selfIdRef.current &&
-                  Date.now() - lastLocalEnvHitAtRef.current < 650;
+                const lastEnvHitTime =
+                  serverPlayer.id === selfIdRef.current
+                    ? lastLocalEnvHitAtRef.current
+                    : lastP2EnvHitAtRef.current;
+                const recentlyEnvDamaged = Date.now() - lastEnvHitTime < 650;
                 existing.name = serverPlayer.name;
                 if (!recentlyEnvDamaged || serverPlayer.hp <= existing.hp || !serverPlayer.alive) {
                   existing.hp = serverPlayer.hp;
@@ -497,21 +579,28 @@ export default function App() {
                     warpSpeedActiveRef.current = false;
                     setWarpSpeedActive(false);
                   }
+                } else if (!serverPlayer.alive && serverPlayer.id === coopIdRef.current) {
+                  existing.warping = false;
+                  existing.landedPlanetId = null;
+                  existing.landedSurfaceAngle = undefined;
+                  p2WarpActiveRef.current = false;
                 }
 
                 const distToSun = Math.hypot(
-                  existing.x - GRAVITY_STAR_X,
-                  existing.y - GRAVITY_STAR_Y
+                  existing.x - arena.starX,
+                  existing.y - arena.starY
                 );
-                const recentlyTeleportedFromSun =
-                  serverPlayer.id === selfIdRef.current &&
-                  Date.now() - lastLocalSunHitAtRef.current < 1200;
+                const lastSunHitTime =
+                  serverPlayer.id === selfIdRef.current
+                    ? lastLocalSunHitAtRef.current
+                    : lastP2SunHitAtRef.current;
+                const recentlyTeleportedFromSun = Date.now() - lastSunHitTime < 1200;
                 if (
                   !recentlyTeleportedFromSun &&
                   (!serverPlayer.alive ||
                     (!wasAlive && serverPlayer.alive) ||
                     serverPlayer.invulnerableTimer > 1.6 ||
-                    distToSun < GRAVITY_STAR_RADIUS + 20)
+                    distToSun < arena.starRadius + 20)
                 ) {
                   existing.x = serverPlayer.x;
                   existing.y = serverPlayer.y;
@@ -521,13 +610,17 @@ export default function App() {
               } else {
                 currentPlayers.set(
                   serverPlayer.id,
-                  mergeSmoothRemotePlayerState(existing, serverPlayer)
+                  mergeSmoothRemotePlayerState(existing, serverPlayer, false, roomIdRef.current)
                 );
               }
             }
 
             for (const id of Array.from(currentPlayers.keys())) {
-              if (!seenIds.has(id)) {
+              const isActiveLocalShip =
+                shellStateRef.current !== 'TITLE_MENU' &&
+                (id === selfIdRef.current ||
+                  (coopActiveRef.current && id === coopIdRef.current));
+              if (!seenIds.has(id) && !isActiveLocalShip) {
                 currentPlayers.delete(id);
               }
             }
@@ -535,7 +628,20 @@ export default function App() {
           }
 
           if (msg.type === 'salvo:spawn') {
-            const spawned = expandSalvoToBullets(msg.salvo);
+            const isOwnSalvo =
+              msg.salvo.ownerId === selfIdRef.current ||
+              (coopActiveRef.current && msg.salvo.ownerId === coopIdRef.current);
+            if (isOwnSalvo && !msg.salvo.idPrefix.startsWith('swm')) {
+              world.bullets = world.bullets.filter(
+                (b) =>
+                  !(
+                    b.ownerId === msg.salvo.ownerId &&
+                    (b.id.startsWith('loc_') || b.id.startsWith('p2_')) &&
+                    b.maxTtl - b.ttl < 0.35
+                  )
+              );
+            }
+            const spawned = expandSalvoToBullets(msg.salvo, roomIdRef.current);
             world.bullets.push(...spawned);
             if (world.bullets.length > 1800) {
               world.bullets.splice(0, world.bullets.length - 1800);
@@ -570,20 +676,30 @@ export default function App() {
           }
 
           if (msg.type === 'player:left') {
-            world.players.delete(msg.playerId);
+            const isActiveLocalShip =
+              shellStateRef.current !== 'TITLE_MENU' &&
+              (msg.playerId === selfIdRef.current ||
+                (coopActiveRef.current && msg.playerId === coopIdRef.current));
+            if (!isActiveLocalShip) {
+              world.players.delete(msg.playerId);
+            }
             return;
           }
 
           if (msg.type === 'combat:hit') {
+            const isLocalP1 = msg.targetId === selfIdRef.current;
+            const isLocalP2 = coopActiveRef.current && msg.targetId === coopIdRef.current;
+            const lastSunTime = isLocalP1 ? lastLocalSunHitAtRef.current : lastP2SunHitAtRef.current;
+            const lastEnvTime = isLocalP1 ? lastLocalEnvHitAtRef.current : lastP2EnvHitAtRef.current;
             const isLocalSunEcho =
-              msg.targetId === selfIdRef.current &&
+              (isLocalP1 || isLocalP2) &&
               (msg.attackerId === 'star' ||
                 msg.cause === 'star' ||
-                Date.now() - lastLocalSunHitAtRef.current < 1500);
+                Date.now() - lastSunTime < 1500);
             const isLocalEnvEcho =
-              msg.targetId === selfIdRef.current &&
+              (isLocalP1 || isLocalP2) &&
               (msg.cause === 'asteroid' || msg.cause === 'planet') &&
-              Date.now() - lastLocalEnvHitAtRef.current < 650;
+              Date.now() - lastEnvTime < 650;
             if (isLocalSunEcho || isLocalEnvEcho) {
               return;
             }
@@ -611,7 +727,12 @@ export default function App() {
                   );
                 }
               }
-              if (msg.targetId === selfIdRef.current || msg.attackerId === selfIdRef.current) {
+              if (
+                msg.targetId === selfIdRef.current ||
+                msg.attackerId === selfIdRef.current ||
+                (coopActiveRef.current &&
+                  (msg.targetId === coopIdRef.current || msg.attackerId === coopIdRef.current))
+              ) {
                 renderer.cameraShake = msg.fatal ? 14 : 5;
                 if (msg.fatal) {
                   renderer.hitstopTimer = 0.045;
@@ -654,6 +775,9 @@ export default function App() {
 
     const handleBeforeUnload = () => {
       sendWs({ type: 'player:leave', playerId: selfIdRef.current });
+      if (coopActiveRef.current) {
+        sendWs({ type: 'player:leave', playerId: coopIdRef.current });
+      }
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
 
@@ -664,220 +788,267 @@ export default function App() {
       if (pingInterval) clearInterval(pingInterval);
       wsRef.current?.close();
     };
-  }, [roomId, sendWs]);
+  }, [sendWs]);
 
-  // Multi-Window & Vercel Serverless Peer Sync (ensures multiple windows share SECTOR-01 even without /ws)
+  // Multi-Window & Vercel Serverless Peer Sync (ensures multiple windows share SECTOR-01 or COUCH-COOP even without /ws)
   useEffect(() => {
-    const peerSync = new PeerSectorSync(selfIdRef.current, (pkt) => {
-      // When the authoritative WebSocket server is connected, ignore peer fallback packets so they don't overwrite server state
-      if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    const peerSync = new PeerSectorSync(
+      selfIdRef.current,
+      (pkt) => {
+        // When the authoritative WebSocket server is connected, ignore peer fallback packets so they don't overwrite server state
+        if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-      const world = worldRef.current;
+        const world = worldRef.current;
+        const activeRoom = roomIdRef.current;
+        const isLocalControlledId = (id: string) =>
+          id === selfIdRef.current || (coopActiveRef.current && id === coopIdRef.current);
 
-      if (pkt.type === 'peer:hello') {
-        if (pkt.player && pkt.player.id !== selfIdRef.current) {
-          const existing = world.players.get(pkt.player.id);
-          world.players.set(
-            pkt.player.id,
-            mergeSmoothRemotePlayerState(existing, pkt.player)
-          );
-        }
-        peerSync.send({
-          type: 'peer:welcome',
-          senderId: selfIdRef.current,
-          players: Array.from(world.players.values()),
-          asteroids: world.asteroids,
-          planets: world.planets,
-          killFeed: world.killFeed,
-          gravityStarEnabled: world.gravityStarEnabled,
-        });
-        return;
-      }
-
-      if (pkt.type === 'peer:welcome') {
-        for (const p of pkt.players) {
-          if (p.id !== selfIdRef.current) {
-            const existing = world.players.get(p.id);
-            world.players.set(p.id, mergeSmoothRemotePlayerState(existing, p));
-          }
-        }
-        if (pkt.planets && pkt.planets.length === world.planets.length) {
-          for (let i = 0; i < pkt.planets.length; i++) {
-            world.planets[i].orbitAngle = pkt.planets[i].orbitAngle;
-          }
-        }
-        if (pkt.killFeed && pkt.killFeed.length > 0 && world.killFeed.length === 0) {
-          world.killFeed = pkt.killFeed;
-        }
-        return;
-      }
-
-      if (pkt.type === 'peer:player_state') {
-        if (pkt.player.id !== selfIdRef.current) {
-          const existing = world.players.get(pkt.player.id);
-          // Do not overwrite live-simulated AI drones with static initial spawn coordinates from /api/sector
-          if (pkt.player.isDrone && existing) {
-            existing.name = pkt.player.name || existing.name;
-          } else {
-            const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
-            const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
-
+        if (pkt.type === 'peer:hello') {
+          if (pkt.player && !isLocalControlledId(pkt.player.id)) {
+            const existing = world.players.get(pkt.player.id);
             world.players.set(
               pkt.player.id,
-              mergeSmoothRemotePlayerState(existing, pkt.player, recentlyDamagedLocally)
+              mergeSmoothRemotePlayerState(existing, pkt.player, false, activeRoom)
             );
           }
+          if (pkt.player2 && !isLocalControlledId(pkt.player2.id)) {
+            const existing2 = world.players.get(pkt.player2.id);
+            world.players.set(
+              pkt.player2.id,
+              mergeSmoothRemotePlayerState(existing2, pkt.player2, false, activeRoom)
+            );
+          }
+          peerSync.send({
+            type: 'peer:welcome',
+            senderId: selfIdRef.current,
+            roomId: activeRoom,
+            players: Array.from(world.players.values()),
+            asteroids: world.asteroids,
+            planets: world.planets,
+            killFeed: world.killFeed,
+            gravityStarEnabled: world.gravityStarEnabled,
+          });
+          return;
         }
-        if (pkt.drones) {
-          for (const d of pkt.drones) {
-            if (!world.players.has(d.id)) {
-              world.players.set(d.id, mergeSmoothRemotePlayerState(undefined, d));
+
+        if (pkt.type === 'peer:welcome') {
+          for (const p of pkt.players) {
+            if (!isLocalControlledId(p.id)) {
+              const existing = world.players.get(p.id);
+              world.players.set(
+                p.id,
+                mergeSmoothRemotePlayerState(existing, p, false, activeRoom)
+              );
             }
           }
-        }
-        return;
-      }
-
-      if (pkt.type === 'peer:player_leave') {
-        if (pkt.playerId !== selfIdRef.current) {
-          world.players.delete(pkt.playerId);
-        }
-        return;
-      }
-
-      if (pkt.type === 'peer:salvo') {
-        const owner = world.players.get(pkt.salvo.ownerId);
-        if (owner) {
-          owner.lastFireTime = performance.now() / 1000;
-        }
-        const spawned = expandSalvoToBullets(pkt.salvo);
-        world.bullets.push(...spawned);
-        if (world.bullets.length > 1800) {
-          world.bullets.splice(0, world.bullets.length - 1800);
-        }
-        return;
-      }
-
-      if (pkt.type === 'peer:cheat_action') {
-        if (pkt.spawnedDrones) {
-          for (const d of pkt.spawnedDrones) {
-            world.players.set(d.id, d);
-          }
-        } else if (pkt.action === 'clear_drones') {
-          for (const [pid, p] of world.players.entries()) {
-            if (p.isDrone) {
-              world.players.delete(pid);
+          if (pkt.planets && pkt.planets.length === world.planets.length) {
+            for (let i = 0; i < pkt.planets.length; i++) {
+              world.planets[i].orbitAngle = pkt.planets[i].orbitAngle;
             }
           }
+          if (pkt.killFeed && pkt.killFeed.length > 0 && world.killFeed.length === 0) {
+            world.killFeed = pkt.killFeed;
+          }
+          return;
         }
-        return;
-      }
 
-      if (pkt.type === 'peer:rename') {
-        const target = world.players.get(pkt.playerId);
-        if (target) target.name = pkt.newName;
-        return;
-      }
+        if (pkt.type === 'peer:player_state') {
+          if (!isLocalControlledId(pkt.player.id)) {
+            const existing = world.players.get(pkt.player.id);
+            // Do not overwrite live-simulated AI drones with static initial spawn coordinates from /api/sector
+            if (pkt.player.isDrone && existing) {
+              existing.name = pkt.player.name || existing.name;
+            } else {
+              const lastDamaged = lastDamagedRemoteAtRef.current.get(pkt.player.id) || 0;
+              const recentlyDamagedLocally = Date.now() - lastDamaged < 450;
 
-      if (pkt.type === 'peer:cheat_rename') {
-        if (pkt.targetId === 'ALL_OTHERS') {
-          for (const p of world.players.values()) {
-            if (p.id !== pkt.requesterId) {
-              p.name = pkt.newName;
-              if (p.id === selfIdRef.current) {
+              world.players.set(
+                pkt.player.id,
+                mergeSmoothRemotePlayerState(
+                  existing,
+                  pkt.player,
+                  recentlyDamagedLocally,
+                  activeRoom
+                )
+              );
+            }
+          }
+          if (pkt.player2 && !isLocalControlledId(pkt.player2.id)) {
+            const existing2 = world.players.get(pkt.player2.id);
+            const lastDamaged2 = lastDamagedRemoteAtRef.current.get(pkt.player2.id) || 0;
+            const recentlyDamagedLocally2 = Date.now() - lastDamaged2 < 450;
+            world.players.set(
+              pkt.player2.id,
+              mergeSmoothRemotePlayerState(
+                existing2,
+                pkt.player2,
+                recentlyDamagedLocally2,
+                activeRoom
+              )
+            );
+          }
+          if (pkt.drones) {
+            for (const d of pkt.drones) {
+              if (!world.players.has(d.id)) {
+                world.players.set(
+                  d.id,
+                  mergeSmoothRemotePlayerState(undefined, d, false, activeRoom)
+                );
+              }
+            }
+          }
+          return;
+        }
+
+        if (pkt.type === 'peer:player_leave') {
+          if (!isLocalControlledId(pkt.playerId)) {
+            world.players.delete(pkt.playerId);
+          }
+          return;
+        }
+
+        if (pkt.type === 'peer:salvo') {
+          const owner = world.players.get(pkt.salvo.ownerId);
+          if (owner) {
+            owner.lastFireTime = performance.now() / 1000;
+          }
+          const spawned = expandSalvoToBullets(pkt.salvo, activeRoom);
+          world.bullets.push(...spawned);
+          if (world.bullets.length > 1800) {
+            world.bullets.splice(0, world.bullets.length - 1800);
+          }
+          return;
+        }
+
+        if (pkt.type === 'peer:cheat_action') {
+          if (pkt.spawnedDrones) {
+            for (const d of pkt.spawnedDrones) {
+              world.players.set(d.id, d);
+            }
+          } else if (pkt.action === 'clear_drones') {
+            for (const [pid, p] of world.players.entries()) {
+              if (p.isDrone) {
+                world.players.delete(pid);
+              }
+            }
+          }
+          return;
+        }
+
+        if (pkt.type === 'peer:rename') {
+          const target = world.players.get(pkt.playerId);
+          if (target) target.name = pkt.newName;
+          return;
+        }
+
+        if (pkt.type === 'peer:cheat_rename') {
+          if (pkt.targetId === 'ALL_OTHERS') {
+            for (const p of world.players.values()) {
+              if (p.id !== pkt.requesterId) {
+                p.name = pkt.newName;
+                if (p.id === selfIdRef.current) {
+                  setPilotName(pkt.newName);
+                }
+              }
+            }
+          } else {
+            const target = world.players.get(pkt.targetId);
+            if (target) {
+              target.name = pkt.newName;
+              if (target.id === selfIdRef.current) {
                 setPilotName(pkt.newName);
               }
             }
           }
-        } else {
+          return;
+        }
+
+        if (pkt.type === 'peer:combat_hit') {
           const target = world.players.get(pkt.targetId);
-          if (target) {
-            target.name = pkt.newName;
-            if (target.id === selfIdRef.current) {
-              setPilotName(pkt.newName);
+          if (target && target.alive) {
+            if (
+              (target.invulnerableTimer <= 0 || target.spectating) &&
+              !target.cheats?.godMode &&
+              !target.warping
+            ) {
+              target.hp = Math.max(0, target.hp - pkt.damage);
+            }
+            if (!target.spectating && !target.warping) {
+              target.vx = pkt.vx;
+              target.vy = pkt.vy;
+            }
+            const isFatal =
+              (pkt.fatal || target.hp <= 0) && !target.cheats?.godMode && !target.warping;
+            if (isFatal) {
+              target.alive = false;
+              target.hp = 0;
+              target.deaths += 1;
+              target.streak = 0;
+              target.respawnTimer = 2.8;
+              target.warping = false;
+              if (target.id === selfIdRef.current) {
+                warpSpeedActiveRef.current = false;
+                setWarpSpeedActive(false);
+              } else if (target.id === coopIdRef.current) {
+                p2WarpActiveRef.current = false;
+              }
+              const attacker = world.players.get(pkt.attackerId);
+              if (attacker && attacker.id !== target.id) {
+                attacker.kills += 1;
+                attacker.streak += 1;
+                attacker.score += 150;
+              }
             }
           }
+          const renderer = rendererRef.current;
+          if (renderer) {
+            renderer.hitFlashes.set(pkt.targetId, 0.12);
+            renderer.addBurst(
+              pkt.x,
+              pkt.y,
+              pkt.vx * 0.25,
+              pkt.vy * 0.25,
+              pkt.color,
+              pkt.fatal ? 34 : 12,
+              pkt.fatal ? 320 : 180,
+              pkt.fatal
+            );
+            if (pkt.fatal) {
+              if (pkt.cause === 'collision' || pkt.killEntry?.cause === 'collision') {
+                deathSoundCtrlRef.current.playSmashSound(undefined, isMutedRef.current);
+              } else {
+                deathSoundCtrlRef.current.playDeathSound(
+                  pkt.deathSound || pkt.killEntry?.deathSound || target?.deathSound,
+                  isMutedRef.current
+                );
+              }
+            }
+            if (
+              pkt.targetId === selfIdRef.current ||
+              pkt.attackerId === selfIdRef.current ||
+              (coopActiveRef.current &&
+                (pkt.targetId === coopIdRef.current || pkt.attackerId === coopIdRef.current))
+            ) {
+              renderer.cameraShake = pkt.fatal ? 14 : 5;
+              soundEngine.playHit(pkt.fatal);
+            }
+          }
+          if (pkt.killEntry) {
+            world.killFeed = [
+              pkt.killEntry,
+              ...world.killFeed.filter((k) => k.id !== pkt.killEntry!.id),
+            ].slice(0, 6);
+          }
+          return;
         }
-        return;
-      }
 
-      if (pkt.type === 'peer:combat_hit') {
-        const target = world.players.get(pkt.targetId);
-        if (target && target.alive) {
-          if (
-            (target.invulnerableTimer <= 0 || target.spectating) &&
-            !target.cheats?.godMode &&
-            !target.warping
-          ) {
-            target.hp = Math.max(0, target.hp - pkt.damage);
-          }
-          if (!target.spectating && !target.warping) {
-            target.vx = pkt.vx;
-            target.vy = pkt.vy;
-          }
-          const isFatal =
-            (pkt.fatal || target.hp <= 0) && !target.cheats?.godMode && !target.warping;
-          if (isFatal) {
-            target.alive = false;
-            target.hp = 0;
-            target.deaths += 1;
-            target.streak = 0;
-            target.respawnTimer = 2.8;
-            target.warping = false;
-            if (target.id === selfIdRef.current) {
-              warpSpeedActiveRef.current = false;
-              setWarpSpeedActive(false);
-            }
-            const attacker = world.players.get(pkt.attackerId);
-            if (attacker && attacker.id !== target.id) {
-              attacker.kills += 1;
-              attacker.streak += 1;
-              attacker.score += 150;
-            }
-          }
+        if (pkt.type === 'peer:chat' && pkt.message) {
+          receiveChatMessageRef.current(pkt.message, true);
+          return;
         }
-        const renderer = rendererRef.current;
-        if (renderer) {
-          renderer.hitFlashes.set(pkt.targetId, 0.12);
-          renderer.addBurst(
-            pkt.x,
-            pkt.y,
-            pkt.vx * 0.25,
-            pkt.vy * 0.25,
-            pkt.color,
-            pkt.fatal ? 34 : 12,
-            pkt.fatal ? 320 : 180,
-            pkt.fatal
-          );
-          if (pkt.fatal) {
-            if (pkt.cause === 'collision' || pkt.killEntry?.cause === 'collision') {
-              deathSoundCtrlRef.current.playSmashSound(undefined, isMutedRef.current);
-            } else {
-              deathSoundCtrlRef.current.playDeathSound(
-                pkt.deathSound || pkt.killEntry?.deathSound || target?.deathSound,
-                isMutedRef.current
-              );
-            }
-          }
-          if (pkt.targetId === selfIdRef.current || pkt.attackerId === selfIdRef.current) {
-            renderer.cameraShake = pkt.fatal ? 14 : 5;
-            soundEngine.playHit(pkt.fatal);
-          }
-        }
-        if (pkt.killEntry) {
-          world.killFeed = [
-            pkt.killEntry,
-            ...world.killFeed.filter((k) => k.id !== pkt.killEntry!.id),
-          ].slice(0, 6);
-        }
-        return;
-      }
-
-      if (pkt.type === 'peer:chat' && pkt.message) {
-        receiveChatMessageRef.current(pkt.message, true);
-        return;
-      }
-    });
+      },
+      roomIdRef.current
+    );
 
     peerSyncRef.current = peerSync;
     peerSync.announceJoin();
@@ -894,7 +1065,11 @@ export default function App() {
       },
       (serverTime) => {
         musicBoxRef.current.updateServerClock(serverTime);
-      }
+      },
+      () =>
+        coopActiveRef.current
+          ? worldRef.current.players.get(coopIdRef.current)
+          : undefined
     );
 
     // Background heartbeat so when a tab is unfocused/hidden or paused, its server music stream and multi-tab audio yield stay active
@@ -902,6 +1077,7 @@ export default function App() {
       const world = worldRef.current;
       const lp = world.players.get(selfIdRef.current);
       if (!lp) return;
+      const p2 = coopActiveRef.current ? world.players.get(coopIdRef.current) : undefined;
 
       const isHiddenOrPaused =
         (typeof document !== 'undefined' && document.hidden) ||
@@ -935,11 +1111,30 @@ export default function App() {
             landedPlanetId: lp.landedPlanetId,
             landedSurfaceAngle: lp.landedSurfaceAngle,
           });
+          if (p2) {
+            sendWs({
+              type: 'player:input',
+              playerId: coopIdRef.current,
+              angle: p2.angle,
+              thrusting: false,
+              shooting: false,
+              inputSource: p2.inputSource,
+              x: p2.x,
+              y: p2.y,
+              vx: p2.vx,
+              vy: p2.vy,
+              warping: p2.warping,
+              landedPlanetId: p2.landedPlanetId,
+              landedSurfaceAngle: p2.landedSurfaceAngle,
+            });
+          }
         } else {
           peerSync.send({
             type: 'peer:player_state',
             senderId: selfIdRef.current,
+            roomId: roomIdRef.current,
             player: lp,
+            player2: p2,
           });
         }
       }
@@ -968,19 +1163,141 @@ export default function App() {
 
     return () => {
       window.clearInterval(bgSyncTimer);
-      peerSync.destroy(selfIdRef.current);
+      peerSync.destroy(
+        selfIdRef.current,
+        coopActiveRef.current ? coopIdRef.current : undefined
+      );
       peerSyncRef.current = null;
     };
   }, [sendWs]);
 
+  const handleSelectRoomMode = useCallback(
+    (nextRoom: RoomModeId) => {
+      if (typeof document !== 'undefined') {
+        (document.activeElement as HTMLElement | null)?.blur?.();
+      }
+      if (roomIdRef.current === nextRoom) return;
+      const prevRoom = roomIdRef.current;
+      roomIdRef.current = nextRoom;
+      setRoomId(nextRoom);
+      rendererRef.current?.setRoomId(nextRoom);
+
+      // Notify previous peer room before switching
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        peerSyncRef.current?.send({
+          type: 'peer:player_leave',
+          senderId: selfIdRef.current,
+          roomId: prevRoom,
+          playerId: selfIdRef.current,
+        });
+        if (coopActiveRef.current) {
+          peerSyncRef.current?.send({
+            type: 'peer:player_leave',
+            senderId: selfIdRef.current,
+            roomId: prevRoom,
+            playerId: coopIdRef.current,
+          });
+        }
+      }
+      peerSyncRef.current?.setRoomId(nextRoom);
+
+      const arena = getRoomArenaConfig(nextRoom);
+      const world = worldRef.current;
+      world.bullets = [];
+      world.asteroids = createInitialClientAsteroids(arena.maxAsteroids, false, nextRoom);
+      world.planets = arena.hasPlanets
+        ? INITIAL_PLANETS.map((p) => ({
+            ...p,
+            x: arena.starX + Math.cos(p.orbitAngle) * p.orbitRadius,
+            y: arena.starY + Math.sin(p.orbitAngle) * p.orbitRadius,
+            vx: -Math.sin(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
+            vy: Math.cos(p.orbitAngle) * p.orbitSpeed * p.orbitRadius,
+          }))
+        : [];
+
+      const existingP1 = world.players.get(selfIdRef.current);
+      const existingP2 = coopActiveRef.current ? world.players.get(coopIdRef.current) : undefined;
+      world.players.clear();
+
+      if (shellStateRef.current !== 'TITLE_MENU' && existingP1) {
+        const pt1 = getSafeSunOrbitPoint(nextRoom);
+        existingP1.x = pt1.x;
+        existingP1.y = pt1.y;
+        existingP1.vx = 0;
+        existingP1.vy = 0;
+        existingP1.landedPlanetId = null;
+        existingP1.landedSurfaceAngle = undefined;
+        existingP1.invulnerableTimer = 2.0;
+        world.players.set(selfIdRef.current, existingP1);
+
+        sendWs({
+          type: 'player:join',
+          roomId: nextRoom,
+          playerId: selfIdRef.current,
+          name: existingP1.name,
+          hull: existingP1.hull,
+          color: existingP1.color,
+          inputSource: existingP1.inputSource,
+          deathSound: existingP1.deathSound,
+          shipPng: existingP1.shipPng,
+        });
+        sendWs({
+          type: 'player:cheats',
+          playerId: selfIdRef.current,
+          cheats: cheatsRef.current,
+        });
+
+        if (coopActiveRef.current && existingP2) {
+          const pt2 = getSafeSunOrbitPoint(nextRoom);
+          existingP2.x = pt2.x;
+          existingP2.y = pt2.y;
+          existingP2.vx = 0;
+          existingP2.vy = 0;
+          existingP2.landedPlanetId = null;
+          existingP2.landedSurfaceAngle = undefined;
+          existingP2.invulnerableTimer = 2.0;
+          world.players.set(coopIdRef.current, existingP2);
+
+          sendWs({
+            type: 'player:join',
+            roomId: nextRoom,
+            playerId: coopIdRef.current,
+            name: existingP2.name,
+            hull: existingP2.hull,
+            color: existingP2.color,
+            inputSource: existingP2.inputSource,
+            deathSound: existingP2.deathSound,
+          });
+        }
+
+        if (wsRef.current?.readyState !== WebSocket.OPEN) {
+          peerSyncRef.current?.announceJoin(existingP1, existingP2);
+        }
+      } else {
+        peerSyncRef.current?.announceJoin();
+      }
+    },
+    [sendWs]
+  );
+
   const handleStartGame = useCallback(() => {
+    if (typeof document !== 'undefined') {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+    }
+    inputRef.current?.clearHeldInputs();
+
     const cleanName = pilotName.trim().slice(0, 16) || 'PILOT';
     localStorage.setItem('spacewar_pilot_name', cleanName);
+
+    const activeRoom = roomIdRef.current;
+    rendererRef.current?.setRoomId(activeRoom);
+    peerSyncRef.current?.setRoomId(activeRoom);
 
     const spec = HULL_SPECS[selectedHull];
     const spawnPt = getColocatedSpawnPoint(
       worldRef.current.players.values(),
-      selfIdRef.current
+      selfIdRef.current,
+      activeRoom
     );
 
     const localPlayerObj: PlayerState = {
@@ -1015,17 +1332,62 @@ export default function App() {
 
     warpSpeedActiveRef.current = false;
     setWarpSpeedActive(false);
+    p2WarpActiveRef.current = false;
     shellStateRef.current = 'PLAYING';
     setShellState('PLAYING');
 
     worldRef.current.players.set(selfIdRef.current, localPlayerObj);
+
+    let localP2Obj: PlayerState | undefined;
+    if (localPlayersCount === 2) {
+      coopActiveRef.current = true;
+      const cleanP2Name = p2Name.trim().slice(0, 16) || `${cleanName.slice(0, 11)}-P2`;
+      localStorage.setItem('spacewar_p2_name', cleanP2Name);
+      const spec2 = HULL_SPECS[p2Hull] || HULL_SPECS.interceptor;
+      const spawnPt2 = getSafeSunOrbitPoint(activeRoom);
+      localP2Obj = {
+        id: coopIdRef.current,
+        name: cleanP2Name,
+        color: p2Color,
+        hull: p2Hull,
+        x: spawnPt2.x,
+        y: spawnPt2.y,
+        vx: 0,
+        vy: 0,
+        angle: -Math.PI / 2,
+        thrusting: false,
+        shooting: false,
+        hp: spec2.maxHp,
+        maxHp: spec2.maxHp,
+        score: 0,
+        kills: 0,
+        deaths: 0,
+        streak: 0,
+        peakSpeed: 0,
+        alive: true,
+        respawnTimer: 0,
+        invulnerableTimer: 2.0,
+        lastFireTime: 0,
+        inputSource: 'keyboard',
+        deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+        warping: false,
+      };
+      worldRef.current.players.set(coopIdRef.current, localP2Obj);
+    } else {
+      if (coopActiveRef.current) {
+        coopActiveRef.current = false;
+        worldRef.current.players.delete(coopIdRef.current);
+        sendWs({ type: 'player:leave', playerId: coopIdRef.current });
+      }
+    }
+
     if (wsRef.current?.readyState !== WebSocket.OPEN) {
-      peerSyncRef.current?.announceJoin(localPlayerObj);
+      peerSyncRef.current?.announceJoin(localPlayerObj, localP2Obj);
     }
 
     sendWs({
       type: 'player:join',
-      roomId,
+      roomId: activeRoom,
       playerId: selfIdRef.current,
       name: cleanName,
       hull: selectedHull,
@@ -1040,7 +1402,20 @@ export default function App() {
       playerId: selfIdRef.current,
       cheats: cheatsRef.current,
     });
-  }, [pilotName, roomId, selectedColor, selectedHull, sendWs]);
+
+    if (localP2Obj) {
+      sendWs({
+        type: 'player:join',
+        roomId: activeRoom,
+        playerId: coopIdRef.current,
+        name: localP2Obj.name,
+        hull: localP2Obj.hull,
+        color: localP2Obj.color,
+        inputSource: 'keyboard',
+        deathSound: localP2Obj.deathSound,
+      });
+    }
+  }, [localPlayersCount, p2Color, p2Hull, p2Name, pilotName, selectedColor, selectedHull, sendWs]);
 
   const handleUpdateCheats = useCallback(
     (nextCheats: PlayerCheats) => {
@@ -1157,13 +1532,14 @@ export default function App() {
             isMissile: true,
             targetIds,
           };
-          world.bullets.push(...expandSalvoToBullets(salvo));
+          world.bullets.push(...expandSalvoToBullets(salvo, roomIdRef.current));
           if (world.bullets.length > 1800) {
             world.bullets.splice(0, world.bullets.length - 1800);
           }
           peerSyncRef.current?.send({
             type: 'peer:salvo',
             senderId: selfIdRef.current,
+            roomId: roomIdRef.current,
             salvo,
           });
         }
@@ -1189,15 +1565,17 @@ export default function App() {
           const droneBatch = createDroneBatchSpec(
             world.players,
             countToSpawn,
-            localPlayer
+            localPlayer,
+            roomIdRef.current
           );
-          const spawnedDrones = createTargetDronesFromBatchSpec(droneBatch);
+          const spawnedDrones = createTargetDronesFromBatchSpec(droneBatch, roomIdRef.current);
           for (const d of spawnedDrones) {
             world.players.set(d.id, d);
           }
           peerSyncRef.current?.send({
             type: 'peer:cheat_action',
             senderId: selfIdRef.current,
+            roomId: roomIdRef.current,
             playerId: selfIdRef.current,
             action,
             droneBatch,
@@ -1366,23 +1744,75 @@ export default function App() {
   );
 
   const handleToggleCoopGamepad = useCallback(() => {
+    if (typeof document !== 'undefined') {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+    }
     if (coopActiveRef.current) {
       coopActiveRef.current = false;
+      setLocalPlayersCount(1);
+      p2WarpActiveRef.current = false;
       sendWs({ type: 'player:leave', playerId: coopIdRef.current });
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        peerSyncRef.current?.send({
+          type: 'peer:player_leave',
+          senderId: selfIdRef.current,
+          roomId: roomIdRef.current,
+          playerId: coopIdRef.current,
+        });
+      }
       worldRef.current.players.delete(coopIdRef.current);
     } else {
       coopActiveRef.current = true;
+      setLocalPlayersCount(2);
+      const activeRoom = roomIdRef.current;
+      const cleanP2Name =
+        p2NameRef.current.trim().slice(0, 16) || `${pilotName.slice(0, 11)}-P2`;
+      const spec2 = HULL_SPECS[p2HullRef.current] || HULL_SPECS.interceptor;
+      const spawnPt2 = getSafeSunOrbitPoint(activeRoom);
+      const p2Obj: PlayerState = {
+        id: coopIdRef.current,
+        name: cleanP2Name,
+        color: p2ColorRef.current,
+        hull: p2HullRef.current,
+        x: spawnPt2.x,
+        y: spawnPt2.y,
+        vx: 0,
+        vy: 0,
+        angle: -Math.PI / 2,
+        thrusting: false,
+        shooting: false,
+        hp: spec2.maxHp,
+        maxHp: spec2.maxHp,
+        score: 0,
+        kills: 0,
+        deaths: 0,
+        streak: 0,
+        peakSpeed: 0,
+        alive: true,
+        respawnTimer: 0,
+        invulnerableTimer: 2.0,
+        lastFireTime: 0,
+        inputSource: 'keyboard',
+        deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+        warping: false,
+      };
+      worldRef.current.players.set(coopIdRef.current, p2Obj);
       sendWs({
         type: 'player:join',
-        roomId,
+        roomId: activeRoom,
         playerId: coopIdRef.current,
-        name: `${pilotName.slice(0, 11)}-P2`,
-        hull: 'interceptor',
-        color: '#10B981',
-        inputSource: 'gamepad',
+        name: cleanP2Name,
+        hull: p2HullRef.current,
+        color: p2ColorRef.current,
+        inputSource: 'keyboard',
+        deathSound: deathSoundCtrlRef.current.selectedDeathSound,
       });
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        const lp = worldRef.current.players.get(selfIdRef.current);
+        peerSyncRef.current?.announceJoin(lp, p2Obj);
+      }
     }
-  }, [pilotName, roomId, sendWs]);
+  }, [pilotName, sendWs]);
 
   const handleRenameOwnShip = useCallback(
     (rawName: string) => {
@@ -1447,11 +1877,13 @@ export default function App() {
   );
 
   const handleRespawnNow = useCallback(() => {
+    const activeRoom = roomIdRef.current;
     const localPlayer = worldRef.current.players.get(selfIdRef.current);
     if (localPlayer && wsRef.current?.readyState !== WebSocket.OPEN) {
       const spawnPt = getColocatedSpawnPoint(
         worldRef.current.players.values(),
-        selfIdRef.current
+        selfIdRef.current,
+        activeRoom
       );
       const spec = HULL_SPECS[selectedHull];
       localPlayer.hull = selectedHull;
@@ -1466,14 +1898,24 @@ export default function App() {
       localPlayer.respawnTimer = 0;
       localPlayer.invulnerableTimer = 2.0;
     }
-    sendWs({
+      sendWs({
       type: 'player:respawn',
       playerId: selfIdRef.current,
       hull: selectedHull,
       name: pilotName,
     });
+    shellStateRef.current = 'PLAYING';
     setShellState('PLAYING');
   }, [pilotName, selectedHull, sendWs]);
+
+  const handleStartGameRef = useRef(handleStartGame);
+  handleStartGameRef.current = handleStartGame;
+  const handleCycleSpectateTargetRef = useRef(handleCycleSpectateTarget);
+  handleCycleSpectateTargetRef.current = handleCycleSpectateTarget;
+  const handleToggleWarpSpeedRef = useRef(handleToggleWarpSpeed);
+  handleToggleWarpSpeedRef.current = handleToggleWarpSpeed;
+  const handleTriggerCheatActionRef = useRef(handleTriggerCheatAction);
+  handleTriggerCheatActionRef.current = handleTriggerCheatAction;
 
   // Isolated 60fps Canvas Simulation & Render Loop
   useEffect(() => {
@@ -1484,6 +1926,7 @@ export default function App() {
 
     const input = new InputManager();
     const renderer = new SpacewarRenderer();
+    renderer.setRoomId(roomIdRef.current);
     inputRef.current = input;
     rendererRef.current = renderer;
 
@@ -1502,6 +1945,10 @@ export default function App() {
     let lastHudSync = 0;
     let lastLocalFire = 0;
     let lastOfflineShot = 0;
+    let lastP2OfflineShot = 0;
+    let lastP2LocalFire = 0;
+    let p1ShotLatch = false;
+    let p2ShotLatch = false;
 
     const loop = (now: number) => {
       const rawDt = (now - lastTime) / 1000;
@@ -1509,17 +1956,103 @@ export default function App() {
       lastTime = now;
       const nowSec = now / 1000;
 
+      const activeRoom = roomIdRef.current;
+      renderer.setRoomId(activeRoom);
+      const arena = getRoomArenaConfig(activeRoom);
+
       const world = worldRef.current;
-      const localPlayer = world.players.get(selfIdRef.current) || null;
       const isTitle = shellStateRef.current === 'TITLE_MENU';
       const isPaused = shellStateRef.current === 'PAUSED';
       const isWsConnected = wsRef.current?.readyState === WebSocket.OPEN;
 
+      // Self-healing safeguard: never allow P1 or P2 to be missing from world.players while in-game
+      if (!isTitle && !world.players.has(selfIdRef.current)) {
+        const spec1 = HULL_SPECS[selectedHullRef.current] || HULL_SPECS.needle;
+        const pt1 = getSafeSunOrbitPoint(activeRoom);
+        world.players.set(selfIdRef.current, {
+          id: selfIdRef.current,
+          name: pilotNameRef.current.trim().slice(0, 16) || 'PILOT',
+          color: selectedColorRef.current,
+          hull: selectedHullRef.current,
+          x: pt1.x,
+          y: pt1.y,
+          vx: 0,
+          vy: 0,
+          angle: -Math.PI / 2,
+          thrusting: false,
+          shooting: false,
+          hp: spec1.maxHp,
+          maxHp: spec1.maxHp,
+          score: 0,
+          kills: 0,
+          deaths: 0,
+          streak: 0,
+          peakSpeed: 0,
+          alive: true,
+          respawnTimer: 0,
+          invulnerableTimer: 2.0,
+          lastFireTime: 0,
+          inputSource: 'keyboard',
+          cheats: cheatsRef.current,
+          deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+          shipPng: selectedShipPngRef.current,
+          warping: false,
+        });
+      }
+      if (!isTitle && coopActiveRef.current && !world.players.has(coopIdRef.current)) {
+        const spec2 = HULL_SPECS[p2HullRef.current] || HULL_SPECS.interceptor;
+        const pt2 = getSafeSunOrbitPoint(activeRoom);
+        world.players.set(coopIdRef.current, {
+          id: coopIdRef.current,
+          name: p2NameRef.current.trim().slice(0, 16) || 'PILOT-P2',
+          color: p2ColorRef.current,
+          hull: p2HullRef.current,
+          x: pt2.x,
+          y: pt2.y,
+          vx: 0,
+          vy: 0,
+          angle: -Math.PI / 2,
+          thrusting: false,
+          shooting: false,
+          hp: spec2.maxHp,
+          maxHp: spec2.maxHp,
+          score: 0,
+          kills: 0,
+          deaths: 0,
+          streak: 0,
+          peakSpeed: 0,
+          alive: true,
+          respawnTimer: 0,
+          invulnerableTimer: 2.0,
+          lastFireTime: 0,
+          inputSource: 'keyboard',
+          deathSound: deathSoundCtrlRef.current.selectedDeathSound,
+          warping: false,
+        });
+      }
+
+      const localPlayer = world.players.get(selfIdRef.current) || null;
+      const localP2 = coopActiveRef.current
+        ? world.players.get(coopIdRef.current) || null
+        : null;
+
+      // Compute exact screen position of P1's ship so mouse aiming is accurate in both follow-camera (SECTOR-01) and fixed-camera (COUCH-COOP)
+      const p1Screen = localPlayer
+        ? renderer.arenaToScreen(
+            localPlayer.x,
+            localPlayer.y,
+            window.innerWidth,
+            window.innerHeight
+          )
+        : { sx: window.innerWidth * 0.5, sy: window.innerHeight * 0.5 };
+
       const sampled = input.sample(
         dt,
-        window.innerWidth * 0.5,
-        window.innerHeight * 0.5,
-        0
+        p1Screen.sx,
+        p1Screen.sy,
+        undefined,
+        coopActiveRef.current,
+        arena.fixedCamera
       );
 
       // Press K while in-game to toggle the Cheat Menu
@@ -1546,12 +2079,12 @@ export default function App() {
 
       // Press M during gameplay to fire an Homing Missile Swarm
       if (!isTitle && sampled.missileSwarmJustPressed && !cheatsRef.current.freeCam) {
-        handleTriggerCheatAction('missile_swarm');
+        handleTriggerCheatActionRef.current('missile_swarm');
       }
 
       // Press [ or ] to cycle spectated players (also activates Free-Cam / Spectator mode)
       if (!isTitle && (sampled.spectatePrevJustPressed || sampled.spectateNextJustPressed)) {
-        handleCycleSpectateTarget(sampled.spectateNextJustPressed ? 1 : -1);
+        handleCycleSpectateTargetRef.current(sampled.spectateNextJustPressed ? 1 : -1);
       }
 
       if (
@@ -1561,7 +2094,7 @@ export default function App() {
         !deathSoundModalOpenRef.current &&
         !cheatMenuOpenRef.current
       ) {
-        handleStartGame();
+        handleStartGameRef.current();
       } else if (!isTitle && sampled.pauseJustPressed) {
         if (typeof document !== 'undefined' && document.pointerLockElement) {
           document.exitPointerLock?.();
@@ -1593,8 +2126,122 @@ export default function App() {
       if (renderer.hitstopTimer > 0) {
         renderer.hitstopTimer = Math.max(0, renderer.hitstopTimer - dt);
       } else if (!isTitle && !isPaused && localPlayer) {
+        const applyEnvironmentHit = (
+          target: PlayerState,
+          cause: 'asteroid' | 'planet',
+          sourceId: string,
+          sourceName: string,
+          sourceColor: string,
+          damage: number,
+          fatal: boolean,
+          impactSpeed: number
+        ) => {
+          if (target.cheats?.godMode || target.warping) return;
+          target.hp = Math.max(0, target.hp - damage);
+          const isFatal = fatal || target.hp <= 0;
+          if (target.id === selfIdRef.current) {
+            lastLocalEnvHitAtRef.current = Date.now();
+          } else if (target.id === coopIdRef.current) {
+            lastP2EnvHitAtRef.current = Date.now();
+          }
+
+          renderer.hitFlashes.set(target.id, 0.14);
+          if (target.id === selfIdRef.current || target.id === coopIdRef.current) {
+            renderer.cameraShake = isFatal ? 14 : 6;
+            if (isFatal) {
+              renderer.hitstopTimer = 0.045;
+            }
+            soundEngine.playHit(isFatal);
+          }
+
+          let killEntry: KillFeedEntry | undefined;
+          if (isFatal) {
+            target.alive = false;
+            target.hp = 0;
+            target.deaths += 1;
+            target.streak = 0;
+            target.respawnTimer = 2.8;
+            target.warping = false;
+            target.landedPlanetId = null;
+            target.landedSurfaceAngle = undefined;
+            if (target.id === selfIdRef.current) {
+              warpSpeedActiveRef.current = false;
+              setWarpSpeedActive(false);
+            } else if (target.id === coopIdRef.current) {
+              p2WarpActiveRef.current = false;
+            }
+            renderer.addBurst(
+              target.x,
+              target.y,
+              target.vx * 0.2,
+              target.vy * 0.2,
+              sourceColor,
+              34,
+              320,
+              true
+            );
+            deathSoundCtrlRef.current.playDeathSound(target.deathSound, isMutedRef.current);
+
+            if (!isWsConnected) {
+              killEntry = {
+                id: `kill_env_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+                killerId: sourceId,
+                killerName: sourceName,
+                killerColor: sourceColor,
+                victimId: target.id,
+                victimName: target.name,
+                victimColor: target.color,
+                cause,
+                speedAtKill: impactSpeed,
+                timestamp: Date.now(),
+              };
+              world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
+            }
+          }
+
+          if (
+            isWsConnected &&
+            (target.id === selfIdRef.current || target.id === coopIdRef.current)
+          ) {
+            sendWs({
+              type: 'player:env_hit',
+              playerId: target.id,
+              cause,
+              sourceId,
+              sourceName,
+              sourceColor,
+              damage,
+              fatal: isFatal,
+              impactSpeed,
+              x: Math.round(target.x),
+              y: Math.round(target.y),
+              vx: Math.round(target.vx),
+              vy: Math.round(target.vy),
+            });
+          } else if (!isWsConnected) {
+            peerSyncRef.current?.send({
+              type: 'peer:combat_hit',
+              senderId: selfIdRef.current,
+              roomId: activeRoom,
+              hitId: `env_${Date.now().toString(36)}_${target.id}`,
+              targetId: target.id,
+              attackerId: sourceId,
+              x: Math.round(target.x),
+              y: Math.round(target.y),
+              vx: Math.round(target.vx),
+              vy: Math.round(target.vy),
+              damage,
+              fatal: isFatal,
+              color: sourceColor,
+              cause,
+              deathSound: target.deathSound,
+              killEntry,
+            });
+          }
+        };
+
         if (isFreeCam) {
-          // If the player died to enemy bullets while in spectator mode, send them back to the Main Menu!
+          // If the player's ship is destroyed while in spectator/free-cam mode, exit free-cam and let them respawn normally instead of deleting them!
           if (!localPlayer.alive || localPlayer.hp <= 0) {
             const nextCheats = { ...cheatsRef.current, freeCam: false };
             cheatsRef.current = nextCheats;
@@ -1602,18 +2249,14 @@ export default function App() {
             spectateTargetIdRef.current = null;
             setSpectateTargetId(null);
             freeCamPosRef.current.initialized = false;
-            world.players.delete(selfIdRef.current);
-            peerSyncRef.current?.send({
-              type: 'peer:player_leave',
-              senderId: selfIdRef.current,
+            localPlayer.spectating = false;
+            localPlayer.spectateTargetId = null;
+            sendWs({
+              type: 'player:cheats',
               playerId: selfIdRef.current,
+              cheats: nextCheats,
             });
-            sendWs({ type: 'player:leave', playerId: selfIdRef.current });
-            shellStateRef.current = 'TITLE_MENU';
-            setShellState('TITLE_MENU');
-            rafId = requestAnimationFrame(loop);
-            return;
-          }
+          } else {
 
           // Detached Camera / Spectator Mode:
           // Ship controls and physics are parked (immune to the Sun), but you retain HP and can be killed by bullets!
@@ -1656,15 +2299,16 @@ export default function App() {
             const camSpeed = sampled.boostHeld ? 3600 : 1450;
             freeCamPosRef.current.x = wrapCoord(
               freeCamPosRef.current.x + sampled.panVector.x * camSpeed * dt,
-              ARENA_WIDTH
+              arena.width
             );
             freeCamPosRef.current.y = wrapCoord(
               freeCamPosRef.current.y + sampled.panVector.y * camSpeed * dt,
-              ARENA_HEIGHT
+              arena.height
             );
           }
 
           localPlayer.spectateTargetId = spectateTargetIdRef.current;
+          }
         } else {
           if (freeCamPosRef.current.initialized) {
             freeCamPosRef.current.initialized = false;
@@ -1677,112 +2321,6 @@ export default function App() {
           localPlayer.shooting = (sampled.shooting || autoFireRef.current) && localPlayer.alive;
           localPlayer.inputSource = sampled.inputSource;
 
-          const applyEnvironmentHit = (
-            target: PlayerState,
-            cause: 'asteroid' | 'planet',
-            sourceId: string,
-            sourceName: string,
-            sourceColor: string,
-            damage: number,
-            fatal: boolean,
-            impactSpeed: number
-          ) => {
-            if (target.cheats?.godMode || target.warping) return;
-            target.hp = Math.max(0, target.hp - damage);
-            const isFatal = fatal || target.hp <= 0;
-            if (target.id === selfIdRef.current) {
-              lastLocalEnvHitAtRef.current = Date.now();
-            }
-
-            renderer.hitFlashes.set(target.id, 0.14);
-            if (target.id === selfIdRef.current) {
-              renderer.cameraShake = isFatal ? 14 : 6;
-              if (isFatal) {
-                renderer.hitstopTimer = 0.045;
-              }
-              soundEngine.playHit(isFatal);
-            }
-
-            let killEntry: KillFeedEntry | undefined;
-            if (isFatal) {
-              target.alive = false;
-              target.hp = 0;
-              target.deaths += 1;
-              target.streak = 0;
-              target.respawnTimer = 2.8;
-              target.warping = false;
-              target.landedPlanetId = null;
-              target.landedSurfaceAngle = undefined;
-              if (target.id === selfIdRef.current) {
-                warpSpeedActiveRef.current = false;
-                setWarpSpeedActive(false);
-              }
-              renderer.addBurst(
-                target.x,
-                target.y,
-                target.vx * 0.2,
-                target.vy * 0.2,
-                sourceColor,
-                34,
-                320,
-                true
-              );
-              deathSoundCtrlRef.current.playDeathSound(target.deathSound, isMutedRef.current);
-
-              if (!isWsConnected) {
-                killEntry = {
-                  id: `kill_env_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
-                  killerId: sourceId,
-                  killerName: sourceName,
-                  killerColor: sourceColor,
-                  victimId: target.id,
-                  victimName: target.name,
-                  victimColor: target.color,
-                  cause,
-                  speedAtKill: impactSpeed,
-                  timestamp: Date.now(),
-                };
-                world.killFeed = [killEntry, ...world.killFeed].slice(0, 6);
-              }
-            }
-
-            if (isWsConnected && (target.id === selfIdRef.current || target.id === coopIdRef.current)) {
-              sendWs({
-                type: 'player:env_hit',
-                playerId: target.id,
-                cause,
-                sourceId,
-                sourceName,
-                sourceColor,
-                damage,
-                fatal: isFatal,
-                impactSpeed,
-                x: Math.round(target.x),
-                y: Math.round(target.y),
-                vx: Math.round(target.vx),
-                vy: Math.round(target.vy),
-              });
-            } else if (!isWsConnected) {
-              peerSyncRef.current?.send({
-                type: 'peer:combat_hit',
-                senderId: selfIdRef.current,
-                hitId: `env_${Date.now().toString(36)}_${target.id}`,
-                targetId: target.id,
-                attackerId: sourceId,
-                x: Math.round(target.x),
-                y: Math.round(target.y),
-                vx: Math.round(target.vx),
-                vy: Math.round(target.vy),
-                damage,
-                fatal: isFatal,
-                color: sourceColor,
-                cause,
-                deathSound: target.deathSound,
-                killEntry,
-              });
-            }
-          };
-
           localPlayer.cheats = cheatsRef.current;
           renderer.stepLocalPlayerPhysics(
             localPlayer,
@@ -1793,15 +2331,15 @@ export default function App() {
             applyEnvironmentHit
           );
 
-          // Prevent getting stuck inside the giant Sun's gravity well:
+          // Prevent getting stuck inside the central Sun's gravity well:
           // touching the Sun immediately teleports/respawns the ship to a safe orbit around the Sun.
           if (world.gravityStarEnabled && localPlayer.alive) {
             const hullRadius = (HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle).radius;
             const distToSun = Math.hypot(
-              localPlayer.x - GRAVITY_STAR_X,
-              localPlayer.y - GRAVITY_STAR_Y
+              localPlayer.x - arena.starX,
+              localPlayer.y - arena.starY
             );
-            if (distToSun < GRAVITY_STAR_RADIUS + hullRadius - 4) {
+            if (distToSun < arena.starRadius + hullRadius - 4) {
               const nowMs = Date.now();
               const isDuplicateSunHit = nowMs - lastLocalSunHitAtRef.current < 1200;
               const wasInvulnerable = localPlayer.invulnerableTimer > 0;
@@ -1818,7 +2356,7 @@ export default function App() {
                 300,
                 true
               );
-              const safeOrbit = getSafeSunOrbitPoint();
+              const safeOrbit = getSafeSunOrbitPoint(activeRoom);
               localPlayer.x = safeOrbit.x;
               localPlayer.y = safeOrbit.y;
               if (!localPlayer.warping) {
@@ -1864,7 +2402,9 @@ export default function App() {
                 peerSyncRef.current?.send({
                   type: 'peer:player_state',
                   senderId: selfIdRef.current,
+                  roomId: activeRoom,
                   player: localPlayer,
+                  player2: localP2 || undefined,
                 });
               }
               sendWs({
@@ -1902,13 +2442,171 @@ export default function App() {
           }
         }
 
+        // Step Same-Screen Local Player 2 (P2) when 2 Players on Same Screen is active
+        if (coopActiveRef.current && localP2) {
+          const p2Sample = input.samplePlayer2(dt);
+          if (p2Sample.warpJustPressed && localP2.alive) {
+            p2WarpActiveRef.current = !p2WarpActiveRef.current;
+            localP2.warping = p2WarpActiveRef.current;
+            soundEngine.playWarp();
+            if (p2WarpActiveRef.current) {
+              localP2.landedPlanetId = null;
+              localP2.landedSurfaceAngle = undefined;
+              localP2.invulnerableTimer = Math.max(localP2.invulnerableTimer, 0.5);
+              const curSpd = Math.hypot(localP2.vx, localP2.vy);
+              const warpSpd = Math.max(WARP_DRIVE_SPEED, curSpd);
+              localP2.vx = Math.cos(localP2.angle) * warpSpd;
+              localP2.vy = Math.sin(localP2.angle) * warpSpd;
+              renderer.addBurst(
+                localP2.x,
+                localP2.y,
+                localP2.vx * 0.15,
+                localP2.vy * 0.15,
+                '#38BDF8',
+                24,
+                280,
+                false
+              );
+            } else {
+              localP2.vx = 0;
+              localP2.vy = 0;
+              renderer.addBurst(localP2.x, localP2.y, 0, 0, '#A855F7', 22, 220, false);
+            }
+          }
+
+          localP2.warping = p2WarpActiveRef.current && localP2.alive;
+          localP2.angle = p2Sample.angle;
+          localP2.thrusting = p2Sample.thrusting && localP2.alive;
+          localP2.shooting = p2Sample.shooting && localP2.alive;
+          localP2.inputSource = p2Sample.inputSource;
+          localP2.cheats = cheatsRef.current.godMode
+            ? { ...DEFAULT_PLAYER_CHEATS, godMode: true }
+            : undefined;
+
+          renderer.stepLocalPlayerPhysics(
+            localP2,
+            dt,
+            world.gravityStarEnabled,
+            world.planets,
+            world.asteroids,
+            applyEnvironmentHit
+          );
+
+          // Central Star collision check for Local Player 2
+          if (world.gravityStarEnabled && localP2.alive) {
+            const p2Radius = (HULL_SPECS[localP2.hull] || HULL_SPECS.interceptor).radius;
+            const distToSun2 = Math.hypot(localP2.x - arena.starX, localP2.y - arena.starY);
+            if (distToSun2 < arena.starRadius + p2Radius - 4) {
+              const nowMs = Date.now();
+              const isDupSun2 = nowMs - lastP2SunHitAtRef.current < 1200;
+              const wasInvuln2 = localP2.invulnerableTimer > 0;
+              lastP2SunHitAtRef.current = nowMs;
+
+              const impactSpeed2 = Math.round(Math.hypot(localP2.vx, localP2.vy));
+              renderer.addBurst(localP2.x, localP2.y, 0, 0, '#F59E0B', 30, 280, true);
+              const safeOrbit2 = getSafeSunOrbitPoint(activeRoom);
+              localP2.x = safeOrbit2.x;
+              localP2.y = safeOrbit2.y;
+              if (!localP2.warping) {
+                localP2.vx = 0;
+                localP2.vy = 0;
+              }
+              localP2.invulnerableTimer = 2.0;
+
+              if (
+                !wasInvuln2 &&
+                !isDupSun2 &&
+                !localP2.cheats?.godMode &&
+                !localP2.warping
+              ) {
+                soundEngine.playHit(true);
+                deathSoundCtrlRef.current.playDeathSound(
+                  localP2.deathSound,
+                  isMutedRef.current
+                );
+                if (!isWsConnected) {
+                  localP2.deaths += 1;
+                  localP2.streak = 0;
+                  localP2.hp = localP2.maxHp;
+                  const killEntry2: KillFeedEntry = {
+                    id: `kill_sun_p2_${Date.now().toString(36)}`,
+                    killerId: 'STAR',
+                    killerName: 'GRAVITY STAR',
+                    killerColor: '#F59E0B',
+                    victimId: localP2.id,
+                    victimName: localP2.name,
+                    victimColor: localP2.color,
+                    cause: 'star',
+                    speedAtKill: impactSpeed2,
+                    timestamp: nowMs,
+                  };
+                  world.killFeed = [killEntry2, ...world.killFeed].slice(0, 6);
+                }
+              }
+            }
+          }
+
+          // Local Player 2 weapon firing (zero-latency client bullets + Peer/Server sync + Laser SFX)
+          const p2Spec = HULL_SPECS[localP2.hull] || HULL_SPECS.interceptor;
+          if (localP2.shooting && localP2.alive) {
+            p2ShotLatch = true;
+            if (nowSec - lastP2OfflineShot >= p2Spec.fireCooldown) {
+              lastP2OfflineShot = nowSec;
+              localP2.lastFireTime = nowSec;
+              const salvo2 = {
+                idPrefix: `p2_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+                ownerId: localP2.id,
+                ownerName: localP2.name,
+                color: localP2.color,
+                x: localP2.x,
+                y: localP2.y,
+                vx: localP2.vx,
+                vy: localP2.vy,
+                angle: localP2.angle,
+                noseDist: p2Spec.radius + 10,
+                count: p2Spec.spreadCount,
+                spreadAngle: p2Spec.spreadAngle,
+                novaSpread: false,
+                baseMuzzle: p2Spec.bulletSpeed,
+                damage: p2Spec.bulletDamage,
+                ttl: 2.6,
+                isMissile: false,
+                targetIds: [],
+              };
+              world.bullets.push(...expandSalvoToBullets(salvo2, activeRoom));
+              if (world.bullets.length > 1800) {
+                world.bullets.splice(0, world.bullets.length - 1800);
+              }
+              if (!isWsConnected) {
+                peerSyncRef.current?.send({
+                  type: 'peer:salvo',
+                  senderId: selfIdRef.current,
+                  roomId: activeRoom,
+                  salvo: salvo2,
+                });
+              }
+            }
+          }
+          if (localP2.shooting && localP2.alive && nowSec - lastP2LocalFire >= p2Spec.fireCooldown) {
+            lastP2LocalFire = nowSec;
+            soundEngine.playLaser(localP2.hull);
+          }
+        }
+
         // If running on static Vercel / Peer mode without WebSocket backend, step respawn, remote players, drones, & asteroids
         if (!isWsConnected) {
-          peerSyncRef.current?.pruneStalePeers(world.players);
+          peerSyncRef.current?.pruneStalePeers(
+            world.players,
+            coopActiveRef.current ? coopIdRef.current : undefined
+          );
           if (!localPlayer.alive) {
             localPlayer.respawnTimer = Math.max(0, localPlayer.respawnTimer - dt);
             if (localPlayer.respawnTimer <= 0) {
-              const spawnPt = getColocatedSpawnPoint(world.players.values(), localPlayer.id);
+              const spawnPt = getColocatedSpawnPoint(
+                world.players.values(),
+                localPlayer.id,
+                activeRoom
+              );
               const spec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
               localPlayer.x = spawnPt.x;
               localPlayer.y = spawnPt.y;
@@ -1920,11 +2618,28 @@ export default function App() {
               localPlayer.invulnerableTimer = 2.0;
             }
           }
+          if (localP2 && !localP2.alive) {
+            localP2.respawnTimer = Math.max(0, localP2.respawnTimer - dt);
+            if (localP2.respawnTimer <= 0) {
+              const spawnPt2 = getSafeSunOrbitPoint(activeRoom);
+              const spec2 = HULL_SPECS[localP2.hull] || HULL_SPECS.interceptor;
+              localP2.x = spawnPt2.x;
+              localP2.y = spawnPt2.y;
+              localP2.vx = 0;
+              localP2.vy = 0;
+              localP2.hp = spec2.maxHp;
+              localP2.maxHp = spec2.maxHp;
+              localP2.alive = true;
+              localP2.invulnerableTimer = 2.0;
+            }
+          }
 
-          if (world.asteroids.length < 192) {
+          const targetAstCount = arena.fixedCamera ? arena.maxAsteroids : 192;
+          if (world.asteroids.length < targetAstCount) {
             const extra = createInitialClientAsteroids(
-              Math.min(32, 192 - world.asteroids.length),
-              true
+              Math.min(16, targetAstCount - world.asteroids.length),
+              true,
+              activeRoom
             );
             for (const ast of extra) {
               ast.id = `ast_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -1932,18 +2647,23 @@ export default function App() {
             }
           }
           for (const ast of world.asteroids) {
-            ast.x = wrapCoord(ast.x + ast.vx * dt, ARENA_WIDTH);
-            ast.y = wrapCoord(ast.y + ast.vy * dt, ARENA_HEIGHT);
+            ast.x = wrapCoord(ast.x + ast.vx * dt, arena.width);
+            ast.y = wrapCoord(ast.y + ast.vy * dt, arena.height);
             ast.angle += ast.vAngle * dt;
           }
 
           for (const p of world.players.values()) {
-            if (p.id === selfIdRef.current) continue;
+            if (
+              p.id === selfIdRef.current ||
+              (coopActiveRef.current && p.id === coopIdRef.current)
+            ) {
+              continue;
+            }
 
             if (!p.alive) {
               p.respawnTimer = Math.max(0, p.respawnTimer - dt);
               if (p.respawnTimer <= 0 && p.isDrone) {
-                const safePt = getSafeSunOrbitPoint();
+                const safePt = getSafeSunOrbitPoint(activeRoom);
                 p.x = safePt.x;
                 p.y = safePt.y;
                 p.alive = true;
@@ -1967,7 +2687,8 @@ export default function App() {
                 world.planets,
                 world.gravityStarEnabled,
                 dt,
-                nowSec
+                nowSec,
+                activeRoom
               );
               renderer.stepLocalPlayerPhysics(
                 p,
@@ -2013,9 +2734,9 @@ export default function App() {
               // Respawn AI drone at a safe orbit if pulled into the central Gravity Star
               if (world.gravityStarEnabled) {
                 const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
-                const distToSun = Math.hypot(p.x - GRAVITY_STAR_X, p.y - GRAVITY_STAR_Y);
-                if (distToSun < GRAVITY_STAR_RADIUS + dSpec.radius - 4) {
-                  const safeOrbit = getSafeSunOrbitPoint();
+                const distToSun = Math.hypot(p.x - arena.starX, p.y - arena.starY);
+                if (distToSun < arena.starRadius + dSpec.radius - 4) {
+                  const safeOrbit = getSafeSunOrbitPoint(activeRoom);
                   p.x = safeOrbit.x;
                   p.y = safeOrbit.y;
                   p.vx = 0;
@@ -2033,10 +2754,10 @@ export default function App() {
 
               // Allow nearby AI ships to actively fire weapons at players & rival ships in Vercel/client mode without flooding bullets off-screen
               if (p.shooting && world.bullets.length < 480) {
-                const refX = localPlayer ? localPlayer.x : GRAVITY_STAR_X;
-                const refY = localPlayer ? localPlayer.y : GRAVITY_STAR_Y;
-                const distToViewX = Math.abs(shortestToroidalDelta(refX, p.x, ARENA_WIDTH));
-                const distToViewY = Math.abs(shortestToroidalDelta(refY, p.y, ARENA_HEIGHT));
+                const refX = localPlayer ? localPlayer.x : arena.starX;
+                const refY = localPlayer ? localPlayer.y : arena.starY;
+                const distToViewX = Math.abs(shortestToroidalDelta(refX, p.x, arena.width));
+                const distToViewY = Math.abs(shortestToroidalDelta(refY, p.y, arena.height));
                 if (distToViewX < 2400 && distToViewY < 2400) {
                   const dSpec = HULL_SPECS[p.hull] || HULL_SPECS.needle;
                   const aiCooldown = Math.max(dSpec.fireCooldown * 1.6, 0.42);
@@ -2062,7 +2783,7 @@ export default function App() {
                       isMissile: false,
                       targetIds: [],
                     };
-                    world.bullets.push(...expandSalvoToBullets(aiSalvo));
+                    world.bullets.push(...expandSalvoToBullets(aiSalvo, activeRoom));
                   }
                 }
               }
@@ -2101,7 +2822,7 @@ export default function App() {
                     isMissile: Boolean(rCheats.homingMissiles),
                     targetIds,
                   };
-                  world.bullets.push(...expandSalvoToBullets(remoteSalvo));
+                  world.bullets.push(...expandSalvoToBullets(remoteSalvo, activeRoom));
                   if (world.bullets.length > 1800) {
                     world.bullets.splice(0, world.bullets.length - 1800);
                   }
@@ -2120,7 +2841,10 @@ export default function App() {
         } else {
           // Smoothly dead-reckon & interpolate remote player positions between WebSocket snapshots
           for (const p of world.players.values()) {
-            if (p.id !== selfIdRef.current) {
+            if (
+              p.id !== selfIdRef.current &&
+              (!coopActiveRef.current || p.id !== coopIdRef.current)
+            ) {
               renderer.stepRemotePlayerSmooth(
                 p,
                 dt,
@@ -2158,8 +2882,8 @@ export default function App() {
               }
               const tSpec = HULL_SPECS[target.hull] || HULL_SPECS.needle;
               const hitRadius = tSpec.radius + (b.isMissile ? 14 : 9);
-              const dx = shortestToroidalDelta(b.x, target.x, ARENA_WIDTH);
-              const dy = shortestToroidalDelta(b.y, target.y, ARENA_HEIGHT);
+              const dx = shortestToroidalDelta(b.x, target.x, arena.width);
+              const dy = shortestToroidalDelta(b.y, target.y, arena.height);
               const hitShip =
                 Math.abs(dx) <= hitRadius &&
                 Math.abs(dy) <= hitRadius &&
@@ -2173,8 +2897,8 @@ export default function App() {
                 typeof target.cursorY === 'number'
               ) {
                 const cursorRadius = b.isMissile ? 40 : 34;
-                const cdx = shortestToroidalDelta(b.x, target.cursorX, ARENA_WIDTH);
-                const cdy = shortestToroidalDelta(b.y, target.cursorY, ARENA_HEIGHT);
+                const cdx = shortestToroidalDelta(b.x, target.cursorX, arena.width);
+                const cdy = shortestToroidalDelta(b.y, target.cursorY, arena.height);
                 hitCursor =
                   Math.abs(cdx) <= cursorRadius &&
                   Math.abs(cdy) <= cursorRadius &&
@@ -2188,13 +2912,13 @@ export default function App() {
                 const hitId = `hit_${b.id}`;
                 const alreadyProcessed = peerSyncRef.current?.hasSeenHit(hitId) ?? false;
                 const isDroneCombat = Boolean(bulletOwner?.isDrone || target.isDrone);
+                const isLocalInvolved =
+                  b.ownerId === selfIdRef.current ||
+                  target.id === selfIdRef.current ||
+                  (coopActiveRef.current &&
+                    (b.ownerId === coopIdRef.current || target.id === coopIdRef.current));
 
-                if (
-                  !alreadyProcessed &&
-                  (b.ownerId === selfIdRef.current ||
-                    target.id === selfIdRef.current ||
-                    isDroneCombat)
-                ) {
+                if (!alreadyProcessed && (isLocalInvolved || isDroneCombat)) {
                   peerSyncRef.current?.markHitSeen(hitId);
                   if (!target.spectating && !target.warping) {
                     const knockback = b.isMissile ? 95 : 65;
@@ -2208,7 +2932,10 @@ export default function App() {
                   ) {
                     target.hp = Math.max(0, target.hp - b.damage);
                   }
-                  if (target.id !== selfIdRef.current) {
+                  if (
+                    target.id !== selfIdRef.current &&
+                    (!coopActiveRef.current || target.id !== coopIdRef.current)
+                  ) {
                     lastDamagedRemoteAtRef.current.set(target.id, Date.now());
                   }
 
@@ -2226,6 +2953,8 @@ export default function App() {
                     if (target.id === selfIdRef.current) {
                       warpSpeedActiveRef.current = false;
                       setWarpSpeedActive(false);
+                    } else if (target.id === coopIdRef.current) {
+                      p2WarpActiveRef.current = false;
                     }
                     if (attacker && attacker.id !== target.id) {
                       attacker.kills += 1;
@@ -2269,6 +2998,7 @@ export default function App() {
                   peerSyncRef.current?.send({
                     type: 'peer:combat_hit',
                     senderId: selfIdRef.current,
+                    roomId: activeRoom,
                     hitId,
                     targetId: target.id,
                     attackerId: b.ownerId,
@@ -2297,9 +3027,9 @@ export default function App() {
             for (let aIdx = world.asteroids.length - 1; aIdx >= 0; aIdx--) {
               const ast = world.asteroids[aIdx];
               const r = ast.radius + (b.isMissile ? 6 : 0);
-              const dx = shortestToroidalDelta(b.x, ast.x, ARENA_WIDTH);
+              const dx = shortestToroidalDelta(b.x, ast.x, arena.width);
               if (Math.abs(dx) > r) continue;
-              const dy = shortestToroidalDelta(b.y, ast.y, ARENA_HEIGHT);
+              const dy = shortestToroidalDelta(b.y, ast.y, arena.height);
               if (Math.abs(dy) > r) continue;
               if (dx * dx + dy * dy <= r * r) {
                 world.bullets.splice(i, 1);
@@ -2312,6 +3042,8 @@ export default function App() {
                   world.asteroids.splice(aIdx, 1);
                   if (b.ownerId === selfIdRef.current) {
                     localPlayer.score += 25;
+                  } else if (localP2 && b.ownerId === coopIdRef.current) {
+                    localP2.score += 25;
                   }
                 }
                 break;
@@ -2327,9 +3059,9 @@ export default function App() {
             if (other.id === localPlayer.id || !other.alive || other.spectating) continue;
             const otherRadius = (HULL_SPECS[other.hull] || HULL_SPECS.needle).radius;
             const minDist = myRadius + otherRadius;
-            const dx = shortestToroidalDelta(other.x, localPlayer.x, ARENA_WIDTH);
+            const dx = shortestToroidalDelta(other.x, localPlayer.x, arena.width);
             if (Math.abs(dx) > minDist) continue;
-            const dy = shortestToroidalDelta(other.y, localPlayer.y, ARENA_HEIGHT);
+            const dy = shortestToroidalDelta(other.y, localPlayer.y, arena.height);
             if (Math.abs(dy) > minDist) continue;
             const distSq = dx * dx + dy * dy;
             if (distSq <= minDist * minDist) {
@@ -2402,6 +3134,7 @@ export default function App() {
                   peerSyncRef.current?.send({
                     type: 'peer:combat_hit',
                     senderId: selfIdRef.current,
+                    roomId: activeRoom,
                     hitId,
                     targetId: other.id,
                     attackerId: localPlayer.id,
@@ -2423,10 +3156,16 @@ export default function App() {
                 const nx = dx / dist;
                 const ny = dy / dist;
                 const overlap = minDist - dist + 2;
-                localPlayer.x = wrapCoord(localPlayer.x + nx * overlap * 0.6, ARENA_WIDTH);
-                localPlayer.y = wrapCoord(localPlayer.y + ny * overlap * 0.6, ARENA_HEIGHT);
+                localPlayer.x = wrapCoord(localPlayer.x + nx * overlap * 0.6, arena.width);
+                localPlayer.y = wrapCoord(localPlayer.y + ny * overlap * 0.6, arena.height);
                 localPlayer.vx += nx * 130;
                 localPlayer.vy += ny * 130;
+                if (other.id === coopIdRef.current) {
+                  other.x = wrapCoord(other.x - nx * overlap * 0.6, arena.width);
+                  other.y = wrapCoord(other.y - ny * overlap * 0.6, arena.height);
+                  other.vx -= nx * 130;
+                  other.vy -= ny * 130;
+                }
               }
             }
           }
@@ -2434,14 +3173,16 @@ export default function App() {
 
         const currentSpeed = Math.hypot(localPlayer.vx, localPlayer.vy);
         soundEngine.updateThrust(
-          localPlayer.thrusting && !localPlayer.landedPlanetId,
+          (localPlayer.thrusting && !localPlayer.landedPlanetId) ||
+            Boolean(localP2 && localP2.thrusting && !localP2.landedPlanetId),
           currentSpeed
         );
 
         const hullSpec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
         const activeCheats = cheatsRef.current;
 
-        if (!isWsConnected && localPlayer.shooting && localPlayer.alive) {
+        if (localPlayer.shooting && localPlayer.alive) {
+          p1ShotLatch = true;
           const effCooldown =
             activeCheats.novaSpread || activeCheats.rapidFire ? 0 : hullSpec.fireCooldown;
           if (effCooldown === 0 || nowSec - lastOfflineShot >= effCooldown) {
@@ -2481,14 +3222,15 @@ export default function App() {
               isMissile: Boolean(activeCheats.homingMissiles),
               targetIds,
             };
-            world.bullets.push(...expandSalvoToBullets(salvo));
+            world.bullets.push(...expandSalvoToBullets(salvo, activeRoom));
             if (world.bullets.length > 1800) {
               world.bullets.splice(0, world.bullets.length - 1800);
             }
-            if (effCooldown > 0 || nowSec - prevShotTime >= 0.055) {
+            if (!isWsConnected && (effCooldown > 0 || nowSec - prevShotTime >= 0.055)) {
               peerSyncRef.current?.send({
                 type: 'peer:salvo',
                 senderId: selfIdRef.current,
+                roomId: activeRoom,
                 salvo,
               });
             }
@@ -2509,27 +3251,38 @@ export default function App() {
         }
 
         if (sampled.warpJustPressed && localPlayer.alive && !isFreeCam) {
-          handleToggleWarpSpeed();
+          handleToggleWarpSpeedRef.current();
         }
 
         // Compute world-space coordinates for the local mouse cursor when in Free-Cam / Spectator Mode
         if (isFreeCam) {
-          let refCamX = freeCamPosRef.current.x;
-          let refCamY = freeCamPosRef.current.y;
-          if (spectateTargetIdRef.current) {
-            const specTarget = world.players.get(spectateTargetIdRef.current);
-            if (specTarget) {
-              const curCam = renderer.getCameraPosition();
-              refCamX = curCam.x;
-              refCamY = curCam.y;
+          if (arena.fixedCamera) {
+            const worldMouse = renderer.screenToArena(
+              sampled.mouseScreenX,
+              sampled.mouseScreenY,
+              window.innerWidth,
+              window.innerHeight
+            );
+            localPlayer.cursorX = Math.round(wrapCoord(worldMouse.x, arena.width));
+            localPlayer.cursorY = Math.round(wrapCoord(worldMouse.y, arena.height));
+          } else {
+            let refCamX = freeCamPosRef.current.x;
+            let refCamY = freeCamPosRef.current.y;
+            if (spectateTargetIdRef.current) {
+              const specTarget = world.players.get(spectateTargetIdRef.current);
+              if (specTarget) {
+                const curCam = renderer.getCameraPosition();
+                refCamX = curCam.x;
+                refCamY = curCam.y;
+              }
             }
+            localPlayer.cursorX = Math.round(
+              wrapCoord(refCamX + (sampled.mouseScreenX - window.innerWidth * 0.5), arena.width)
+            );
+            localPlayer.cursorY = Math.round(
+              wrapCoord(refCamY + (sampled.mouseScreenY - window.innerHeight * 0.5), arena.height)
+            );
           }
-          localPlayer.cursorX = Math.round(
-            wrapCoord(refCamX + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
-          );
-          localPlayer.cursorY = Math.round(
-            wrapCoord(refCamY + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
-          );
         }
 
         // Attach live Music Box broadcast state, custom Death Sound (.OGG), and Admin Ship PNG to localPlayer
@@ -2544,15 +3297,20 @@ export default function App() {
             peerSyncRef.current?.send({
               type: 'peer:player_state',
               senderId: selfIdRef.current,
+              roomId: activeRoom,
               player: localPlayer,
+              player2: localP2 || undefined,
             });
           }
+          const p1ShootingToSend = Boolean(localPlayer.shooting || p1ShotLatch);
+          p1ShotLatch = false;
           sendWs({
             type: 'player:input',
+            roomId: activeRoom,
             playerId: selfIdRef.current,
             angle: localPlayer.angle,
             thrusting: localPlayer.thrusting,
-            shooting: localPlayer.shooting,
+            shooting: p1ShootingToSend,
             inputSource: sampled.inputSource,
             x: localPlayer.x,
             y: localPlayer.y,
@@ -2570,41 +3328,26 @@ export default function App() {
             landedSurfaceAngle: localPlayer.landedSurfaceAngle,
             cheats: cheatsRef.current,
           });
-        }
-
-        if (coopActiveRef.current) {
-          const p2 = world.players.get(coopIdRef.current);
-          const pads = input.getConnectedGamepads();
-          const pad2 = pads[1] || null;
-          if (p2 && pad2) {
-            const lx = pad2.axes[0] ?? 0;
-            const ly = pad2.axes[1] ?? 0;
-            if (Math.hypot(lx, ly) > input.getMapping().deadzone) {
-              p2.angle = Math.atan2(ly, lx);
-            }
-            p2.thrusting = Boolean(pad2.buttons[7]?.pressed || pad2.buttons[0]?.pressed) && p2.alive;
-            p2.shooting = Boolean(pad2.buttons[5]?.pressed || pad2.buttons[2]?.pressed) && p2.alive;
-            renderer.stepLocalPlayerPhysics(
-              p2,
-              dt,
-              world.gravityStarEnabled,
-              world.planets,
-              world.asteroids
-            );
-            if (now - lastNetSend < 18) {
-              sendWs({
-                type: 'player:input',
-                playerId: coopIdRef.current,
-                angle: p2.angle,
-                thrusting: p2.thrusting,
-                shooting: p2.shooting,
-                inputSource: 'gamepad',
-                x: p2.x,
-                y: p2.y,
-                vx: p2.vx,
-                vy: p2.vy,
-              });
-            }
+          if (coopActiveRef.current && localP2) {
+            const p2ShootingToSend = Boolean(localP2.shooting || p2ShotLatch);
+            p2ShotLatch = false;
+            sendWs({
+              type: 'player:input',
+              roomId: activeRoom,
+              playerId: coopIdRef.current,
+              angle: localP2.angle,
+              thrusting: localP2.thrusting,
+              shooting: p2ShootingToSend,
+              inputSource: localP2.inputSource,
+              x: localP2.x,
+              y: localP2.y,
+              vx: localP2.vx,
+              vy: localP2.vy,
+              deathSound: localP2.deathSound,
+              warping: localP2.warping,
+              landedPlanetId: localP2.landedPlanetId,
+              landedSurfaceAngle: localP2.landedSurfaceAngle,
+            });
           }
         }
       } else {
@@ -2613,7 +3356,10 @@ export default function App() {
           localPlayer.music = musicBoxRef.current.getBroadcastMusicState();
         }
         for (const p of world.players.values()) {
-          if (p.id !== selfIdRef.current) {
+          if (
+            p.id !== selfIdRef.current &&
+            (!coopActiveRef.current || p.id !== coopIdRef.current)
+          ) {
             renderer.stepRemotePlayerSmooth(
               p,
               dt,
@@ -2655,7 +3401,8 @@ export default function App() {
         world.gravityStarEnabled,
         sampled.stickVector,
         isTitle,
-        cameraOverride
+        cameraOverride,
+        localP2
       );
 
       // Update spatial proximity audio from other ships playing music within MUSIC_HEARING_RADIUS (1800u)
@@ -2681,12 +3428,23 @@ export default function App() {
 
       // Keep local cursor world position synced with rendered camera even while paused or right after camera lerp
       if (localPlayer && cheatsRef.current.freeCam) {
-        localPlayer.cursorX = Math.round(
-          wrapCoord(camPos.x + (sampled.mouseScreenX - window.innerWidth * 0.5), ARENA_WIDTH)
-        );
-        localPlayer.cursorY = Math.round(
-          wrapCoord(camPos.y + (sampled.mouseScreenY - window.innerHeight * 0.5), ARENA_HEIGHT)
-        );
+        if (arena.fixedCamera) {
+          const worldMouse = renderer.screenToArena(
+            sampled.mouseScreenX,
+            sampled.mouseScreenY,
+            window.innerWidth,
+            window.innerHeight
+          );
+          localPlayer.cursorX = Math.round(wrapCoord(worldMouse.x, arena.width));
+          localPlayer.cursorY = Math.round(wrapCoord(worldMouse.y, arena.height));
+        } else {
+          localPlayer.cursorX = Math.round(
+            wrapCoord(camPos.x + (sampled.mouseScreenX - window.innerWidth * 0.5), arena.width)
+          );
+          localPlayer.cursorY = Math.round(
+            wrapCoord(camPos.y + (sampled.mouseScreenY - window.innerHeight * 0.5), arena.height)
+          );
+        }
       }
 
       const anyModalOpen =
@@ -2759,13 +3517,7 @@ export default function App() {
       input.destroy();
       soundEngine.stopThrust();
     };
-  }, [
-    handleCycleSpectateTarget,
-    handleStartGame,
-    handleToggleWarpSpeed,
-    handleTriggerCheatAction,
-    sendWs,
-  ]);
+  }, [sendWs]);
 
   const handleUpdateMapping = useCallback((next: ControllerMapping) => {
     setMapping(next);
@@ -2977,11 +3729,106 @@ export default function App() {
             </svg>
 
             {/* Launch Configuration Panel */}
-            <div className="mt-4 w-full rounded-xl border border-slate-800/90 bg-[#0B1120]/95 p-5 text-left shadow-2xl">
+            <div className="mt-3 w-full rounded-xl border border-slate-800/90 bg-[#0B1120]/95 p-4 md:p-5 text-left shadow-2xl">
+              {/* Server Room Mode & Local Players Per Screen Selector */}
+              <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-12 border-b border-slate-800/80 pb-4">
+                <div className="md:col-span-7">
+                  <label className="block text-xs font-medium text-slate-400">
+                    Multiplayer Server Room
+                  </label>
+                  <div className="mt-1.5 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectRoomMode('SECTOR-01')}
+                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                        roomId === 'SECTOR-01'
+                          ? 'border-amber-500 bg-[#111C33] text-white'
+                          : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-display text-xs font-bold text-amber-400">
+                          SECTOR-01 SERVER
+                        </span>
+                        <span className="font-mono-tabular text-[10px] text-slate-400">
+                          Follow Cam
+                        </span>
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-slate-400">
+                        Open Star System · Planets &amp; Deep Space
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleSelectRoomMode('COUCH-COOP')}
+                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                        roomId === 'COUCH-COOP'
+                          ? 'border-cyan-400 bg-[#0F2238] text-white shadow-[0_0_20px_rgba(56,189,248,0.18)]'
+                          : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-display text-xs font-bold text-cyan-300">
+                          COUCH CO-OP SERVER
+                        </span>
+                        <span className="font-mono-tabular text-[10px] text-cyan-400">
+                          Fixed Cam
+                        </span>
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-slate-300">
+                        Screen-Edge Loop Wrap · Online Room
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="md:col-span-5">
+                  <label className="block text-xs font-medium text-slate-400">
+                    Players on This Screen (Max 2)
+                  </label>
+                  <div className="mt-1.5 grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setLocalPlayersCount(1)}
+                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                        localPlayersCount === 1
+                          ? 'border-amber-500 bg-[#111C33] text-white'
+                          : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="font-display text-xs font-bold text-white">
+                        1 Player
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-slate-400">
+                        Solo on this computer
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setLocalPlayersCount(2)}
+                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                        localPlayersCount === 2
+                          ? 'border-emerald-400 bg-[#0D2824] text-white'
+                          : 'border-slate-800 bg-[#060913] text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="font-display text-xs font-bold text-emerald-300">
+                        2 Players (P1+P2)
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-slate-300">
+                        Same screen (2 Max)
+                      </div>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 gap-4 md:grid-cols-12">
                 <div className="md:col-span-7">
                   <label className="block text-xs font-medium text-slate-400">
-                    Pilot Callsign
+                    {localPlayersCount === 2 ? 'Player 1 (P1) Callsign · WASD + Mouse/Space' : 'Pilot Callsign'}
                   </label>
                   <input
                     type="text"
@@ -2995,7 +3842,7 @@ export default function App() {
 
                 <div className="md:col-span-5">
                   <label className="block text-xs font-medium text-slate-400">
-                    Vector Trace Color
+                    {localPlayersCount === 2 ? 'P1 Vector Trace Color' : 'Vector Trace Color'}
                   </label>
                   <div className="mt-2 flex items-center gap-2">
                     {PLAYER_COLORS.slice(0, 6).map((c) => (
@@ -3015,12 +3862,164 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Player 2 Same-Screen Configuration Row (when 2 Players on This Screen is selected) */}
+              {localPlayersCount === 2 && (
+                <div className="mt-3 rounded-lg border border-emerald-500/40 bg-[#060913]/90 p-3">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-12 items-center">
+                    <div className="md:col-span-5">
+                      <label className="block text-[11px] font-medium text-emerald-300">
+                        Player 2 (P2) Callsign · Arrows + Enter/RShift or Pad {mapping.p2ControllerIndex >= 0 ? mapping.p2ControllerIndex + 1 : 'Off'}
+                      </label>
+                      <input
+                        type="text"
+                        maxLength={16}
+                        value={p2Name}
+                        onChange={(e) => setP2Name(e.target.value.toUpperCase())}
+                        placeholder="PILOT-P2"
+                        className="mt-1 w-full rounded-lg border border-slate-700 bg-[#0B1120] px-2.5 py-1.5 font-mono-tabular text-xs text-white focus:border-emerald-400 focus:outline-none"
+                      />
+                    </div>
+                    <div className="md:col-span-4">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        P2 Spacecraft Hull
+                      </label>
+                      <div className="mt-1 grid grid-cols-4 gap-1">
+                        {HULL_LIST.map((hk) => (
+                          <button
+                            key={hk}
+                            type="button"
+                            onClick={() => setP2Hull(hk)}
+                            className={`rounded border px-1.5 py-1 font-display text-[10px] font-bold uppercase ${
+                              p2Hull === hk
+                                ? 'border-emerald-400 bg-emerald-500/20 text-white'
+                                : 'border-slate-800 bg-[#0B1120] text-slate-400 hover:border-slate-700'
+                            }`}
+                          >
+                            {HULL_SPECS[hk].name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="md:col-span-3">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        P2 Color
+                      </label>
+                      <div className="mt-1.5 flex items-center gap-1.5">
+                        {PLAYER_COLORS.slice(0, 6).map((c) => (
+                          <button
+                            key={c}
+                            type="button"
+                            onClick={() => setP2Color(c)}
+                            className={`h-6 w-6 rounded border ${
+                              p2Color === c
+                                ? 'scale-110 border-white'
+                                : 'border-transparent opacity-70 hover:opacity-100'
+                            }`}
+                            style={{ backgroundColor: c }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Quick Controller-to-Ship Assignment Bar (P1 & P2 Controller Mapping) */}
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-[#060913]/90 px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-display font-bold text-amber-400">P1 (Keyboard Always Active):</span>
+                  {[0, 1, 2, 3, -1].map((slot) => (
+                    <button
+                      key={`p1_pad_${slot}`}
+                      type="button"
+                      onClick={() => {
+                        const next: ControllerMapping = {
+                          ...mapping,
+                          p1ControllerIndex: slot,
+                          p2ControllerIndex:
+                            slot >= 0 && mapping.p2ControllerIndex === slot
+                              ? mapping.p1ControllerIndex >= 0
+                                ? mapping.p1ControllerIndex
+                                : (slot + 1) % 4
+                              : mapping.p2ControllerIndex,
+                        };
+                        handleUpdateMapping(next);
+                      }}
+                      className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] font-semibold transition-colors ${
+                        mapping.p1ControllerIndex === slot
+                          ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                          : 'border-slate-800 bg-[#0B1120] text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                      }`}
+                    >
+                      {slot === -1 ? 'KB Only' : slot === 0 ? 'Pad 1 + KB' : `Pad ${slot + 1} + KB`}
+                    </button>
+                  ))}
+                </div>
+
+                {localPlayersCount === 2 && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-display font-bold text-emerald-400">P2 Controller:</span>
+                    {[0, 1, 2, 3, -1].map((slot) => (
+                      <button
+                        key={`p2_pad_${slot}`}
+                        type="button"
+                        onClick={() => {
+                          const next: ControllerMapping = {
+                            ...mapping,
+                            p2ControllerIndex: slot,
+                            p1ControllerIndex:
+                              slot >= 0 && mapping.p1ControllerIndex === slot
+                                ? mapping.p2ControllerIndex >= 0
+                                  ? mapping.p2ControllerIndex
+                                  : (slot + 1) % 4
+                                : mapping.p1ControllerIndex,
+                          };
+                          handleUpdateMapping(next);
+                        }}
+                        className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] font-semibold transition-colors ${
+                          mapping.p2ControllerIndex === slot
+                            ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300'
+                            : 'border-slate-800 bg-[#0B1120] text-slate-400 hover:border-slate-700 hover:text-slate-200'
+                        }`}
+                      >
+                        {slot === -1 ? 'Arrows Only' : `Pad ${slot + 1}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleUpdateMapping({
+                        ...mapping,
+                        p1ControllerIndex: mapping.p2ControllerIndex,
+                        p2ControllerIndex: mapping.p1ControllerIndex,
+                      })
+                    }
+                    className="rounded border border-slate-700 bg-[#0B1120] px-2 py-0.5 font-mono-tabular text-[11px] text-slate-300 hover:border-amber-500/50 hover:text-white whitespace-nowrap"
+                  >
+                    ⇄ Swap P1/P2
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setControllerModalOpen(true)}
+                    className="rounded border border-cyan-500/50 bg-[#0B1120] px-2.5 py-0.5 font-mono-tabular text-[11px] font-semibold text-cyan-300 hover:border-cyan-400 hover:text-white whitespace-nowrap"
+                  >
+                    Map Controllers...
+                  </button>
+                </div>
+              </div>
+
               {/* Ship Hull Selector */}
               <div className="mt-4">
                 <div className="flex items-center justify-between text-xs text-slate-400">
-                  <span>Select Spacecraft Hull</span>
+                  <span>{localPlayersCount === 2 ? 'Select Player 1 (P1) Hull' : 'Select Spacecraft Hull'}</span>
                   <span className="font-mono-tabular text-slate-500">
-                    Zero Friction · Infinite Velocity Accumulation
+                    {roomId === 'COUCH-COOP'
+                      ? 'Fixed Camera · Screen-Edge Loop Wrap · Up to 2 Players/Screen'
+                      : 'Zero Friction · Infinite Velocity Accumulation'}
                   </span>
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2.5 md:grid-cols-4">
@@ -3091,9 +4090,11 @@ export default function App() {
               </div>
 
               {/* Primary Launch Row */}
-              <div className="mt-5 flex flex-col items-center justify-between gap-4 border-t border-slate-800/80 pt-4 sm:flex-row">
+              <div className="mt-4 flex flex-col items-center justify-between gap-4 border-t border-slate-800/80 pt-4 sm:flex-row">
                 <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                  <span>{hud.playerCount} Pilots in Sector</span>
+                  <span>
+                    {hud.playerCount} Pilots in <strong className="text-slate-200">{roomId}</strong>
+                  </span>
                   <span className="text-slate-600">·</span>
                   <button
                     onClick={handleCopyInvite}
@@ -3114,7 +4115,9 @@ export default function App() {
                   onClick={handleStartGame}
                   className="w-full sm:w-auto rounded-lg bg-amber-500 px-7 py-3 font-display text-sm font-bold tracking-wide text-slate-950 transition-colors hover:bg-amber-400 whitespace-nowrap shrink-0"
                 >
-                  Launch Ship · Enter / Start
+                  {roomId === 'COUCH-COOP'
+                    ? `Launch Couch Co-Op (${localPlayersCount}P) · Enter`
+                    : `Launch ${roomId} (${localPlayersCount}P) · Enter`}
                 </button>
               </div>
             </div>
@@ -3122,7 +4125,7 @@ export default function App() {
 
           {/* Single Flat Control-Hint Line at Bottom */}
           <div className="text-center font-mono-tabular text-xs text-slate-400 pointer-events-auto">
-            Joystick Points Exact Ship Direction · RT / A Build Infinite Momentum · RB / X Fire · F / R3 Auto-Fire · Y / E Warp · T / Enter Chat · Esc Pause
+            P1: WASD/Mouse or Pad 1 · P2 (Same Screen): Arrow Keys + Enter/RShift or Pad 2 · F Auto-Fire · E / . Warp · T Chat · Esc Pause
           </div>
         </div>
       )}
@@ -3341,20 +4344,41 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-end gap-2 pointer-events-auto">
                 <button
                   type="button"
+                  onClick={() =>
+                    handleSelectRoomMode(roomId === 'COUCH-COOP' ? 'SECTOR-01' : 'COUCH-COOP')
+                  }
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    roomId === 'COUCH-COOP'
+                      ? 'border-cyan-400/70 bg-cyan-950/80 text-cyan-300 hover:border-cyan-300 hover:text-white'
+                      : 'border-amber-500/50 bg-[#0B1120]/90 text-amber-300 hover:border-amber-400 hover:text-white'
+                  }`}
+                  title="Switch between Open Star System (SECTOR-01) and Fixed-Camera Screen-Wrap Server (COUCH-COOP)"
+                >
+                  {roomId === 'COUCH-COOP'
+                    ? '📺 Room: COUCH-COOP (Switch to SECTOR-01)'
+                    : '🌌 Room: SECTOR-01 (Switch to COUCH-COOP)'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleCoopGamepad}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer ${
+                    hud.localCoopActive
+                      ? 'border-emerald-400/70 bg-emerald-950/70 text-emerald-300 hover:border-emerald-300'
+                      : 'border-slate-800 bg-[#0B1120]/90 text-emerald-400 hover:border-emerald-500/60'
+                  }`}
+                  title="Add or remove a 2nd local player on this same screen (Max 2 per screen; uses Arrow Keys + Enter/RShift or Controller 2)"
+                >
+                  {hud.localCoopActive
+                    ? '2P Same-Screen: ON (Remove P2)'
+                    : '+ Add P2 (Same Screen · Max 2)'}
+                </button>
+                <button
+                  type="button"
                   onClick={handleCopyInvite}
                   className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {copiedInvite ? 'Sector Link Copied!' : `Invite Players (${hud.playerCount} Online)`}
                 </button>
-                {(hud.secondPadAvailable || hud.localCoopActive) && (
-                  <button
-                    type="button"
-                    onClick={handleToggleCoopGamepad}
-                    className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:border-emerald-500/60 whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    {hud.localCoopActive ? 'Remove 2nd Controller' : '+ Join 2nd Controller'}
-                  </button>
-                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -3374,16 +4398,6 @@ export default function App() {
                   className="rounded-lg border border-slate-800 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-amber-500/60 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   Controller Setup
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    inputRef.current?.clearHeldInputs();
-                    setCheatMenuOpen((prev) => !prev);
-                  }}
-                  className="rounded-lg border border-rose-500/40 bg-[#0B1120]/90 px-3 py-1.5 text-xs font-medium text-rose-300 hover:border-rose-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Cheats (K)
                 </button>
                 <button
                   type="button"
@@ -3647,6 +4661,30 @@ export default function App() {
                 </span>
               </div>
               <div className="flex items-center justify-between pt-1">
+                <span className="text-slate-400">Multiplayer Server Room</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleSelectRoomMode(roomId === 'COUCH-COOP' ? 'SECTOR-01' : 'COUCH-COOP')
+                  }
+                  className="rounded border border-cyan-500/50 px-2.5 py-1 text-xs text-cyan-300 hover:border-cyan-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {roomId === 'COUCH-COOP'
+                    ? 'COUCH-COOP (Fixed Cam · Loop)'
+                    : 'SECTOR-01 (Open Star System)'}
+                </button>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-slate-400">Players on This Screen (Max 2)</span>
+                <button
+                  type="button"
+                  onClick={handleToggleCoopGamepad}
+                  className="rounded border border-emerald-500/50 px-2.5 py-1 text-xs text-emerald-300 hover:border-emerald-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {hud.localCoopActive ? '2 Players (P1 + P2 Active)' : '1 Player (Click to Add P2)'}
+                </button>
+              </div>
+              <div className="flex items-center justify-between pt-1">
                 <span className="text-slate-400">Central Gravity Star</span>
                 <button
                   type="button"
@@ -3673,16 +4711,6 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setShellState('PLAYING');
-                  setCheatMenuOpen(true);
-                }}
-                className="w-full rounded-lg border border-rose-500/50 py-2.5 text-xs font-medium text-rose-300 hover:border-rose-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Cheat & Experimental Weapons Menu (K)
-              </button>
-              <button
-                type="button"
                 onClick={() => setDeathSoundModalOpen(true)}
                 className="w-full rounded-lg border border-amber-500/50 py-2.5 text-xs font-medium text-amber-300 hover:border-amber-400 hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
               >
@@ -3706,9 +4734,20 @@ export default function App() {
                   peerSyncRef.current?.send({
                     type: 'peer:player_leave',
                     senderId: selfIdRef.current,
+                    roomId: roomIdRef.current,
                     playerId: selfIdRef.current,
                   });
                   sendWs({ type: 'player:leave', playerId: selfIdRef.current });
+                  if (coopActiveRef.current) {
+                    worldRef.current.players.delete(coopIdRef.current);
+                    peerSyncRef.current?.send({
+                      type: 'peer:player_leave',
+                      senderId: selfIdRef.current,
+                      roomId: roomIdRef.current,
+                      playerId: coopIdRef.current,
+                    });
+                    sendWs({ type: 'player:leave', playerId: coopIdRef.current });
+                  }
                   setShellState('TITLE_MENU');
                 }}
                 className="w-full rounded-lg border border-slate-800 py-2.5 text-xs font-medium text-slate-400 hover:border-slate-700 hover:text-slate-200 whitespace-nowrap shrink-0 cursor-pointer"

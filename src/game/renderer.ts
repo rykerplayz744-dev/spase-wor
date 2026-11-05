@@ -3,10 +3,10 @@ import {
   ARENA_WIDTH,
   AsteroidState,
   BulletState,
+  getRoomArenaConfig,
   GRAVITY_STAR_RADIUS,
   GRAVITY_STAR_X,
   GRAVITY_STAR_Y,
-  GRAVITY_STRENGTH,
   HULL_SPECS,
   MUSIC_HEARING_RADIUS,
   PLANET_LANDING_SPEED_THRESHOLD,
@@ -39,6 +39,7 @@ export interface StarPoint {
 }
 
 export function wrapCoord(val: number, max: number): number {
+  if (!Number.isFinite(val)) return max * 0.5;
   return ((val % max) + max) % max;
 }
 
@@ -118,6 +119,7 @@ export class SpacewarRenderer {
   public hitFlashes = new Map<string, number>();
   public cameraShake = 0;
   public hitstopTimer = 0;
+  private roomId: string = 'SECTOR-01';
   private camX = GRAVITY_STAR_X;
   private camY = GRAVITY_STAR_Y;
   private lastCursorTrail = new Map<string, { x: number; y: number }>();
@@ -159,13 +161,88 @@ export class SpacewarRenderer {
     }
   }
 
+  public setRoomId(roomId: string) {
+    const clean = roomId === 'COUCH-COOP' ? 'COUCH-COOP' : 'SECTOR-01';
+    if (this.roomId !== clean) {
+      this.roomId = clean;
+      const arena = getRoomArenaConfig(clean);
+      this.camX = arena.starX;
+      this.camY = arena.starY;
+      this.particles.length = 0;
+    }
+  }
+
+  public getRoomId(): string {
+    return this.roomId;
+  }
+
   public getCameraPosition(): { x: number; y: number } {
     return { x: this.camX, y: this.camY };
   }
 
   public setCameraPosition(x: number, y: number) {
-    this.camX = wrapCoord(x, ARENA_WIDTH);
-    this.camY = wrapCoord(y, ARENA_HEIGHT);
+    const arena = getRoomArenaConfig(this.roomId);
+    this.camX = wrapCoord(x, arena.width);
+    this.camY = wrapCoord(y, arena.height);
+  }
+
+  /**
+   * Converts world/arena coordinates to actual browser screen coordinates,
+   * accounting for the fixed-camera scaled viewport in COUCH-COOP mode.
+   */
+  public arenaToScreen(
+    wx: number,
+    wy: number,
+    viewWidth: number,
+    viewHeight: number
+  ): { sx: number; sy: number } {
+    const arena = getRoomArenaConfig(this.roomId);
+    if (arena.isCouch) {
+      const scale = Math.min(viewWidth / arena.width, viewHeight / arena.height);
+      const offsetX = (viewWidth - arena.width * scale) * 0.5;
+      const offsetY = (viewHeight - arena.height * scale) * 0.5;
+      return {
+        sx: offsetX + wx * scale,
+        sy: offsetY + wy * scale,
+      };
+    }
+    const dx = shortestToroidalDelta(this.camX, wx, arena.width);
+    const dy = shortestToroidalDelta(this.camY, wy, arena.height);
+    return {
+      sx: viewWidth * 0.5 + dx,
+      sy: viewHeight * 0.5 + dy,
+    };
+  }
+
+  /**
+   * Converts browser mouse screen coordinates into world/arena coordinates.
+   */
+  public screenToArena(
+    clientX: number,
+    clientY: number,
+    viewWidth: number,
+    viewHeight: number,
+    refCamX?: number,
+    refCamY?: number
+  ): { x: number; y: number } {
+    const arena = getRoomArenaConfig(this.roomId);
+    if (arena.isCouch) {
+      const scale = Math.min(viewWidth / arena.width, viewHeight / arena.height);
+      const offsetX = (viewWidth - arena.width * scale) * 0.5;
+      const offsetY = (viewHeight - arena.height * scale) * 0.5;
+      const ax = (clientX - offsetX) / Math.max(0.01, scale);
+      const ay = (clientY - offsetY) / Math.max(0.01, scale);
+      return {
+        x: Math.round(wrapCoord(ax, arena.width)),
+        y: Math.round(wrapCoord(ay, arena.height)),
+      };
+    }
+    const cx = refCamX ?? this.camX;
+    const cy = refCamY ?? this.camY;
+    return {
+      x: Math.round(wrapCoord(cx + (clientX - viewWidth * 0.5), arena.width)),
+      y: Math.round(wrapCoord(cy + (clientY - viewHeight * 0.5), arena.height)),
+    };
   }
 
   public addBurst(
@@ -202,11 +279,12 @@ export class SpacewarRenderer {
   }
 
   public stepClientPlanets(planets: PlanetState[], dt: number) {
+    const arena = getRoomArenaConfig(this.roomId);
     for (let i = 0; i < planets.length; i++) {
       const p = planets[i];
       p.orbitAngle = (p.orbitAngle + p.orbitSpeed * dt) % (Math.PI * 2);
-      p.x = GRAVITY_STAR_X + Math.cos(p.orbitAngle) * p.orbitRadius;
-      p.y = GRAVITY_STAR_Y + Math.sin(p.orbitAngle) * p.orbitRadius;
+      p.x = arena.starX + Math.cos(p.orbitAngle) * p.orbitRadius;
+      p.y = arena.starY + Math.sin(p.orbitAngle) * p.orbitRadius;
       p.vx = -Math.sin(p.orbitAngle) * p.orbitSpeed * p.orbitRadius;
       p.vy = Math.cos(p.orbitAngle) * p.orbitSpeed * p.orbitRadius;
     }
@@ -230,6 +308,8 @@ export class SpacewarRenderer {
     ) => void
   ) {
     if (!player.alive) return;
+
+    const arena = getRoomArenaConfig(this.roomId);
 
     if (player.cheats?.godMode) {
       player.hp = player.maxHp;
@@ -256,11 +336,11 @@ export class SpacewarRenderer {
         }
         const rearX = wrapCoord(
           player.x - Math.cos(player.angle) * (spec.radius * 1.1),
-          ARENA_WIDTH
+          arena.width
         );
         const rearY = wrapCoord(
           player.y - Math.sin(player.angle) * (spec.radius * 1.1),
-          ARENA_HEIGHT
+          arena.height
         );
         const spread = (Math.random() - 0.5) * 0.55;
         const ejectAngle = player.angle + Math.PI + spread;
@@ -280,8 +360,8 @@ export class SpacewarRenderer {
         });
       }
 
-      player.x = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
-      player.y = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+      player.x = wrapCoord(player.x + player.vx * dt, arena.width);
+      player.y = wrapCoord(player.y + player.vy * dt, arena.height);
       if (warpSpd > player.peakSpeed) {
         player.peakSpeed = Math.round(warpSpd);
       }
@@ -306,8 +386,8 @@ export class SpacewarRenderer {
           const outX = Math.cos(surfaceAngle);
           const outY = Math.sin(surfaceAngle);
           const launchDist = landedPlanet.radius + spec.radius + 9;
-          player.x = wrapCoord(landedPlanet.x + outX * launchDist, ARENA_WIDTH);
-          player.y = wrapCoord(landedPlanet.y + outY * launchDist, ARENA_HEIGHT);
+          player.x = wrapCoord(landedPlanet.x + outX * launchDist, arena.width);
+          player.y = wrapCoord(landedPlanet.y + outY * launchDist, arena.height);
           const launchBoost = Math.max(195, spec.thrustAccel * 0.36);
           player.vx = landedPlanet.vx + Math.cos(player.angle) * launchBoost + outX * 85;
           player.vy = landedPlanet.vy + Math.sin(player.angle) * launchBoost + outY * 85;
@@ -316,11 +396,11 @@ export class SpacewarRenderer {
           const anchorDist = landedPlanet.radius + spec.radius + 2;
           player.x = wrapCoord(
             landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
-            ARENA_WIDTH
+            arena.width
           );
           player.y = wrapCoord(
             landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
-            ARENA_HEIGHT
+            arena.height
           );
           player.vx = landedPlanet.vx;
           player.vy = landedPlanet.vy;
@@ -339,8 +419,8 @@ export class SpacewarRenderer {
 
       // Spawn thruster exhaust particles opposite to facing direction
       if (Math.random() < 0.85) {
-        const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 0.85), ARENA_WIDTH);
-        const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 0.85), ARENA_HEIGHT);
+        const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 0.85), arena.width);
+        const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 0.85), arena.height);
         const spread = (Math.random() - 0.5) * 0.42;
         const ejectAngle = player.angle + Math.PI + spread;
         const ejectSpeed = 160 + Math.random() * 140;
@@ -358,14 +438,16 @@ export class SpacewarRenderer {
       }
     }
 
-    // 2. Apply central Gravity Star pull (scaled 10x)
+    // 2. Apply central Gravity Star pull
     if (gravityStarEnabled) {
-      const dx = GRAVITY_STAR_X - player.x;
-      const dy = GRAVITY_STAR_Y - player.y;
+      const dx = arena.starX - player.x;
+      const dy = arena.starY - player.y;
       const distSq = dx * dx + dy * dy;
       const dist = Math.sqrt(distSq);
-      if (dist < 9500 && dist > 100) {
-        const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
+      const maxPullRange = arena.isCouch ? 1100 : 9500;
+      const minClampSq = arena.isCouch ? 22000 : 280000;
+      if (dist < maxPullRange && dist > arena.starRadius * 0.4) {
+        const pullAccel = Math.min(620, arena.gravityStrength / Math.max(minClampSq, distSq));
         player.vx += (dx / dist) * pullAccel * dt;
         player.vy += (dy / dist) * pullAccel * dt;
       }
@@ -374,8 +456,8 @@ export class SpacewarRenderer {
     // 2b. Apply Orbiting Planets gravity slingshots before integrating position
     for (let i = 0; i < planets.length; i++) {
       const planet = planets[i];
-      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(player.x, planet.x, arena.width);
+      const dy = shortestToroidalDelta(player.y, planet.y, arena.height);
       const distSq = dx * dx + dy * dy;
       const minSep = spec.radius + planet.radius;
       if (distSq >= minSep * minSep && distSq < (planet.radius * 5.5) ** 2 && distSq > 1000) {
@@ -386,15 +468,15 @@ export class SpacewarRenderer {
       }
     }
 
-    // 3. Toroidal position integration
-    player.x = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
-    player.y = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+    // 3. Toroidal / Screen-Edge Loop position integration
+    player.x = wrapCoord(player.x + player.vx * dt, arena.width);
+    player.y = wrapCoord(player.y + player.vy * dt, arena.height);
 
     // 4. Check Asteroid collisions & damage
     for (let i = 0; i < asteroids.length; i++) {
       const ast = asteroids[i];
-      const dx = shortestToroidalDelta(ast.x, player.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(ast.y, player.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(ast.x, player.x, arena.width);
+      const dy = shortestToroidalDelta(ast.y, player.y, arena.height);
       const minSep = spec.radius + ast.radius * 0.9;
       if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
       const distSq = dx * dx + dy * dy;
@@ -409,8 +491,8 @@ export class SpacewarRenderer {
         const relSpeed = Math.hypot(relVx, relVy);
         const impactSpeed = Math.max(preSpeed, relSpeed);
 
-        player.x = wrapCoord(ast.x + nx * (minSep + 3), ARENA_WIDTH);
-        player.y = wrapCoord(ast.y + ny * (minSep + 3), ARENA_HEIGHT);
+        player.x = wrapCoord(ast.x + nx * (minSep + 3), arena.width);
+        player.y = wrapCoord(ast.y + ny * (minSep + 3), arena.height);
 
         const normalVel = relVx * nx + relVy * ny;
         if (normalVel < 0) {
@@ -442,8 +524,8 @@ export class SpacewarRenderer {
     // 5. Check Planet collisions: slow landing (<= 500 u/s) vs high-speed surface crash & damage (> 500 u/s)
     for (let i = 0; i < planets.length; i++) {
       const planet = planets[i];
-      const dx = shortestToroidalDelta(player.x, planet.x, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(player.y, planet.y, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(player.x, planet.x, arena.width);
+      const dy = shortestToroidalDelta(player.y, planet.y, arena.height);
       const minSep = spec.radius + planet.radius;
       if (Math.abs(dx) > minSep || Math.abs(dy) > minSep) continue;
       const distSq = dx * dx + dy * dy;
@@ -464,8 +546,8 @@ export class SpacewarRenderer {
           player.landedPlanetId = planet.id;
           player.landedSurfaceAngle = surfaceAngle;
           const anchorDist = planet.radius + spec.radius + 2;
-          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, ARENA_WIDTH);
-          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, ARENA_HEIGHT);
+          player.x = wrapCoord(planet.x + Math.cos(surfaceAngle) * anchorDist, arena.width);
+          player.y = wrapCoord(planet.y + Math.sin(surfaceAngle) * anchorDist, arena.height);
           player.vx = planet.vx;
           player.vy = planet.vy;
           this.addBurst(
@@ -481,8 +563,8 @@ export class SpacewarRenderer {
           return;
         }
 
-        player.x = wrapCoord(planet.x + nx * (minSep + 4), ARENA_WIDTH);
-        player.y = wrapCoord(planet.y + ny * (minSep + 4), ARENA_HEIGHT);
+        player.x = wrapCoord(planet.x + nx * (minSep + 4), arena.width);
+        player.y = wrapCoord(planet.y + ny * (minSep + 4), arena.height);
 
         const normalVel = relVx * nx + relVy * ny;
         if (normalVel < 0) {
@@ -528,6 +610,8 @@ export class SpacewarRenderer {
     gravityStarEnabled: boolean,
     planets: PlanetState[] = []
   ) {
+    const arena = getRoomArenaConfig(this.roomId);
+
     // 1. Smoothly interpolate remote spectator cursor if detached in Free-Cam / Spectate
     if (
       player.spectating &&
@@ -538,11 +622,11 @@ export class SpacewarRenderer {
         player.cursorX = player.netTargetCursorX;
         player.cursorY = player.netTargetCursorY;
       } else {
-        const cdx = shortestToroidalDelta(player.cursorX, player.netTargetCursorX, ARENA_WIDTH);
-        const cdy = shortestToroidalDelta(player.cursorY, player.netTargetCursorY, ARENA_HEIGHT);
+        const cdx = shortestToroidalDelta(player.cursorX, player.netTargetCursorX, arena.width);
+        const cdy = shortestToroidalDelta(player.cursorY, player.netTargetCursorY, arena.height);
         const cursorLerp = 1 - Math.exp(-18 * dt);
-        player.cursorX = wrapCoord(player.cursorX + cdx * cursorLerp, ARENA_WIDTH);
-        player.cursorY = wrapCoord(player.cursorY + cdy * cursorLerp, ARENA_HEIGHT);
+        player.cursorX = wrapCoord(player.cursorX + cdx * cursorLerp, arena.width);
+        player.cursorY = wrapCoord(player.cursorY + cdy * cursorLerp, arena.height);
       }
     }
 
@@ -557,11 +641,11 @@ export class SpacewarRenderer {
       player.thrusting = false;
       player.shooting = false;
       if (typeof player.netTargetX === 'number' && typeof player.netTargetY === 'number') {
-        const dx = shortestToroidalDelta(player.x, player.netTargetX, ARENA_WIDTH);
-        const dy = shortestToroidalDelta(player.y, player.netTargetY, ARENA_HEIGHT);
+        const dx = shortestToroidalDelta(player.x, player.netTargetX, arena.width);
+        const dy = shortestToroidalDelta(player.y, player.netTargetY, arena.height);
         const posLerp = 1 - Math.exp(-12 * dt);
-        player.x = wrapCoord(player.x + dx * posLerp, ARENA_WIDTH);
-        player.y = wrapCoord(player.y + dy * posLerp, ARENA_HEIGHT);
+        player.x = wrapCoord(player.x + dx * posLerp, arena.width);
+        player.y = wrapCoord(player.y + dy * posLerp, arena.height);
       }
       return;
     }
@@ -578,11 +662,11 @@ export class SpacewarRenderer {
         const anchorDist = landedPlanet.radius + spec.radius + 2;
         player.x = wrapCoord(
           landedPlanet.x + Math.cos(surfaceAngle) * anchorDist,
-          ARENA_WIDTH
+          arena.width
         );
         player.y = wrapCoord(
           landedPlanet.y + Math.sin(surfaceAngle) * anchorDist,
-          ARENA_HEIGHT
+          arena.height
         );
         player.vx = landedPlanet.vx;
         player.vy = landedPlanet.vy;
@@ -614,12 +698,14 @@ export class SpacewarRenderer {
     }
 
     if (gravityStarEnabled) {
-      const sdx = GRAVITY_STAR_X - tx;
-      const sdy = GRAVITY_STAR_Y - ty;
+      const sdx = arena.starX - tx;
+      const sdy = arena.starY - ty;
       const distSq = sdx * sdx + sdy * sdy;
       const dist = Math.sqrt(distSq);
-      if (dist < 9500 && dist > 100) {
-        const pullAccel = Math.min(620, GRAVITY_STRENGTH / Math.max(280000, distSq));
+      const maxPullRange = arena.isCouch ? 1100 : 9500;
+      const minClampSq = arena.isCouch ? 22000 : 280000;
+      if (dist < maxPullRange && dist > arena.starRadius * 0.4) {
+        const pullAccel = Math.min(620, arena.gravityStrength / Math.max(minClampSq, distSq));
         tvx += (sdx / dist) * pullAccel * dt;
         tvy += (sdy / dist) * pullAccel * dt;
       }
@@ -638,8 +724,8 @@ export class SpacewarRenderer {
       }
     }
 
-    tx = wrapCoord(tx + tvx * dt, ARENA_WIDTH);
-    ty = wrapCoord(ty + tvy * dt, ARENA_HEIGHT);
+    tx = wrapCoord(tx + tvx * dt, arena.width);
+    ty = wrapCoord(ty + tvy * dt, arena.height);
 
     player.netTargetX = tx;
     player.netTargetY = ty;
@@ -651,15 +737,15 @@ export class SpacewarRenderer {
     player.vx += (tvx - player.vx) * velLerp;
     player.vy += (tvy - player.vy) * velLerp;
 
-    const nextPredX = wrapCoord(player.x + player.vx * dt, ARENA_WIDTH);
-    const nextPredY = wrapCoord(player.y + player.vy * dt, ARENA_HEIGHT);
+    const nextPredX = wrapCoord(player.x + player.vx * dt, arena.width);
+    const nextPredY = wrapCoord(player.y + player.vy * dt, arena.height);
 
-    const errX = shortestToroidalDelta(nextPredX, tx, ARENA_WIDTH);
-    const errY = shortestToroidalDelta(nextPredY, ty, ARENA_HEIGHT);
+    const errX = shortestToroidalDelta(nextPredX, tx, arena.width);
+    const errY = shortestToroidalDelta(nextPredY, ty, arena.height);
     const posLerp = 1 - Math.exp(-11 * dt);
 
-    player.x = wrapCoord(nextPredX + errX * posLerp, ARENA_WIDTH);
-    player.y = wrapCoord(nextPredY + errY * posLerp, ARENA_HEIGHT);
+    player.x = wrapCoord(nextPredX + errX * posLerp, arena.width);
+    player.y = wrapCoord(nextPredY + errY * posLerp, arena.height);
 
     const angleDiff = normalizeAngleDiff(tAngle - player.angle);
     const angleLerp = 1 - Math.exp(-18 * dt);
@@ -667,8 +753,8 @@ export class SpacewarRenderer {
 
     // Emit thruster or warp exhaust particles for remote ships
     if (player.warping && this.particles.length < 440) {
-      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 1.1), ARENA_WIDTH);
-      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 1.1), ARENA_HEIGHT);
+      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 1.1), arena.width);
+      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 1.1), arena.height);
       this.particles.push({
         x: rearX,
         y: rearY,
@@ -683,8 +769,8 @@ export class SpacewarRenderer {
         angle: player.angle,
       });
     } else if (player.thrusting && Math.random() < 0.75 && this.particles.length < 440) {
-      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 0.85), ARENA_WIDTH);
-      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 0.85), ARENA_HEIGHT);
+      const rearX = wrapCoord(player.x - Math.cos(player.angle) * (spec.radius * 0.85), arena.width);
+      const rearY = wrapCoord(player.y - Math.sin(player.angle) * (spec.radius * 0.85), arena.height);
       const spread = (Math.random() - 0.5) * 0.42;
       const ejectAngle = player.angle + Math.PI + spread;
       const ejectSpeed = 160 + Math.random() * 140;
@@ -710,8 +796,9 @@ export class SpacewarRenderer {
     planets: PlanetState[] = [],
     gravityStarEnabled: boolean = true
   ) {
+    const arena = getRoomArenaConfig(this.roomId);
     let astMap: Map<string, AsteroidState> | null = null;
-    const starHitRadius = GRAVITY_STAR_RADIUS * 0.85;
+    const starHitRadius = arena.starRadius * 0.85;
     const starHitRadiusSq = starHitRadius * starHitRadius;
 
     for (let i = bullets.length - 1; i >= 0; i--) {
@@ -743,8 +830,8 @@ export class SpacewarRenderer {
           let bestDistSq = Infinity;
           for (const p of players.values()) {
             if (!p.alive || p.id === b.ownerId) continue;
-            const dx = shortestToroidalDelta(b.x, p.x, ARENA_WIDTH);
-            const dy = shortestToroidalDelta(b.y, p.y, ARENA_HEIGHT);
+            const dx = shortestToroidalDelta(b.x, p.x, arena.width);
+            const dy = shortestToroidalDelta(b.y, p.y, arena.height);
             const dSq = dx * dx + dy * dy;
             if (dSq < bestDistSq) {
               bestDistSq = dSq;
@@ -757,8 +844,8 @@ export class SpacewarRenderer {
         }
 
         if (target) {
-          const dx = shortestToroidalDelta(b.x, target.x + target.vx * 0.12, ARENA_WIDTH);
-          const dy = shortestToroidalDelta(b.y, target.y + target.vy * 0.12, ARENA_HEIGHT);
+          const dx = shortestToroidalDelta(b.x, target.x + target.vx * 0.12, arena.width);
+          const dy = shortestToroidalDelta(b.y, target.y + target.vy * 0.12, arena.height);
           const desiredAngle = Math.atan2(dy, dx);
           const diff = normalizeAngleDiff(desiredAngle - b.angle);
           const maxTurn = (b.turnRate || 6.4) * dt;
@@ -771,12 +858,12 @@ export class SpacewarRenderer {
         }
       }
 
-      b.x = wrapCoord(b.x + b.vx * dt, ARENA_WIDTH);
-      b.y = wrapCoord(b.y + b.vy * dt, ARENA_HEIGHT);
+      b.x = wrapCoord(b.x + b.vx * dt, arena.width);
+      b.y = wrapCoord(b.y + b.vy * dt, arena.height);
 
       if (gravityStarEnabled) {
-        const sdx = b.x - GRAVITY_STAR_X;
-        const sdy = b.y - GRAVITY_STAR_Y;
+        const sdx = b.x - arena.starX;
+        const sdy = b.y - arena.starY;
         if (
           Math.abs(sdx) <= starHitRadius &&
           Math.abs(sdy) <= starHitRadius &&
@@ -813,8 +900,8 @@ export class SpacewarRenderer {
 
   public render(
     ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
+    screenWidth: number,
+    screenHeight: number,
     dt: number,
     nowSec: number,
     localPlayer: PlayerState | null,
@@ -830,8 +917,11 @@ export class SpacewarRenderer {
       x: number;
       y: number;
       targetId?: string | null;
-    } | null
+    } | null,
+    localPlayer2?: PlayerState | null
   ) {
+    const arena = getRoomArenaConfig(this.roomId);
+
     // Update camera shake & hit flashes
     if (this.cameraShake > 0) {
       this.cameraShake = Math.max(0, this.cameraShake - dt * 28);
@@ -849,16 +939,46 @@ export class SpacewarRenderer {
         this.particles.splice(i, 1);
         continue;
       }
-      p.x = wrapCoord(p.x + p.vx * dt, ARENA_WIDTH);
-      p.y = wrapCoord(p.y + p.vy * dt, ARENA_HEIGHT);
+      p.x = wrapCoord(p.x + p.vx * dt, arena.width);
+      p.y = wrapCoord(p.y + p.vy * dt, arena.height);
       p.alpha = Math.max(0, p.life / p.maxLife);
     }
 
-    // Smooth camera tracking (supports normal ship lock, Free-Cam flight, and Spectating other players)
-    if (isTitleMode || !localPlayer) {
+    // Clear full browser viewport first
+    ctx.fillStyle = '#060913';
+    ctx.fillRect(0, 0, screenWidth, screenHeight);
+
+    let width = screenWidth;
+    let height = screenHeight;
+    let couchTransformApplied = false;
+
+    if (arena.isCouch) {
+      // Fixed-camera Couch Co-Op Server:
+      // The camera is permanently fixed at the center of the 1920x1080 arena,
+      // and any player/projectile crossing 0..1920 or 0..1080 immediately loops to the opposite side!
+      this.camX = arena.starX;
+      this.camY = arena.starY;
+
+      const scale = Math.min(screenWidth / arena.width, screenHeight / arena.height);
+      const offsetX = (screenWidth - arena.width * scale) * 0.5;
+      const offsetY = (screenHeight - arena.height * scale) * 0.5;
+
+      ctx.save();
+      couchTransformApplied = true;
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+
+      // Clip to the exact fixed screen boundaries (0..1920 x 0..1080)
+      ctx.beginPath();
+      ctx.rect(0, 0, arena.width, arena.height);
+      ctx.clip();
+
+      width = arena.width;
+      height = arena.height;
+    } else if (isTitleMode || !localPlayer) {
       // Slow orbital pan around the Gravity Star on Title Screen
-      this.camX = GRAVITY_STAR_X + Math.cos(nowSec * 0.22) * 240;
-      this.camY = GRAVITY_STAR_Y + Math.sin(nowSec * 0.22) * 140;
+      this.camX = arena.starX + Math.cos(nowSec * 0.22) * 240;
+      this.camY = arena.starY + Math.sin(nowSec * 0.22) * 140;
     } else if (cameraOverride) {
       const spectatedPlayer =
         cameraOverride.mode === 'spectate' && cameraOverride.targetId
@@ -868,31 +988,31 @@ export class SpacewarRenderer {
       if (spectatedPlayer) {
         const lookAheadX = Math.max(-140, Math.min(140, spectatedPlayer.vx * 0.08));
         const lookAheadY = Math.max(-100, Math.min(100, spectatedPlayer.vy * 0.08));
-        const targetX = wrapCoord(spectatedPlayer.x + lookAheadX, ARENA_WIDTH);
-        const targetY = wrapCoord(spectatedPlayer.y + lookAheadY, ARENA_HEIGHT);
+        const targetX = wrapCoord(spectatedPlayer.x + lookAheadX, arena.width);
+        const targetY = wrapCoord(spectatedPlayer.y + lookAheadY, arena.height);
 
-        const dx = shortestToroidalDelta(this.camX, targetX, ARENA_WIDTH);
-        const dy = shortestToroidalDelta(this.camY, targetY, ARENA_HEIGHT);
+        const dx = shortestToroidalDelta(this.camX, targetX, arena.width);
+        const dy = shortestToroidalDelta(this.camY, targetY, arena.height);
         const lerp = 1 - Math.exp(-14 * dt);
-        this.camX = wrapCoord(this.camX + dx * lerp, ARENA_WIDTH);
-        this.camY = wrapCoord(this.camY + dy * lerp, ARENA_HEIGHT);
+        this.camX = wrapCoord(this.camX + dx * lerp, arena.width);
+        this.camY = wrapCoord(this.camY + dy * lerp, arena.height);
       } else {
         // Free-Cam detached flight
-        this.camX = wrapCoord(cameraOverride.x, ARENA_WIDTH);
-        this.camY = wrapCoord(cameraOverride.y, ARENA_HEIGHT);
+        this.camX = wrapCoord(cameraOverride.x, arena.width);
+        this.camY = wrapCoord(cameraOverride.y, arena.height);
       }
     } else {
       // Snap toroidal camera smoothly to local player with slight velocity lookahead
       const lookAheadX = Math.max(-140, Math.min(140, localPlayer.vx * 0.08));
       const lookAheadY = Math.max(-100, Math.min(100, localPlayer.vy * 0.08));
-      const targetX = wrapCoord(localPlayer.x + lookAheadX, ARENA_WIDTH);
-      const targetY = wrapCoord(localPlayer.y + lookAheadY, ARENA_HEIGHT);
+      const targetX = wrapCoord(localPlayer.x + lookAheadX, arena.width);
+      const targetY = wrapCoord(localPlayer.y + lookAheadY, arena.height);
 
-      const dx = shortestToroidalDelta(this.camX, targetX, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(this.camY, targetY, ARENA_HEIGHT);
+      const dx = shortestToroidalDelta(this.camX, targetX, arena.width);
+      const dy = shortestToroidalDelta(this.camY, targetY, arena.height);
       const lerp = 1 - Math.exp(-14 * dt);
-      this.camX = wrapCoord(this.camX + dx * lerp, ARENA_WIDTH);
-      this.camY = wrapCoord(this.camY + dy * lerp, ARENA_HEIGHT);
+      this.camX = wrapCoord(this.camX + dx * lerp, arena.width);
+      this.camY = wrapCoord(this.camY + dy * lerp, arena.height);
     }
 
     const shakeX = this.cameraShake > 0 ? (Math.random() - 0.5) * this.cameraShake * 2.2 : 0;
@@ -901,8 +1021,16 @@ export class SpacewarRenderer {
     const viewCenterY = height * 0.5 + shakeY;
 
     const worldToScreen = (wx: number, wy: number) => {
-      const dx = shortestToroidalDelta(this.camX, wx, ARENA_WIDTH);
-      const dy = shortestToroidalDelta(this.camY, wy, ARENA_HEIGHT);
+      if (arena.isCouch) {
+        return {
+          sx: wx + shakeX,
+          sy: wy + shakeY,
+          dx: wx - arena.starX,
+          dy: wy - arena.starY,
+        };
+      }
+      const dx = shortestToroidalDelta(this.camX, wx, arena.width);
+      const dy = shortestToroidalDelta(this.camY, wy, arena.height);
       return {
         sx: viewCenterX + dx,
         sy: viewCenterY + dy,
@@ -911,22 +1039,22 @@ export class SpacewarRenderer {
       };
     };
 
-    // 1. Clear Deep Space Canvas (#060913)
-    ctx.fillStyle = '#060913';
-    ctx.fillRect(0, 0, width, height);
-
     // 2. Render Subtle Toroidal Vector Coordinate Grid
-    const gridSpacing = 200;
+    const gridSpacing = arena.isCouch ? 120 : 200;
     ctx.strokeStyle = 'rgba(30, 41, 59, 0.38)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    const offsetX = ((viewCenterX - this.camX) % gridSpacing + gridSpacing) % gridSpacing;
-    const offsetY = ((viewCenterY - this.camY) % gridSpacing + gridSpacing) % gridSpacing;
-    for (let x = offsetX; x < width; x += gridSpacing) {
+    const offsetX = arena.isCouch
+      ? 0
+      : (((viewCenterX - this.camX) % gridSpacing) + gridSpacing) % gridSpacing;
+    const offsetY = arena.isCouch
+      ? 0
+      : (((viewCenterY - this.camY) % gridSpacing) + gridSpacing) % gridSpacing;
+    for (let x = offsetX; x <= width; x += gridSpacing) {
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
     }
-    for (let y = offsetY; y < height; y += gridSpacing) {
+    for (let y = offsetY; y <= height; y += gridSpacing) {
       ctx.moveTo(0, y);
       ctx.lineTo(width, y);
     }
@@ -934,15 +1062,18 @@ export class SpacewarRenderer {
 
     // 3. Render Multi-Layer Parallax Starfield (+ high-momentum velocity streaks!)
     const localSpeed = localPlayer ? Math.hypot(localPlayer.vx, localPlayer.vy) : 0;
-    const streakFactor = localPlayer && localSpeed > 450 ? Math.min(28, (localSpeed - 450) * 0.015) : 0;
+    const streakFactor =
+      !arena.isCouch && localPlayer && localSpeed > 450
+        ? Math.min(28, (localSpeed - 450) * 0.015)
+        : 0;
     const velUnitX = localPlayer && localSpeed > 1 ? localPlayer.vx / localSpeed : 0;
     const velUnitY = localPlayer && localSpeed > 1 ? localPlayer.vy / localSpeed : 0;
 
     for (const star of this.stars) {
       const dx = shortestToroidalDelta(this.camX * star.depth, star.x, ARENA_WIDTH);
       const dy = shortestToroidalDelta(this.camY * star.depth, star.y, ARENA_HEIGHT);
-      const sx = ((viewCenterX + dx) % width + width) % width;
-      const sy = ((viewCenterY + dy) % height + height) % height;
+      const sx = (((viewCenterX + dx) % width) + width) % width;
+      const sy = (((viewCenterY + dy) % height) + height) % height;
 
       if (streakFactor > 1.5) {
         ctx.strokeStyle = `rgba(226, 232, 240, ${star.alpha * 0.75})`;
@@ -960,22 +1091,22 @@ export class SpacewarRenderer {
       }
     }
 
-    // 4. Render Central Gravity Star ("The Heavy Star" - 10x Scale)
+    // 4. Render Central Gravity Star
     const maxViewHalfDiag = Math.hypot(width, height) * 0.58;
     if (gravityStarEnabled) {
-      const { sx, sy } = worldToScreen(GRAVITY_STAR_X, GRAVITY_STAR_Y);
+      const { sx, sy } = worldToScreen(arena.starX, arena.starY);
       const distToSunCenter = Math.hypot(sx - viewCenterX, sy - viewCenterY);
       const baseAngleToCam = Math.atan2(viewCenterY - sy, viewCenterX - sx);
 
-      // Gravity well contour rings (10x scale) - culled to visible viewport arc to protect ChromeOS GPU
-      const ringRadii = [1800, 3800, 6500];
+      // Gravity well contour rings - scaled for COUCH-COOP vs SECTOR-01
+      const ringRadii = arena.isCouch ? [220, 440, 720] : [1800, 3800, 6500];
       ctx.save();
       ctx.lineWidth = 1;
       for (let i = 0; i < ringRadii.length; i++) {
         const r = ringRadii[i];
-        if (Math.abs(distToSunCenter - r) > maxViewHalfDiag) continue;
+        if (!arena.isCouch && Math.abs(distToSunCenter - r) > maxViewHalfDiag) continue;
         const span =
-          distToSunCenter < r * 0.35
+          arena.isCouch || distToSunCenter < r * 0.35
             ? Math.PI
             : Math.min(Math.PI, (maxViewHalfDiag / Math.max(r, 1)) * 1.25);
         ctx.strokeStyle = `rgba(245, 158, 11, ${0.14 - i * 0.035})`;
@@ -985,7 +1116,7 @@ export class SpacewarRenderer {
       }
       ctx.restore();
 
-      const glowRadius = GRAVITY_STAR_RADIUS * 2.6;
+      const glowRadius = arena.starRadius * 2.6;
       if (
         sx > -glowRadius &&
         sx < width + glowRadius &&
@@ -996,7 +1127,7 @@ export class SpacewarRenderer {
         const grad = ctx.createRadialGradient(
           sx,
           sy,
-          GRAVITY_STAR_RADIUS * 0.2,
+          arena.starRadius * 0.2,
           sx,
           sy,
           glowRadius
@@ -1012,21 +1143,21 @@ export class SpacewarRenderer {
         // Solar photosphere core disc
         ctx.fillStyle = '#FEF3C7';
         ctx.strokeStyle = '#F59E0B';
-        ctx.lineWidth = 3;
+        ctx.lineWidth = arena.isCouch ? 2.2 : 3;
         ctx.beginPath();
-        ctx.arc(sx, sy, GRAVITY_STAR_RADIUS * 0.72, 0, Math.PI * 2);
+        ctx.arc(sx, sy, arena.starRadius * 0.72, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
 
         // Classic PDP-1 oscillating star vector rays
         ctx.strokeStyle = '#FDE68A';
-        ctx.lineWidth = 2.2;
+        ctx.lineWidth = arena.isCouch ? 1.8 : 2.2;
         const rayCount = 24;
         ctx.beginPath();
         for (let i = 0; i < rayCount; i++) {
           const a = (i / rayCount) * Math.PI * 2 + nowSec * 0.35;
           const len =
-            GRAVITY_STAR_RADIUS * (0.95 + 0.25 * Math.sin(nowSec * 5 + i * 1.7));
+            arena.starRadius * (0.95 + 0.25 * Math.sin(nowSec * 5 + i * 1.7));
           ctx.moveTo(sx, sy);
           ctx.lineTo(sx + Math.cos(a) * len, sy + Math.sin(a) * len);
         }
@@ -1036,7 +1167,7 @@ export class SpacewarRenderer {
 
     // 4b. Render Planetary Orbit Tracks & Orbiting Planets around the Sun
     if (planets.length > 0) {
-      const sunScreen = worldToScreen(GRAVITY_STAR_X, GRAVITY_STAR_Y);
+      const sunScreen = worldToScreen(arena.starX, arena.starY);
       const distToSunCenter = Math.hypot(sunScreen.sx - viewCenterX, sunScreen.sy - viewCenterY);
       const baseAngleToCam = Math.atan2(viewCenterY - sunScreen.sy, viewCenterX - sunScreen.sx);
 
@@ -1243,8 +1374,8 @@ export class SpacewarRenderer {
 
       if (b.isMissile && Math.random() < smokeChance) {
         this.particles.push({
-          x: wrapCoord(b.x - Math.cos(b.angle) * 10, ARENA_WIDTH),
-          y: wrapCoord(b.y - Math.sin(b.angle) * 10, ARENA_HEIGHT),
+          x: wrapCoord(b.x - Math.cos(b.angle) * 10, arena.width),
+          y: wrapCoord(b.y - Math.sin(b.angle) * 10, arena.height),
           vx: (Math.random() - 0.5) * 35,
           vy: (Math.random() - 0.5) * 35,
           color: Math.random() < 0.5 ? '#F59E0B' : '#F43F5E',
@@ -1308,7 +1439,6 @@ export class SpacewarRenderer {
       ctx.beginPath();
       for (let i = 0; i < visibleMissiles.length; i++) {
         const { sx, sy, cos, sin } = visibleMissiles[i];
-        // Local (-8, -2.5), (-17, 0), (-8, 2.5)
         ctx.moveTo(sx - 8 * cos + 2.5 * sin, sy - 8 * sin - 2.5 * cos);
         ctx.lineTo(sx - 17 * cos, sy - 17 * sin);
         ctx.lineTo(sx - 8 * cos - 2.5 * sin, sy - 8 * sin + 2.5 * cos);
@@ -1322,7 +1452,6 @@ export class SpacewarRenderer {
       ctx.beginPath();
       for (let i = 0; i < visibleMissiles.length; i++) {
         const { sx, sy, cos, sin } = visibleMissiles[i];
-        // Diamond/Dart warhead: (10, 0), (-7, -4.5), (-5, 0), (-7, 4.5)
         ctx.moveTo(sx + 10 * cos, sy + 10 * sin);
         ctx.lineTo(sx - 7 * cos + 4.5 * sin, sy - 7 * sin - 4.5 * cos);
         ctx.lineTo(sx - 5 * cos, sy - 5 * sin);
@@ -1374,7 +1503,9 @@ export class SpacewarRenderer {
       if (!player.alive) continue;
 
       const { sx, sy, dx, dy } = worldToScreen(player.x, player.y);
-      const isLocal = localPlayer && player.id === localPlayer.id;
+      const isLocalP1 = Boolean(localPlayer && player.id === localPlayer.id);
+      const isLocalP2 = Boolean(localPlayer2 && player.id === localPlayer2.id);
+      const isLocal = isLocalP1 || isLocalP2;
       const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
 
       // If this ship is playing music, draw its spatial audio hearing radius & soundwave ripples
@@ -1387,7 +1518,6 @@ export class SpacewarRenderer {
         ) {
           ctx.save();
           ctx.translate(sx, sy);
-          // Outer hearing radius boundary ring (1800u)
           ctx.setLineDash([8, 10]);
           ctx.strokeStyle = isLocal
             ? 'rgba(245, 158, 11, 0.22)'
@@ -1397,10 +1527,9 @@ export class SpacewarRenderer {
           ctx.arc(0, 0, MUSIC_HEARING_RADIUS, 0, Math.PI * 2);
           ctx.stroke();
 
-          // Animated concentric acoustic wave rings around the broadcasting ship
           ctx.setLineDash([]);
           for (let w = 0; w < 2; w++) {
-            const phase = ((nowSec * 0.65 + w * 0.5) % 1);
+            const phase = (nowSec * 0.65 + w * 0.5) % 1;
             const waveR = spec.radius + 14 + phase * 85;
             const waveAlpha = (1 - phase) * 0.42;
             ctx.strokeStyle = `rgba(245, 158, 11, ${waveAlpha.toFixed(3)})`;
@@ -1434,6 +1563,7 @@ export class SpacewarRenderer {
       const isFocusedShip =
         cameraOverride?.mode === 'spectate' && cameraOverride.targetId === player.id;
       if (
+        !arena.isCouch &&
         !isLocal &&
         !isFocusedShip &&
         (sx < margin || sx > width - margin || sy < margin || sy > height - margin)
@@ -1461,14 +1591,16 @@ export class SpacewarRenderer {
         ctx.restore();
       }
 
-      // Draw Tactical Direct-Joystick Compass & Prograde Momentum Ring around Local Player (when piloting ship)
+      // Draw Tactical Direct-Joystick Compass & Prograde Momentum Ring around Local Player(s)
       if (isLocal && !isTitleMode && !cameraOverride) {
         const compassRadius = spec.radius + 32;
         ctx.save();
         ctx.translate(sx, sy);
 
         // Subtle compass ring
-        ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+        ctx.strokeStyle = isLocalP2
+          ? 'rgba(16, 185, 129, 0.34)'
+          : 'rgba(148, 163, 184, 0.22)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.arc(0, 0, compassRadius, 0, Math.PI * 2);
@@ -1477,14 +1609,19 @@ export class SpacewarRenderer {
         // Direct Joystick / Aim Heading Reticle on Compass Ring
         const aimX = Math.cos(player.angle) * compassRadius;
         const aimY = Math.sin(player.angle) * compassRadius;
-        ctx.strokeStyle = stickVector.active ? '#F59E0B' : player.color;
+        ctx.strokeStyle =
+          isLocalP1 && stickVector.active ? '#F59E0B' : player.color;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(Math.cos(player.angle) * (spec.radius + 8), Math.sin(player.angle) * (spec.radius + 8));
+        ctx.moveTo(
+          Math.cos(player.angle) * (spec.radius + 8),
+          Math.sin(player.angle) * (spec.radius + 8)
+        );
         ctx.lineTo(aimX, aimY);
         ctx.stroke();
 
-        ctx.fillStyle = stickVector.active ? '#F59E0B' : player.color;
+        ctx.fillStyle =
+          isLocalP1 && stickVector.active ? '#F59E0B' : player.color;
         ctx.beginPath();
         ctx.arc(aimX, aimY, 3.2, 0, Math.PI * 2);
         ctx.fill();
@@ -1506,7 +1643,6 @@ export class SpacewarRenderer {
         ctx.restore();
       }
 
-      // Record on-screen squad ships so we can draw wingman links in O(K^2) instead of O(N^2)
       if (player.squadId) {
         onScreenSquadShips.push({ player, sx, sy });
       }
@@ -1524,98 +1660,117 @@ export class SpacewarRenderer {
         ctx.restore();
       }
 
-      // Draw Ship Body
-      ctx.save();
-      ctx.translate(sx, sy);
-      ctx.rotate(player.angle);
+      // Draw Ship Body (plus ghost duplicate across screen edge in COUCH-COOP if straddling the boundary!)
+      const drawShipInstance = (drawX: number, drawY: number) => {
+        ctx.save();
+        ctx.translate(drawX, drawY);
+        ctx.rotate(player.angle);
 
-      // Invulnerability or Warp Field shield ring
-      if (player.warping) {
-        ctx.strokeStyle = `rgba(56, 189, 248, ${0.7 + 0.25 * Math.sin(nowSec * 22)})`;
-        ctx.lineWidth = 2.4;
-        ctx.beginPath();
-        ctx.ellipse(0, 0, spec.radius + 15, spec.radius + 9, 0, 0, Math.PI * 2);
-        ctx.stroke();
-
-        ctx.strokeStyle = `rgba(168, 85, 247, ${0.6 + 0.3 * Math.cos(nowSec * 26)})`;
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        ctx.arc(0, 0, spec.radius + 11, 0, Math.PI * 2);
-        ctx.stroke();
-      } else if (player.invulnerableTimer > 0) {
-        ctx.strokeStyle = `rgba(56, 189, 248, ${0.35 + 0.25 * Math.sin(nowSec * 16)})`;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.arc(0, 0, spec.radius + 8, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // Thruster or Warp Drive flame cone
-      if (player.warping) {
-        const warpFlameLen = spec.radius * (2.6 + Math.random() * 1.1);
-        ctx.fillStyle = '#38BDF8';
-        ctx.beginPath();
-        ctx.moveTo(-spec.radius * 0.75, -spec.radius * 0.38);
-        ctx.lineTo(-spec.radius * 0.75 - warpFlameLen, 0);
-        ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.38);
-        ctx.closePath();
-        ctx.fill();
-      } else if (player.thrusting && !player.landedPlanetId) {
-        const flameLen = spec.radius * (1.2 + Math.random() * 0.65);
-        ctx.fillStyle = '#F59E0B';
-        ctx.beginPath();
-        ctx.moveTo(-spec.radius * 0.75, -spec.radius * 0.26);
-        ctx.lineTo(-spec.radius * 0.75 - flameLen, 0);
-        ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.26);
-        ctx.closePath();
-        ctx.fill();
-      }
-
-      const isFlashing = (this.hitFlashes.get(player.id) || 0) > 0;
-      const spriteImg = this.getShipSpriteImage(player.shipPng);
-
-      if (spriteImg) {
-        const spriteSize = spec.radius * 2.8;
-        ctx.drawImage(
-          spriteImg,
-          -spriteSize * 0.5,
-          -spriteSize * 0.5,
-          spriteSize,
-          spriteSize
-        );
-        if (isFlashing) {
-          ctx.strokeStyle = '#FFFFFF';
+        // Invulnerability or Warp Field shield ring
+        if (player.warping) {
+          ctx.strokeStyle = `rgba(56, 189, 248, ${0.7 + 0.25 * Math.sin(nowSec * 22)})`;
           ctx.lineWidth = 2.4;
           ctx.beginPath();
-          ctx.arc(0, 0, spec.radius * 1.15, 0, Math.PI * 2);
+          ctx.ellipse(0, 0, spec.radius + 15, spec.radius + 9, 0, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.strokeStyle = `rgba(168, 85, 247, ${0.6 + 0.3 * Math.cos(nowSec * 26)})`;
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.arc(0, 0, spec.radius + 11, 0, Math.PI * 2);
+          ctx.stroke();
+        } else if (player.invulnerableTimer > 0) {
+          ctx.strokeStyle = `rgba(56, 189, 248, ${0.35 + 0.25 * Math.sin(nowSec * 16)})`;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(0, 0, spec.radius + 8, 0, Math.PI * 2);
           ctx.stroke();
         }
-      } else {
-        ctx.fillStyle = isFlashing ? '#FFFFFF' : 'rgba(15, 23, 42, 0.92)';
-        ctx.strokeStyle = isFlashing ? '#FFFFFF' : player.warping ? '#38BDF8' : player.color;
-        ctx.lineWidth = isLocal ? 2.4 : 2.0;
 
-        drawShipHullPath(ctx, player.hull, spec.radius);
-        ctx.fill();
-        ctx.stroke();
+        // Thruster or Warp Drive flame cone
+        if (player.warping) {
+          const warpFlameLen = spec.radius * (2.6 + Math.random() * 1.1);
+          ctx.fillStyle = '#38BDF8';
+          ctx.beginPath();
+          ctx.moveTo(-spec.radius * 0.75, -spec.radius * 0.38);
+          ctx.lineTo(-spec.radius * 0.75 - warpFlameLen, 0);
+          ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.38);
+          ctx.closePath();
+          ctx.fill();
+        } else if (player.thrusting && !player.landedPlanetId) {
+          const flameLen = spec.radius * (1.2 + Math.random() * 0.65);
+          ctx.fillStyle = '#F59E0B';
+          ctx.beginPath();
+          ctx.moveTo(-spec.radius * 0.75, -spec.radius * 0.26);
+          ctx.lineTo(-spec.radius * 0.75 - flameLen, 0);
+          ctx.lineTo(-spec.radius * 0.75, spec.radius * 0.26);
+          ctx.closePath();
+          ctx.fill();
+        }
 
-        // Forward nose sight dot
-        ctx.fillStyle = '#FFFFFF';
-        ctx.beginPath();
-        ctx.arc(spec.radius * 0.85, 0, 1.8, 0, Math.PI * 2);
-        ctx.fill();
+        const isFlashing = (this.hitFlashes.get(player.id) || 0) > 0;
+        const spriteImg = this.getShipSpriteImage(player.shipPng);
+
+        if (spriteImg) {
+          const spriteSize = spec.radius * 2.8;
+          ctx.drawImage(
+            spriteImg,
+            -spriteSize * 0.5,
+            -spriteSize * 0.5,
+            spriteSize,
+            spriteSize
+          );
+          if (isFlashing) {
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.lineWidth = 2.4;
+            ctx.beginPath();
+            ctx.arc(0, 0, spec.radius * 1.15, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        } else {
+          ctx.fillStyle = isFlashing ? '#FFFFFF' : 'rgba(15, 23, 42, 0.92)';
+          ctx.strokeStyle = isFlashing ? '#FFFFFF' : player.warping ? '#38BDF8' : player.color;
+          ctx.lineWidth = isLocal ? 2.4 : 2.0;
+
+          drawShipHullPath(ctx, player.hull, spec.radius);
+          ctx.fill();
+          ctx.stroke();
+
+          // Forward nose sight dot
+          ctx.fillStyle = '#FFFFFF';
+          ctx.beginPath();
+          ctx.arc(spec.radius * 0.85, 0, 1.8, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.restore();
+      };
+
+      drawShipInstance(sx, sy);
+
+      // In COUCH-COOP, if a ship is crossing the screen edge, render its wrap-around twin on the opposite edge for seamless visual looping!
+      if (arena.isCouch) {
+        const edgeWrapMargin = spec.radius * 2.2;
+        if (sx < edgeWrapMargin) drawShipInstance(sx + arena.width, sy);
+        if (sx > arena.width - edgeWrapMargin) drawShipInstance(sx - arena.width, sy);
+        if (sy < edgeWrapMargin) drawShipInstance(sx, sy + arena.height);
+        if (sy > arena.height - edgeWrapMargin) drawShipInstance(sx, sy - arena.height);
       }
-
-      ctx.restore();
 
       // Draw Callsign, Squad Tag, Speed & Hull Integrity Bar below ship
       const spd = player.landedPlanetId ? 0 : Math.round(Math.hypot(player.vx, player.vy));
+      const localTag =
+        localPlayer2 && isLocalP1
+          ? ' [P1]'
+          : localPlayer2 && isLocalP2
+          ? ' [P2]'
+          : '';
       ctx.save();
       ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
       ctx.fillStyle = player.warping ? '#38BDF8' : isLocal ? '#F8FAFC' : '#CBD5E1';
       ctx.textAlign = 'center';
       ctx.fillText(
-        `${player.name}${player.squadId ? ` [${player.squadId}]` : ''}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : player.landedPlanetId ? ' [LANDED]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
+        `${player.name}${localTag}${player.squadId ? ` [${player.squadId}]` : ''}${player.spectating ? ' [CAM DETACHED]' : player.warping ? ' [WARP · INVINCIBLE]' : player.landedPlanetId ? ' [LANDED]' : ''}${spd > 100 ? ` · ${spd} u/s` : ''}`,
         sx,
         sy + spec.radius + 18
       );
@@ -1669,8 +1824,8 @@ export class SpacewarRenderer {
       ctx.restore();
     }
 
-    // 8b. Render Off-Screen Ship Indicators (sorted by proximity so 100 ships stay clean)
-    if (offscreenShips.length > 0) {
+    // 8b. Render Off-Screen Ship Indicators (only needed in SECTOR-01)
+    if (!arena.isCouch && offscreenShips.length > 0) {
       offscreenShips.sort((a, b) => a.dist - b.dist);
       const margin = 44;
       const maxToDraw = Math.min(offscreenShips.length, 32);
@@ -1721,12 +1876,11 @@ export class SpacewarRenderer {
         continue;
       }
 
-      // Spawn subtle glowing trail particles when a spectator moves their mouse cursor
       const prevTrail = this.lastCursorTrail.get(player.id);
       if (prevTrail) {
         const moveDist = Math.hypot(
-          shortestToroidalDelta(prevTrail.x, player.cursorX, ARENA_WIDTH),
-          shortestToroidalDelta(prevTrail.y, player.cursorY, ARENA_HEIGHT)
+          shortestToroidalDelta(prevTrail.x, player.cursorX, arena.width),
+          shortestToroidalDelta(prevTrail.y, player.cursorY, arena.height)
         );
         if (moveDist > 6 && this.particles.length < 440) {
           this.particles.push({
@@ -1749,9 +1903,9 @@ export class SpacewarRenderer {
       const { sx, sy, dx, dy } = worldToScreen(player.cursorX, player.cursorY);
       const isSelfCursor = localPlayer && player.id === localPlayer.id;
 
-      // If another player's spectator cursor is off-screen, render an edge indicator so you can spot it
       const margin = 48;
       if (
+        !arena.isCouch &&
         !isSelfCursor &&
         (sx < margin || sx > width - margin || sy < margin || sy > height - margin)
       ) {
@@ -1792,7 +1946,6 @@ export class SpacewarRenderer {
 
       const isCursorFlashing = (this.hitFlashes.get(player.id) || 0) > 0;
 
-      // Rotating outer tactical ring around spectator cursor (2x scale)
       const pulseRadius = 36 + Math.sin(nowSec * 7) * 5;
       ctx.save();
       ctx.rotate(nowSec * 1.6);
@@ -1804,7 +1957,6 @@ export class SpacewarRenderer {
       ctx.stroke();
       ctx.restore();
 
-      // Precision crosshair ticks at cursor tip (2x scale)
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
       ctx.lineWidth = 2.0;
       ctx.beginPath();
@@ -1814,7 +1966,6 @@ export class SpacewarRenderer {
       ctx.lineTo(0, 14);
       ctx.stroke();
 
-      // High-visibility 2x Vector Mouse Pointer Arrow (tip at 0,0)
       ctx.fillStyle = isCursorFlashing ? '#FFFFFF' : '#060913';
       ctx.strokeStyle = isCursorFlashing ? '#FFFFFF' : player.color;
       ctx.lineWidth = 3.8;
@@ -1831,13 +1982,11 @@ export class SpacewarRenderer {
       ctx.fill();
       ctx.stroke();
 
-      // Bright core dot at cursor point (2x scale)
       ctx.fillStyle = '#FFFFFF';
       ctx.beginPath();
       ctx.arc(0, 0, 4.4, 0, Math.PI * 2);
       ctx.fill();
 
-      // Callsign + Health Bar Tag beside 2x cursor
       const hpPct = Math.max(0, Math.min(1, player.hp / Math.max(1, player.maxHp)));
       const label = `${player.name} · ${Math.max(0, Math.ceil(player.hp))} HP`;
       ctx.font = '700 12px "JetBrains Mono", monospace';
@@ -1860,7 +2009,6 @@ export class SpacewarRenderer {
       ctx.textBaseline = 'middle';
       ctx.fillText(label, tagX + 8, tagY + 11);
 
-      // Spectator Cursor Health Bar
       const barX = tagX + 8;
       const barY = tagY + 21;
       const barW = boxW - 16;
@@ -1873,10 +2021,27 @@ export class SpacewarRenderer {
       ctx.restore();
     }
 
-    // 9. Render 10x Star System Orrery Minimap Radar (Bottom-Right Corner)
-    if (!isTitleMode) {
+    // 9. In COUCH-COOP, draw the glowing screen-edge loop boundary frame around the 1920x1080 arena;
+    //    in SECTOR-01, draw the 10x Star System Orrery Minimap Radar (Bottom-Right Corner).
+    if (arena.isCouch) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.48)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(1.5, 1.5, arena.width - 3, arena.height - 3);
+
+      // Subtle dashed wrap-portal tick lines along the 4 edges
+      ctx.setLineDash([10, 14]);
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(6, 6, arena.width - 12, arena.height - 12);
+      ctx.restore();
+
+      if (couchTransformApplied) {
+        ctx.restore();
+      }
+    } else if (!isTitleMode) {
       const mapW = 196;
-      const mapH = Math.round(mapW * (ARENA_HEIGHT / ARENA_WIDTH)); // 126px
+      const mapH = Math.round(mapW * (arena.height / arena.width)); // 126px
       const mapX = width - mapW - 20;
       const mapY = height - mapH - 52;
 
@@ -1889,10 +2054,10 @@ export class SpacewarRenderer {
       ctx.fill();
       ctx.stroke();
 
-      const scaleX = mapW / ARENA_WIDTH;
-      const scaleY = mapH / ARENA_HEIGHT;
-      const sunMapX = mapX + GRAVITY_STAR_X * scaleX;
-      const sunMapY = mapY + GRAVITY_STAR_Y * scaleY;
+      const scaleX = mapW / arena.width;
+      const scaleY = mapH / arena.height;
+      const sunMapX = mapX + arena.starX * scaleX;
+      const sunMapY = mapY + arena.starY * scaleY;
 
       // Planetary orbit rings on minimap
       ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
@@ -1908,7 +2073,7 @@ export class SpacewarRenderer {
       if (gravityStarEnabled) {
         ctx.fillStyle = '#F59E0B';
         ctx.beginPath();
-        ctx.arc(sunMapX, sunMapY, Math.max(3.5, GRAVITY_STAR_RADIUS * scaleX), 0, Math.PI * 2);
+        ctx.arc(sunMapX, sunMapY, Math.max(3.5, arena.starRadius * scaleX), 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -1928,7 +2093,9 @@ export class SpacewarRenderer {
         if (p.alive) {
           const px = mapX + p.x * scaleX;
           const py = mapY + p.y * scaleY;
-          const isSelf = localPlayer && p.id === localPlayer.id;
+          const isSelf =
+            (localPlayer && p.id === localPlayer.id) ||
+            (localPlayer2 && p.id === localPlayer2.id);
           ctx.fillStyle = isSelf ? '#FFFFFF' : p.color;
           ctx.beginPath();
           ctx.arc(px, py, isSelf ? 3.2 : 1.7, 0, Math.PI * 2);

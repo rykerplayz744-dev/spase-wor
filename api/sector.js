@@ -1,13 +1,73 @@
-// Vercel Serverless Function for cross-browser / cross-device Sector-01 state & combat event relay
+// Vercel Serverless Function for cross-browser / cross-device Sector-01 & Couch Co-Op state & combat event relay
 // Optimized for minimal bandwidth on Vercel Hobby Plan (no self-echo, deterministic drone batch seeds, compact keys)
-const activePlayers = new Map();
-const droneBatches = [];
-const deadDroneIds = new Set();
-const recentEvents = [];
-let eventSeq = 1;
+const rooms = new Map();
+
+function getRoom(roomId) {
+  const cleanId = roomId === 'COUCH-COOP' ? 'COUCH-COOP' : 'SECTOR-01';
+  let room = rooms.get(cleanId);
+  if (!room) {
+    room = {
+      activePlayers: new Map(),
+      droneBatches: [],
+      deadDroneIds: new Set(),
+      recentEvents: [],
+      eventSeq: 1,
+    };
+    rooms.set(cleanId, room);
+  }
+  return room;
+}
+
+function upsertIncomingPlayer(activePlayers, incomingPlayer, now) {
+  if (!incomingPlayer || typeof incomingPlayer.id !== 'string') return;
+
+  const prevEntry = activePlayers.get(incomingPlayer.id);
+  const incomingMusic = incomingPlayer.music;
+  if (incomingMusic && incomingMusic.isPlaying) {
+    const prevMusic = prevEntry?.player?.music;
+    const reportedTrackTime = Math.max(0, Number(incomingMusic.trackTime) || 0);
+    const computedStartMs = now - Math.round(reportedTrackTime * 1000);
+    const isSameTrack =
+      prevMusic &&
+      prevMusic.isPlaying &&
+      prevMusic.filename === incomingMusic.filename;
+    const prevStartMs = prevMusic?.startedAtServerMs;
+    const didSeekOrRestart =
+      !isSameTrack ||
+      typeof prevStartMs !== 'number' ||
+      Math.abs(computedStartMs - prevStartMs) > 650;
+
+    const authoritativeStartMs = didSeekOrRestart ? computedStartMs : prevStartMs;
+    incomingPlayer.music = {
+      ...incomingMusic,
+      startedAtServerMs: authoritativeStartMs,
+      trackTime: Math.max(0, Number(((now - authoritativeStartMs) / 1000).toFixed(2))),
+      updatedAt: now,
+    };
+  } else {
+    delete incomingPlayer.music;
+  }
+
+  activePlayers.set(incomingPlayer.id, {
+    player: incomingPlayer,
+    updatedAt: now,
+  });
+}
 
 export default function handler(req, res) {
   const now = Date.now();
+  const body =
+    req.method === 'POST' && req.body
+      ? typeof req.body === 'string'
+        ? JSON.parse(req.body)
+        : req.body
+      : null;
+
+  const roomId = body && (body.r === 'COUCH-COOP' || body.roomId === 'COUCH-COOP')
+    ? 'COUCH-COOP'
+    : 'SECTOR-01';
+  const room = getRoom(roomId);
+  const { activePlayers, droneBatches, deadDroneIds, recentEvents } = room;
 
   // Evict stale human players (> 6 seconds without heartbeat)
   for (const [id, entry] of activePlayers.entries()) {
@@ -23,10 +83,9 @@ export default function handler(req, res) {
 
   let sinceSeq = 0;
   let requesterId = '';
+  let requesterP2Id = '';
 
-  if (req.method === 'POST' && req.body) {
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-
+  if (body) {
     if (typeof body.q === 'number') {
       sinceSeq = body.q;
     } else if (typeof body.sinceSeq === 'number') {
@@ -34,57 +93,20 @@ export default function handler(req, res) {
     }
 
     const incomingPlayer = body.p || body.player;
+    const incomingPlayer2 = body.p2 || body.player2;
+
     if (typeof body.id === 'string') {
       requesterId = body.id;
     } else if (incomingPlayer && typeof incomingPlayer.id === 'string') {
       requesterId = incomingPlayer.id;
     }
 
-    if (incomingPlayer && typeof incomingPlayer.id === 'string') {
-      // Remove stale ghost duplicate with the same name (> 1.5s without heartbeat) from a page reload
-      for (const [existingId, entry] of activePlayers.entries()) {
-        if (
-          existingId !== incomingPlayer.id &&
-          entry.player &&
-          entry.player.name === incomingPlayer.name &&
-          now - entry.updatedAt > 1500
-        ) {
-          activePlayers.delete(existingId);
-        }
-      }
-
-      const prevEntry = activePlayers.get(incomingPlayer.id);
-      const incomingMusic = incomingPlayer.music;
-      if (incomingMusic && incomingMusic.isPlaying) {
-        const prevMusic = prevEntry?.player?.music;
-        const reportedTrackTime = Math.max(0, Number(incomingMusic.trackTime) || 0);
-        const computedStartMs = now - Math.round(reportedTrackTime * 1000);
-        const isSameTrack =
-          prevMusic &&
-          prevMusic.isPlaying &&
-          prevMusic.filename === incomingMusic.filename;
-        const prevStartMs = prevMusic?.startedAtServerMs;
-        const didSeekOrRestart =
-          !isSameTrack ||
-          typeof prevStartMs !== 'number' ||
-          Math.abs(computedStartMs - prevStartMs) > 650;
-
-        const authoritativeStartMs = didSeekOrRestart ? computedStartMs : prevStartMs;
-        incomingPlayer.music = {
-          ...incomingMusic,
-          startedAtServerMs: authoritativeStartMs,
-          trackTime: Math.max(0, Number(((now - authoritativeStartMs) / 1000).toFixed(2))),
-          updatedAt: now,
-        };
-      } else {
-        delete incomingPlayer.music;
-      }
-
-      activePlayers.set(incomingPlayer.id, {
-        player: incomingPlayer,
-        updatedAt: now,
-      });
+    if (incomingPlayer2 && typeof incomingPlayer2.id === 'string') {
+      requesterP2Id = incomingPlayer2.id;
     }
+
+    upsertIncomingPlayer(activePlayers, incomingPlayer, now);
+    upsertIncomingPlayer(activePlayers, incomingPlayer2, now);
 
     const incomingEvents = body.e || body.events;
     if (Array.isArray(incomingEvents)) {
@@ -114,7 +136,7 @@ export default function handler(req, res) {
         }
 
         recentEvents.push({
-          seq: eventSeq++,
+          seq: room.eventSeq++,
           timestamp: now,
           packet: pkt,
         });
@@ -131,10 +153,10 @@ export default function handler(req, res) {
     deadDroneIds.clear();
   }
 
-  // Never echo the requester's own player state back to them!
+  // Never echo the requester's own player state (P1 or P2) back to them!
   const remotePlayers = [];
   for (const [id, entry] of activePlayers.entries()) {
-    if (id === requesterId) continue;
+    if (id === requesterId || (requesterP2Id && id === requesterP2Id)) continue;
     const p = entry.player;
     if (p && p.music && p.music.isPlaying && typeof p.music.startedAtServerMs === 'number') {
       p.music = {
@@ -150,13 +172,18 @@ export default function handler(req, res) {
   const newEvents =
     sinceSeq > 0
       ? recentEvents
-          .filter((e) => e.seq > sinceSeq && e.packet.senderId !== requesterId)
+          .filter(
+            (e) =>
+              e.seq > sinceSeq &&
+              e.packet.senderId !== requesterId &&
+              (!requesterP2Id || e.packet.senderId !== requesterP2Id)
+          )
           .map((e) => e.packet)
       : [];
 
   const responsePayload = {
     s: now,
-    q: eventSeq - 1,
+    q: room.eventSeq - 1,
   };
 
   if (remotePlayers.length > 0) {
@@ -175,3 +202,4 @@ export default function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.status(200).json(responsePayload);
 }
+
