@@ -217,6 +217,10 @@ export const SHIP_SMASH_SPEED_THRESHOLD = 1000;
 export const PLANET_LANDING_SPEED_THRESHOLD = 500;
 export const WARP_DRIVE_SPEED = 4800;
 
+export const TACTICAL_MISSILE_COOLDOWN = 3.5; // Seconds between M-key missile salvos
+export const TACTICAL_MISSILE_MAX_LOCK_SPEED = 820; // Targets moving faster than this cannot be locked or break lock
+export const TACTICAL_MISSILE_TRACKING_CONE = 0.95; // ~54 degrees off missile nose; sharp dodging causes missiles to miss
+
 export interface BulletState {
   id: string;
   ownerId: string;
@@ -233,6 +237,10 @@ export interface BulletState {
   isMissile?: boolean;
   targetId?: string;
   turnRate?: number;
+  maxSpeed?: number;
+  accel?: number;
+  maxLockSpeed?: number;
+  trackingCone?: number;
 }
 
 export interface AsteroidState {
@@ -421,6 +429,10 @@ export type ClientToServerMessage =
       action: CheatActionType;
     }
   | {
+      type: 'player:tactical_missile';
+      playerId: string;
+    }
+  | {
       type: 'player:rename';
       playerId: string;
       newName: string;
@@ -477,6 +489,11 @@ export interface SalvoSpawnPayload {
   ttl: number;
   isMissile: boolean;
   targetIds: string[];
+  turnRate?: number;
+  maxSpeed?: number;
+  accel?: number;
+  maxLockSpeed?: number;
+  trackingCone?: number;
 }
 
 export function expandSalvoToBullets(
@@ -504,6 +521,11 @@ export function expandSalvoToBullets(
     ttl,
     isMissile,
     targetIds,
+    turnRate,
+    maxSpeed,
+    accel,
+    maxLockSpeed,
+    trackingCone,
   } = salvo;
 
   const spreadStep = novaSpread ? (Math.PI * 2) / count : spreadAngle;
@@ -528,7 +550,7 @@ export function expandSalvoToBullets(
       id: `${idPrefix}_${i}`,
       ownerId,
       ownerName,
-      color: isMissile ? '#F43F5E' : color,
+      color: isMissile ? color || '#F43F5E' : color,
       x: bx,
       y: by,
       vx: bvx,
@@ -539,7 +561,11 @@ export function expandSalvoToBullets(
       maxTtl: ttl,
       isMissile,
       targetId: isMissile && tLen > 0 ? targetIds[i % tLen] : undefined,
-      turnRate: 6.4,
+      turnRate: turnRate ?? 6.4,
+      maxSpeed: maxSpeed ?? 2600,
+      accel: accel ?? 920,
+      maxLockSpeed,
+      trackingCone,
     });
   }
 

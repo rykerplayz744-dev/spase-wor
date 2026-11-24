@@ -825,13 +825,39 @@ export class SpacewarRenderer {
           target = astMap.get(b.targetId);
         }
 
+        // Tactical missiles lose lock if target is moving too fast (> maxLockSpeed) or dodges outside the seeker cone
+        if (target && b.maxLockSpeed) {
+          const targetSpd = Math.hypot(target.vx, target.vy);
+          if (targetSpd > b.maxLockSpeed || (target as PlayerState).warping) {
+            target = undefined;
+            b.targetId = undefined;
+          }
+        }
+        if (target && b.trackingCone) {
+          const dx = shortestToroidalDelta(b.x, target.x, arena.width);
+          const dy = shortestToroidalDelta(b.y, target.y, arena.height);
+          const angleDiff = Math.abs(normalizeAngleDiff(Math.atan2(dy, dx) - b.angle));
+          if (angleDiff > b.trackingCone) {
+            target = undefined;
+            b.targetId = undefined;
+          }
+        }
+
         // Dynamic target acquisition if missile has no valid target yet
         if (!target) {
-          let bestDistSq = Infinity;
+          let bestDistSq = b.maxLockSpeed ? 1350 * 1350 : Infinity;
           for (const p of players.values()) {
             if (!p.alive || p.id === b.ownerId) continue;
+            if (b.maxLockSpeed) {
+              const pSpd = Math.hypot(p.vx, p.vy);
+              if (pSpd > b.maxLockSpeed || p.warping) continue;
+            }
             const dx = shortestToroidalDelta(b.x, p.x, arena.width);
             const dy = shortestToroidalDelta(b.y, p.y, arena.height);
+            if (b.trackingCone) {
+              const angleDiff = Math.abs(normalizeAngleDiff(Math.atan2(dy, dx) - b.angle));
+              if (angleDiff > b.trackingCone) continue;
+            }
             const dSq = dx * dx + dy * dy;
             if (dSq < bestDistSq) {
               bestDistSq = dSq;
@@ -844,15 +870,18 @@ export class SpacewarRenderer {
         }
 
         if (target) {
-          const dx = shortestToroidalDelta(b.x, target.x + target.vx * 0.12, arena.width);
-          const dy = shortestToroidalDelta(b.y, target.y + target.vy * 0.12, arena.height);
+          const leadTime = b.maxLockSpeed ? 0.03 : 0.12;
+          const dx = shortestToroidalDelta(b.x, target.x + target.vx * leadTime, arena.width);
+          const dy = shortestToroidalDelta(b.y, target.y + target.vy * leadTime, arena.height);
           const desiredAngle = Math.atan2(dy, dx);
           const diff = normalizeAngleDiff(desiredAngle - b.angle);
           const maxTurn = (b.turnRate || 6.4) * dt;
           b.angle += Math.max(-maxTurn, Math.min(maxTurn, diff));
 
           const currentSpd = Math.hypot(b.vx, b.vy);
-          const nextSpd = Math.min(2600, currentSpd + 920 * dt);
+          const topSpd = b.maxSpeed || 2600;
+          const accelRate = b.accel || 920;
+          const nextSpd = Math.min(topSpd, currentSpd + accelRate * dt);
           b.vx = Math.cos(b.angle) * nextSpd;
           b.vy = Math.sin(b.angle) * nextSpd;
         }

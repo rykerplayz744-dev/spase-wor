@@ -58,6 +58,9 @@ import {
   SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
   stepAiDroneAutopilot,
+  TACTICAL_MISSILE_COOLDOWN,
+  TACTICAL_MISSILE_MAX_LOCK_SPEED,
+  TACTICAL_MISSILE_TRACKING_CONE,
   WARP_DRIVE_SPEED,
 } from './shared/types.ts';
 
@@ -87,6 +90,7 @@ interface HudTelemetry {
   secondPadAvailable: boolean;
   localCoopActive: boolean;
   landedPlanetName: string | null;
+  missileCooldown: number;
 }
 
 const HULL_LIST: ShipHullType[] = ['needle', 'wedge', 'interceptor', 'disc'];
@@ -154,6 +158,7 @@ export default function App() {
     secondPadAvailable: false,
     localCoopActive: false,
     landedPlanetName: null,
+    missileCooldown: 0,
   });
 
   // Mutable simulation refs isolated from React render cycle for 60fps canvas loop
@@ -209,6 +214,7 @@ export default function App() {
   const lastLocalEnvHitAtRef = useRef<number>(0);
   const lastP2SunHitAtRef = useRef<number>(0);
   const lastP2EnvHitAtRef = useRef<number>(0);
+  const lastTacticalMissileAtRef = useRef<number>(0);
   const seenChatIdsRef = useRef<Set<string>>(new Set());
   const serverWideTimerRef = useRef<number | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
@@ -631,7 +637,11 @@ export default function App() {
             const isOwnSalvo =
               msg.salvo.ownerId === selfIdRef.current ||
               (coopActiveRef.current && msg.salvo.ownerId === coopIdRef.current);
-            if (isOwnSalvo && !msg.salvo.idPrefix.startsWith('swm')) {
+            if (
+              isOwnSalvo &&
+              !msg.salvo.idPrefix.startsWith('swm') &&
+              !msg.salvo.idPrefix.startsWith('tacm')
+            ) {
               world.bullets = world.bullets.filter(
                 (b) =>
                   !(
@@ -1617,6 +1627,91 @@ export default function App() {
     [sendWs]
   );
 
+  const handleFireTacticalMissile = useCallback(() => {
+    const world = worldRef.current;
+    const localPlayer = world.players.get(selfIdRef.current);
+    if (!localPlayer || !localPlayer.alive || cheatsRef.current.freeCam) return;
+
+    const nowSec = performance.now() / 1000;
+    if (nowSec - lastTacticalMissileAtRef.current < TACTICAL_MISSILE_COOLDOWN) {
+      return;
+    }
+    lastTacticalMissileAtRef.current = nowSec;
+    soundEngine.playMissileLaunch();
+
+    const isWsConnected = wsRef.current?.readyState === WebSocket.OPEN;
+    if (!isWsConnected) {
+      const activeRoom = roomIdRef.current;
+      const arena = getRoomArenaConfig(activeRoom);
+      const spec = HULL_SPECS[localPlayer.hull] || HULL_SPECS.needle;
+      const lockedTargets: string[] = [];
+      let bestDistSq = 1350 * 1350;
+      let bestTargetId: string | null = null;
+
+      for (const p of world.players.values()) {
+        if (!p.alive || p.id === localPlayer.id) continue;
+        const pSpd = Math.hypot(p.vx, p.vy);
+        // Do not lock onto targets flying faster than TACTICAL_MISSILE_MAX_LOCK_SPEED (820 u/s) or warping
+        if (pSpd > TACTICAL_MISSILE_MAX_LOCK_SPEED || p.warping) continue;
+        const dx = shortestToroidalDelta(localPlayer.x, p.x, arena.width);
+        const dy = shortestToroidalDelta(localPlayer.y, p.y, arena.height);
+        let angleDiff = Math.atan2(dy, dx) - localPlayer.angle;
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        if (Math.abs(angleDiff) > TACTICAL_MISSILE_TRACKING_CONE) continue;
+        const dSq = dx * dx + dy * dy;
+        if (dSq < bestDistSq) {
+          bestDistSq = dSq;
+          bestTargetId = p.id;
+        }
+      }
+      if (bestTargetId) {
+        lockedTargets.push(bestTargetId);
+      }
+
+      const salvo = {
+        idPrefix: `tacm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+        ownerId: localPlayer.id,
+        ownerName: localPlayer.name,
+        color: '#FB923C',
+        x: localPlayer.x,
+        y: localPlayer.y,
+        vx: localPlayer.vx,
+        vy: localPlayer.vy,
+        angle: localPlayer.angle,
+        noseDist: spec.radius + 11,
+        count: 2,
+        spreadAngle: 0.16,
+        novaSpread: false,
+        baseMuzzle: 640,
+        damage: 28,
+        ttl: 2.5,
+        isMissile: true,
+        targetIds: lockedTargets,
+        turnRate: 1.95,
+        maxSpeed: 1020,
+        accel: 320,
+        maxLockSpeed: TACTICAL_MISSILE_MAX_LOCK_SPEED,
+        trackingCone: TACTICAL_MISSILE_TRACKING_CONE,
+      };
+      world.bullets.push(...expandSalvoToBullets(salvo, activeRoom));
+      if (world.bullets.length > 1800) {
+        world.bullets.splice(0, world.bullets.length - 1800);
+      }
+      peerSyncRef.current?.send({
+        type: 'peer:salvo',
+        senderId: selfIdRef.current,
+        roomId: activeRoom,
+        salvo,
+      });
+    } else {
+      sendWs({
+        type: 'player:tactical_missile',
+        playerId: selfIdRef.current,
+      });
+    }
+  }, [sendWs]);
+
   const handleToggleWarpSpeed = useCallback(() => {
     const localPlayer = worldRef.current.players.get(selfIdRef.current);
     if (!localPlayer || !localPlayer.alive || cheatsRef.current.freeCam) return;
@@ -1916,6 +2011,8 @@ export default function App() {
   handleToggleWarpSpeedRef.current = handleToggleWarpSpeed;
   const handleTriggerCheatActionRef = useRef(handleTriggerCheatAction);
   handleTriggerCheatActionRef.current = handleTriggerCheatAction;
+  const handleFireTacticalMissileRef = useRef(handleFireTacticalMissile);
+  handleFireTacticalMissileRef.current = handleFireTacticalMissile;
 
   // Isolated 60fps Canvas Simulation & Render Loop
   useEffect(() => {
@@ -2077,9 +2174,9 @@ export default function App() {
         });
       }
 
-      // Press M during gameplay to fire an Homing Missile Swarm
-      if (!isTitle && sampled.missileSwarmJustPressed && !cheatsRef.current.freeCam) {
-        handleTriggerCheatActionRef.current('missile_swarm');
+      // Press M during gameplay to fire a cooldown-based tactical missile (cannot lock onto fast targets > 820 u/s and can be dodged)
+      if (!isTitle && sampled.tacticalMissileJustPressed && !cheatsRef.current.freeCam) {
+        handleFireTacticalMissileRef.current();
       }
 
       // Press [ or ] to cycle spectated players (also activates Free-Cam / Spectator mode)
@@ -3479,6 +3576,10 @@ export default function App() {
           )
           .slice(0, 36);
         const pads = input.getConnectedGamepads();
+        const missileCdRemaining = Math.max(
+          0,
+          TACTICAL_MISSILE_COOLDOWN - (nowSec - lastTacticalMissileAtRef.current)
+        );
 
         setHud({
           hp: localPlayer ? Math.max(0, Math.round(localPlayer.hp)) : 100,
@@ -3504,6 +3605,7 @@ export default function App() {
           secondPadAvailable: pads.length > 1,
           localCoopActive: coopActiveRef.current,
           landedPlanetName: landedPlanetObj ? landedPlanetObj.name : null,
+          missileCooldown: Number(missileCdRemaining.toFixed(1)),
         });
       }
 
@@ -4241,6 +4343,21 @@ export default function App() {
                   }`}
                 >
                   AUTO-FIRE (F): {autoFire ? 'ON' : 'OFF'}
+                </button>
+                <span className="mx-1.5 text-slate-600">·</span>
+                <button
+                  onClick={handleFireTacticalMissile}
+                  disabled={!hud.alive || cheats.freeCam || hud.missileCooldown > 0}
+                  title="Tactical Homing Missiles (M) · 3.5s cooldown · Cannot lock onto targets moving > 820 u/s and loses lock on sharp turns"
+                  className={`pointer-events-auto font-semibold transition-colors ${
+                    hud.missileCooldown > 0
+                      ? 'text-slate-500 cursor-not-allowed'
+                      : 'text-orange-400 hover:text-orange-300'
+                  }`}
+                >
+                  {hud.missileCooldown > 0
+                    ? `MISSILE (M): ${hud.missileCooldown.toFixed(1)}s`
+                    : 'MISSILE (M): READY'}
                 </button>
               </div>
 

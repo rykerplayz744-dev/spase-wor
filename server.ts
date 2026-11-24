@@ -34,6 +34,9 @@ import {
   SHIP_SMASH_SPEED_THRESHOLD,
   ShipHullType,
   stepAiDroneAutopilot,
+  TACTICAL_MISSILE_COOLDOWN,
+  TACTICAL_MISSILE_MAX_LOCK_SPEED,
+  TACTICAL_MISSILE_TRACKING_CONE,
   WARP_DRIVE_SPEED,
 } from './src/shared/types.ts';
 import { createTargetDronesBatch } from './src/game/peerSync.ts';
@@ -59,6 +62,7 @@ const socketToRoom = new Map<WebSocket, string>();
 const socketToPlayerIds = new Map<WebSocket, Set<string>>();
 const playerLastSeen = new Map<string, number>();
 const lastEnvHitAt = new Map<string, number>();
+const lastTacticalMissileAt = new Map<string, number>();
 
 let entitySeq = 1;
 function nextId(prefix: string): string {
@@ -66,6 +70,7 @@ function nextId(prefix: string): string {
 }
 
 function wrapCoord(val: number, max: number): number {
+  if (!Number.isFinite(val)) return max * 0.5;
   return ((val % max) + max) % max;
 }
 
@@ -373,7 +378,50 @@ function resolveMissileTargetO1(
   room: RoomState,
   bullet: BulletState
 ): { id: string; x: number; y: number; vx: number; vy: number } | null {
-  // Fast O(1) lookup if missile already has a valid locked targetId
+  const arena = getRoomArenaConfig(room.id);
+
+  // If this is a tactical cooldown missile (has maxLockSpeed or trackingCone), enforce speed & cone lock-break rules
+  if (bullet.maxLockSpeed || bullet.trackingCone) {
+    if (bullet.targetId) {
+      const p = room.players.get(bullet.targetId);
+      if (p && p.alive && p.id !== bullet.ownerId) {
+        const pSpd = Math.hypot(p.vx, p.vy);
+        const dx = shortestToroidalDelta(bullet.x, p.x, arena.width);
+        const dy = shortestToroidalDelta(bullet.y, p.y, arena.height);
+        const angleDiff = Math.abs(normalizeAngleDiff(Math.atan2(dy, dx) - bullet.angle));
+        const tooFast = Boolean(bullet.maxLockSpeed && (pSpd > bullet.maxLockSpeed || p.warping));
+        const outsideCone = Boolean(bullet.trackingCone && angleDiff > bullet.trackingCone);
+        if (!tooFast && !outsideCone) {
+          return p;
+        }
+      }
+      bullet.targetId = undefined;
+    }
+
+    let bestTarget: { id: string; x: number; y: number; vx: number; vy: number } | null = null;
+    let bestDistSq = 1350 * 1350;
+    for (const p of room.players.values()) {
+      if (!p.alive || p.id === bullet.ownerId) continue;
+      if (bullet.maxLockSpeed) {
+        const pSpd = Math.hypot(p.vx, p.vy);
+        if (pSpd > bullet.maxLockSpeed || p.warping) continue;
+      }
+      const dx = shortestToroidalDelta(bullet.x, p.x, arena.width);
+      const dy = shortestToroidalDelta(bullet.y, p.y, arena.height);
+      if (bullet.trackingCone) {
+        const angleDiff = Math.abs(normalizeAngleDiff(Math.atan2(dy, dx) - bullet.angle));
+        if (angleDiff > bullet.trackingCone) continue;
+      }
+      const dSq = dx * dx + dy * dy;
+      if (dSq < bestDistSq) {
+        bestDistSq = dSq;
+        bestTarget = p;
+      }
+    }
+    return bestTarget;
+  }
+
+  // Fast O(1) lookup for Admin Cheat Menu missiles (no speed or cone limit)
   if (bullet.targetId) {
     const p = room.players.get(bullet.targetId);
     if (p && p.alive && p.id !== bullet.ownerId) {
@@ -433,6 +481,68 @@ function spawnMissileSwarm(room: RoomState, player: PlayerState, count: number =
     ttl: 3.0,
     isMissile: true,
     targetIds: availableTargets,
+  };
+
+  const spawned = expandSalvoToBullets(salvo, room.id);
+  for (let i = 0; i < spawned.length; i++) {
+    room.bullets.set(spawned[i].id, spawned[i]);
+  }
+
+  broadcastRoom(room, { type: 'salvo:spawn', salvo });
+}
+
+function spawnTacticalMissile(room: RoomState, player: PlayerState) {
+  const arena = getRoomArenaConfig(room.id);
+  const spec = HULL_SPECS[player.hull] || HULL_SPECS.needle;
+  const noseDist = spec.radius + 11;
+  evictExcessBullets(room, 2, 1800);
+
+  // Only lock onto a target that is inside the forward seeker cone, within 1350u range, and moving slower than TACTICAL_MISSILE_MAX_LOCK_SPEED
+  const lockedTargets: string[] = [];
+  let bestDistSq = 1350 * 1350;
+  let bestTargetId: string | null = null;
+  for (const p of room.players.values()) {
+    if (!p.alive || p.id === player.id) continue;
+    const pSpd = Math.hypot(p.vx, p.vy);
+    if (pSpd > TACTICAL_MISSILE_MAX_LOCK_SPEED || p.warping) continue;
+    const dx = shortestToroidalDelta(player.x, p.x, arena.width);
+    const dy = shortestToroidalDelta(player.y, p.y, arena.height);
+    const angleDiff = Math.abs(normalizeAngleDiff(Math.atan2(dy, dx) - player.angle));
+    if (angleDiff > TACTICAL_MISSILE_TRACKING_CONE) continue;
+    const dSq = dx * dx + dy * dy;
+    if (dSq < bestDistSq) {
+      bestDistSq = dSq;
+      bestTargetId = p.id;
+    }
+  }
+  if (bestTargetId) {
+    lockedTargets.push(bestTargetId);
+  }
+
+  const salvo: SalvoSpawnPayload = {
+    idPrefix: nextId('tacm'),
+    ownerId: player.id,
+    ownerName: player.name,
+    color: '#FB923C',
+    x: Math.round(player.x * 10) / 10,
+    y: Math.round(player.y * 10) / 10,
+    vx: Math.round(player.vx),
+    vy: Math.round(player.vy),
+    angle: Number(player.angle.toFixed(4)),
+    noseDist,
+    count: 2,
+    spreadAngle: 0.16,
+    novaSpread: false,
+    baseMuzzle: 640,
+    damage: 28,
+    ttl: 2.5,
+    isMissile: true,
+    targetIds: lockedTargets,
+    turnRate: 1.95,
+    maxSpeed: 1020,
+    accel: 320,
+    maxLockSpeed: TACTICAL_MISSILE_MAX_LOCK_SPEED,
+    trackingCone: TACTICAL_MISSILE_TRACKING_CONE,
   };
 
   const spawned = expandSalvoToBullets(salvo, room.id);
@@ -1003,15 +1113,18 @@ function stepRoomSimulation(room: RoomState, dt: number, nowSec: number) {
       const target = resolveMissileTargetO1(room, bullet);
       if (target) {
         bullet.targetId = target.id;
-        const dx = shortestToroidalDelta(bullet.x, target.x + target.vx * 0.12, arena.width);
-        const dy = shortestToroidalDelta(bullet.y, target.y + target.vy * 0.12, arena.height);
+        const leadTime = bullet.maxLockSpeed ? 0.03 : 0.12;
+        const dx = shortestToroidalDelta(bullet.x, target.x + target.vx * leadTime, arena.width);
+        const dy = shortestToroidalDelta(bullet.y, target.y + target.vy * leadTime, arena.height);
         const desiredAngle = Math.atan2(dy, dx);
         const diff = normalizeAngleDiff(desiredAngle - bullet.angle);
         const maxTurn = (bullet.turnRate || 6.4) * dt;
         bullet.angle += Math.max(-maxTurn, Math.min(maxTurn, diff));
 
         const currentSpd = Math.hypot(bullet.vx, bullet.vy);
-        const nextSpd = Math.min(2600, currentSpd + 920 * dt);
+        const topSpd = bullet.maxSpeed || 2600;
+        const accelRate = bullet.accel || 920;
+        const nextSpd = Math.min(topSpd, currentSpd + accelRate * dt);
         bullet.vx = Math.cos(bullet.angle) * nextSpd;
         bullet.vy = Math.sin(bullet.angle) * nextSpd;
       } else {
@@ -1770,6 +1883,21 @@ async function startServer() {
               }
             }
           }
+          return;
+        }
+
+        if (msg.type === 'player:tactical_missile') {
+          const ownedIds = socketToPlayerIds.get(ws);
+          if (!ownedIds || !ownedIds.has(msg.playerId)) return;
+          const player = room.players.get(msg.playerId);
+          if (!player || !player.alive || player.spectating) return;
+
+          const nowSec = performance.now() / 1000;
+          const lastFired = lastTacticalMissileAt.get(player.id) || 0;
+          if (nowSec - lastFired < TACTICAL_MISSILE_COOLDOWN - 0.15) return;
+          lastTacticalMissileAt.set(player.id, nowSec);
+
+          spawnTacticalMissile(room, player);
           return;
         }
 

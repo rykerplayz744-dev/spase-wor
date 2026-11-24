@@ -49,7 +49,7 @@ export interface SampledInput {
   pauseJustPressed: boolean;
   startJustPressed: boolean;
   cheatMenuJustPressed: boolean;
-  missileSwarmJustPressed: boolean;
+  tacticalMissileJustPressed: boolean;
   autoFireToggleJustPressed: boolean;
   inputSource: 'gamepad' | 'keyboard';
   gamepadConnected: boolean;
@@ -213,6 +213,7 @@ export class InputManager {
     // One-shot toggle keys should always register on non-repeat keydown even if ChromeOS swallowed a prior keyup
     const isOneShotKey =
       code === 'KeyK' ||
+      code === 'KeyM' ||
       code === 'KeyP' ||
       code === 'KeyE' ||
       code === 'KeyQ' ||
@@ -594,7 +595,7 @@ export class InputManager {
     const kbPauseJustPressed = this.justPressedKeys.has('Escape') || this.justPressedKeys.has('KeyP');
     const kbStartJustPressed = this.justPressedKeys.has('Enter') || this.justPressedKeys.has('Space');
     const cheatMenuJustPressed = this.justPressedKeys.has('KeyK');
-    const missileSwarmJustPressed = this.heldKeys.has('KeyM') || this.justPressedKeys.has('KeyM');
+    const tacticalMissileJustPressed = this.justPressedKeys.has('KeyM');
     const autoFireToggleJustPressed = this.justPressedKeys.has('KeyF') || gpAutoFireJustPressed;
     const spectatePrevJustPressed = this.justPressedKeys.has('BracketLeft');
     const spectateNextJustPressed = this.justPressedKeys.has('BracketRight');
@@ -626,7 +627,7 @@ export class InputManager {
       pauseJustPressed: gpPauseJustPressed || kbPauseJustPressed,
       startJustPressed: gpStartJustPressed || kbStartJustPressed,
       cheatMenuJustPressed,
-      missileSwarmJustPressed,
+      tacticalMissileJustPressed,
       autoFireToggleJustPressed,
       inputSource: this.lastInputSource,
       gamepadConnected: Boolean(gp),
